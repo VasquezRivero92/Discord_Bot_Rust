@@ -151,19 +151,54 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
     s.filter(|v| !v.is_empty())
 }
 
-/// Rol de administración efectivo, igual que `getEffectiveConfigForGuild` + `checkIsAdmin`:
-/// `settings.adminRoleId || settings.adminRoleName || env.ADMIN_ROLE_ID` (con `ADMIN_ROLE_ID`
-/// ya resuelto como `ADMIN_ROLE_ID || ADMIN_ROLE_NAME` en la configuración). Las cadenas vacías
-/// cuentan como ausentes. (En el legacy el valor de entorno solo entra por la rama de servidor
-/// por defecto en `getEffectiveConfigForGuild`, pero `checkIsAdmin` repite `|| env.ADMIN_ROLE_ID`,
-/// así que el resultado es siempre este.)
-pub fn effective_admin_role(
-    settings: Option<&GuildSettings>,
-    env_admin_role_id: Option<&str>,
-) -> Option<String> {
-    non_empty(settings.and_then(|s| s.admin_role_id.as_deref()))
-        .or_else(|| non_empty(settings.and_then(|s| s.admin_role_name.as_deref())))
-        .or_else(|| non_empty(env_admin_role_id))
+/// Fuentes del rol de administración. El llamador resuelve la capa global (ver abajo).
+///
+/// Cadena del legacy (`config/index.js` `getEffectiveConfigForGuild` + `adminCheck.js`):
+///
+/// * `guild = guildSettings.adminRoleId || guildSettings.adminRoleName`
+/// * servidor por defecto (`guildId === globalConfig.discordGuildId`):
+///   `guild || globalConfig.adminRoleId`, con `globalConfig.adminRoleId =
+///   settings.adminRoleId || settings.adminRoleName || process.env.ADMIN_ROLE_ID ||
+///   env.ADMIN_ROLE_ID` (`settings` = documento global `faceit_config/settings`)
+/// * cualquier otro servidor: solo `guild` (aislamiento estricto, sin capa global)
+/// * `checkIsAdmin` añade al final `|| env.ADMIN_ROLE_ID` (`ADMIN_ROLE_ID || ADMIN_ROLE_NAME` del
+///   entorno) para TODOS los servidores.
+///
+/// Las cadenas vacías cuentan como ausentes (`||` de JS).
+///
+/// **El llamador debe aportar `global_admin_role`**, ya resuelto como
+/// `settings.adminRoleId || settings.adminRoleName || env`. Todavía no hay repo de
+/// `faceit_config/settings` en `data`; el plan de la fase 2 lo añade, y hasta entonces el
+/// llamador puede pasar solo la parte de entorno (o `None`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdminRoleSources<'a> {
+    /// Ajustes del servidor (`GuildSettingsRepo`), si existen.
+    pub guild_settings: Option<&'a GuildSettings>,
+    /// Capa global ya resuelta (`globalConfig.adminRoleId`); solo cuenta si `is_default_guild`.
+    pub global_admin_role: Option<&'a str>,
+    /// `guildId === globalConfig.discordGuildId`.
+    pub is_default_guild: bool,
+    /// `env.ADMIN_ROLE_ID` (`Config::admin_role_id`).
+    pub env_admin_role_id: Option<&'a str>,
+}
+
+/// Rol de administración efectivo según la cadena documentada en [`AdminRoleSources`].
+pub fn effective_admin_role(src: &AdminRoleSources<'_>) -> Option<String> {
+    let guild =
+        non_empty(src.guild_settings.and_then(|s| s.admin_role_id.as_deref())).or_else(|| {
+            non_empty(
+                src.guild_settings
+                    .and_then(|s| s.admin_role_name.as_deref()),
+            )
+        });
+    let global = if src.is_default_guild {
+        non_empty(src.global_admin_role)
+    } else {
+        None
+    };
+    guild
+        .or(global)
+        .or_else(|| non_empty(src.env_admin_role_id))
         .map(str::to_owned)
 }
 
@@ -177,13 +212,12 @@ pub fn is_admin(
     roles: &[Role],
     guild_id: &str,
     is_guild_owner: bool,
-    settings: Option<&GuildSettings>,
-    env_admin_role_id: Option<&str>,
+    sources: &AdminRoleSources<'_>,
 ) -> bool {
     if is_guild_owner || has_administrator(guild_id, member, roles) {
         return true;
     }
-    let Some(wanted) = effective_admin_role(settings, env_admin_role_id) else {
+    let Some(wanted) = effective_admin_role(sources) else {
         return false;
     };
     let has_id = |id: &str| id == guild_id || member.roles.iter().any(|m| m == id);
@@ -203,8 +237,7 @@ pub async fn check_discord_admin(
     api: &dyn DiscordApi,
     guild_id: &str,
     user_id: &str,
-    settings: Option<&GuildSettings>,
-    env_admin_role_id: Option<&str>,
+    sources: &AdminRoleSources<'_>,
 ) -> Result<bool, DiscordError> {
     let Some(member) = api.guild_member(guild_id, user_id).await? else {
         return Ok(false);
@@ -216,8 +249,7 @@ pub async fn check_discord_admin(
         &roles,
         guild_id,
         owner == user_id,
-        settings,
-        env_admin_role_id,
+        sources,
     ))
 }
 
@@ -607,6 +639,135 @@ mod tests {
         }
     }
 
+    /// Atajo: servidor que no es el de por defecto, sin capa global.
+    fn is_admin(
+        m: &GuildMember,
+        r: &[Role],
+        g: &str,
+        owner: bool,
+        s: Option<&GuildSettings>,
+        env: Option<&str>,
+    ) -> bool {
+        super::is_admin(m, r, g, owner, &src(s, None, false, env))
+    }
+
+    fn src<'a>(
+        s: Option<&'a GuildSettings>,
+        global: Option<&'a str>,
+        default_guild: bool,
+        env: Option<&'a str>,
+    ) -> AdminRoleSources<'a> {
+        AdminRoleSources {
+            guild_settings: s,
+            global_admin_role: global,
+            is_default_guild: default_guild,
+            env_admin_role_id: env,
+        }
+    }
+
+    fn eff(
+        s: Option<&GuildSettings>,
+        global: Option<&str>,
+        default_guild: bool,
+        env: Option<&str>,
+    ) -> Option<String> {
+        effective_admin_role(&src(s, global, default_guild, env))
+    }
+
+    #[test]
+    fn guild_admin_role_id_wins_over_global_and_env() {
+        let s = settings(Some("1"), Some("n"));
+        assert_eq!(
+            eff(Some(&s), Some("g"), true, Some("e")).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            eff(Some(&s), Some("g"), false, Some("e")).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn guild_admin_role_name_used_when_id_absent_or_empty() {
+        for s in [settings(None, Some("n")), settings(Some(""), Some("n"))] {
+            assert_eq!(
+                eff(Some(&s), Some("g"), true, Some("e")).as_deref(),
+                Some("n")
+            );
+        }
+    }
+
+    #[test]
+    fn global_layer_applies_only_to_the_default_guild() {
+        let empty = settings(None, None);
+        assert_eq!(
+            eff(Some(&empty), Some("g"), true, Some("e")).as_deref(),
+            Some("g")
+        );
+        assert_eq!(eff(None, Some("g"), true, Some("e")).as_deref(), Some("g"));
+        // otro servidor: aislamiento estricto, cae directo al entorno (checkIsAdmin)
+        assert_eq!(
+            eff(Some(&empty), Some("g"), false, Some("e")).as_deref(),
+            Some("e")
+        );
+        assert_eq!(eff(None, Some("g"), false, None), None);
+    }
+
+    #[test]
+    fn env_is_the_last_resort_for_every_guild() {
+        assert_eq!(eff(None, None, true, Some("e")).as_deref(), Some("e"));
+        assert_eq!(eff(None, Some(""), true, Some("e")).as_deref(), Some("e"));
+        assert_eq!(eff(None, None, false, Some("e")).as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn empty_strings_count_as_absent() {
+        let s = settings(Some(""), Some(""));
+        assert_eq!(eff(Some(&s), Some(""), true, Some("")), None);
+        assert_eq!(eff(None, None, false, Some("")), None);
+        assert_eq!(eff(None, None, false, None), None);
+    }
+
+    #[test]
+    fn is_admin_uses_the_global_layer_for_the_default_guild_only() {
+        let roles = vec![role("9", "Staff", "0")];
+        let m = member(&["9"]);
+        assert!(super::is_admin(
+            &m,
+            &roles,
+            GUILD,
+            false,
+            &src(None, Some("9"), true, None)
+        ));
+        assert!(!super::is_admin(
+            &m,
+            &roles,
+            GUILD,
+            false,
+            &src(None, Some("9"), false, None)
+        ));
+        // nombre global, sin distinguir mayusculas
+        assert!(super::is_admin(
+            &m,
+            &roles,
+            GUILD,
+            false,
+            &src(None, Some("STAFF"), true, None)
+        ));
+    }
+
+    #[test]
+    fn administrator_permission_short_circuits_without_any_role_configured() {
+        let roles = vec![role("9", "Boss", "8")];
+        assert!(super::is_admin(
+            &member(&["9"]),
+            &roles,
+            GUILD,
+            false,
+            &AdminRoleSources::default()
+        ));
+    }
+
     #[test]
     fn permissions_or_everyone_and_member_roles() {
         let roles = vec![
@@ -756,30 +917,6 @@ mod tests {
             Some(&s),
             Some("")
         ));
-    }
-
-    #[test]
-    fn admin_role_precedence_matches_get_effective_config_for_guild() {
-        // settings.adminRoleId || settings.adminRoleName || env.ADMIN_ROLE_ID
-        assert_eq!(
-            effective_admin_role(Some(&settings(Some("1"), Some("n"))), Some("e")).as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            effective_admin_role(Some(&settings(None, Some("n"))), Some("e")).as_deref(),
-            Some("n")
-        );
-        assert_eq!(
-            effective_admin_role(Some(&settings(Some(""), Some("n"))), Some("e")).as_deref(),
-            Some("n")
-        );
-        assert_eq!(
-            effective_admin_role(Some(&settings(None, None)), Some("e")).as_deref(),
-            Some("e")
-        );
-        assert_eq!(effective_admin_role(None, Some("e")).as_deref(), Some("e"));
-        assert_eq!(effective_admin_role(None, None), None);
-        assert_eq!(effective_admin_role(None, Some("")), None);
     }
 
     #[test]

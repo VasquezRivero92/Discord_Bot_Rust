@@ -20,7 +20,8 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use web::discord::testing::FakeDiscordApi;
 use web::discord::{
-    check_discord_admin, DiscordApi, DiscordError, DiscordUser, GuildMember, RestDiscordApi, Role,
+    check_discord_admin, AdminRoleSources, DiscordApi, DiscordError, DiscordUser, GuildMember,
+    RestDiscordApi, Role,
 };
 use web::routes::auth::{self, AuthState};
 
@@ -167,7 +168,7 @@ async fn base_url_trailing_slashes_are_stripped_like_the_legacy() {
 // ---------------------------------------------------------------- callback (proxy)
 
 #[tokio::test]
-async fn callback_stays_on_the_proxy() {
+async fn standalone_router_does_not_handle_proxied_auth_routes() {
     for uri in [
         "/auth/discord/callback",
         "/auth/discord/callback?code=abc",
@@ -616,7 +617,7 @@ async fn check_admin_via_administrator_role() {
         )
         .with_owner("1", Ok("7".into()));
     assert_eq!(
-        check_discord_admin(&api, "1", "42", None, None).await,
+        check_discord_admin(&api, "1", "42", &AdminRoleSources::default()).await,
         Ok(true)
     );
     assert_eq!(
@@ -632,20 +633,20 @@ async fn check_admin_owner_and_non_member_and_errors() {
         .with_roles("1", Ok(vec![]))
         .with_owner("1", Ok("42".into()));
     assert_eq!(
-        check_discord_admin(&owner, "1", "42", None, None).await,
+        check_discord_admin(&owner, "1", "42", &AdminRoleSources::default()).await,
         Ok(true)
     );
 
     let absent = FakeDiscordApi::new().with_member("1", "42", Ok(None));
     assert_eq!(
-        check_discord_admin(&absent, "1", "42", None, None).await,
+        check_discord_admin(&absent, "1", "42", &AdminRoleSources::default()).await,
         Ok(false)
     );
     assert_eq!(absent.calls(), ["guild_member:1:42"]);
 
     let failing = FakeDiscordApi::new().with_member("1", "42", Err(DiscordError::Transport));
     assert_eq!(
-        check_discord_admin(&failing, "1", "42", None, None).await,
+        check_discord_admin(&failing, "1", "42", &AdminRoleSources::default()).await,
         Err(DiscordError::Transport)
     );
 }
@@ -659,4 +660,98 @@ async fn fake_api_is_usable_as_trait_object() {
         avatar: None,
     })));
     assert_eq!(api.exchange_code("c", "r").await.unwrap().id, "1");
+}
+
+// ---------------------------------------------------------------- composicion con el proxy
+
+async fn serve(app: Router) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+/// Compone como la Tarea 17: rutas de Rust + el proxy como fallback unico. El Node simulado
+/// contesta `LEGACY <metodo> <ruta>` y registra cada peticion que recibe.
+#[tokio::test]
+async fn auth_routes_compose_with_proxy_callback_and_steam_reach_legacy() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s2 = seen.clone();
+    let legacy = Router::new().fallback(axum::routing::any(move |req: Request| {
+        let s = s2.clone();
+        async move {
+            let line = format!("LEGACY {} {}", req.method(), req.uri().path());
+            s.lock().unwrap().push(line.clone());
+            line
+        }
+    }));
+    let legacy_addr = serve(legacy).await;
+    let proxy = web::proxy::fallback_proxy(format!("http://{legacy_addr}"), Default::default());
+    let front = serve(app().merge(proxy)).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Estas llegan al legacy.
+    for (method, path_q, path) in [
+        (
+            reqwest::Method::GET,
+            "/auth/discord/callback?code=x&state=/",
+            "/auth/discord/callback",
+        ),
+        (reqwest::Method::GET, "/auth/steam", "/auth/steam"),
+        (
+            reqwest::Method::GET,
+            "/auth/steam/callback",
+            "/auth/steam/callback",
+        ),
+        (
+            reqwest::Method::POST,
+            "/auth/demo-login",
+            "/auth/demo-login",
+        ),
+    ] {
+        let res = client
+            .request(method.clone(), format!("http://{front}{path_q}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{path_q}");
+        assert_eq!(
+            res.text().await.unwrap(),
+            format!("LEGACY {method} {path}"),
+            "{path_q}"
+        );
+    }
+    assert_eq!(seen.lock().unwrap().len(), 4);
+
+    // Estas las contesta Rust y el legacy no ve nada.
+    let res = client
+        .get(format!("http://{front}/auth/discord"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 302);
+    assert!(res.headers()["location"]
+        .to_str()
+        .unwrap()
+        .starts_with("https://discord.com/oauth2/authorize?"));
+
+    let res = client
+        .get(format!("http://{front}/auth/logout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 302);
+    assert_eq!(res.headers()["location"], "/");
+    assert_eq!(res.headers().get_all("set-cookie").iter().count(), 2);
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        4,
+        "el legacy no debe ver /auth/discord ni /auth/logout"
+    );
 }
