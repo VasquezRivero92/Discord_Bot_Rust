@@ -38,7 +38,7 @@ fn now() -> u64 {
 }
 
 fn state(secure: bool) -> SessionState {
-    SessionState::new(SECRET.as_bytes(), secure)
+    SessionState::new(SECRET.as_bytes(), secure).unwrap()
 }
 
 fn router() -> Router {
@@ -483,6 +483,84 @@ fn session_state_from_config_follows_production() {
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
     .collect();
     let cfg = common::config::Config::from_map(&vars).unwrap();
-    let st = SessionState::from_config(&cfg);
+    let st = SessionState::from_config(&cfg).unwrap();
     assert!(st.secure_cookies);
+}
+
+#[test]
+fn jwt_secret_with_edge_whitespace_verifies_token_signed_with_raw_secret() {
+    use std::collections::HashMap;
+    let raw = " s3cr3t ";
+    let vars: HashMap<String, String> = [
+        ("ADMIN_JWT_SECRET", raw),
+        ("BASE_URL", "http://localhost:15633"),
+        ("DISCORD_CLIENT_ID", "id"),
+        ("DISCORD_CLIENT_SECRET", "secret"),
+        ("DISCORD_TOKEN", "token"),
+        ("DISCORD_GUILD_ID", "guild"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let cfg = common::config::Config::from_map(&vars).unwrap();
+    let st = SessionState::from_config(&cfg).unwrap();
+    let t = sign(&claims("user", false, "x", now()), raw.as_bytes()).unwrap();
+    assert!(st.verify(&t).is_ok());
+    let trimmed = sign(&claims("user", false, "x", now()), raw.trim().as_bytes()).unwrap();
+    assert!(st.verify(&trimmed).is_err());
+}
+
+#[test]
+fn empty_secret_is_rejected_by_constructor() {
+    assert!(SessionState::new(b"", false).is_err());
+}
+
+#[test]
+fn token_expiring_exactly_now_is_rejected() {
+    // Node: `clockTimestamp >= exp` ya es TokenExpiredError.
+    let n = now();
+    let mut c = claims("user", false, "x", n);
+    c.exp = n;
+    assert!(verify(&token_for(&c), SECRET.as_bytes()).is_err());
+    c.exp = n + 5;
+    assert!(verify(&token_for(&c), SECRET.as_bytes()).is_ok());
+}
+
+#[test]
+fn token_without_iat_is_accepted_like_legacy() {
+    // jsonwebtoken (npm) no exige `iat`; solo firma y `exp`.
+    let c = claims("user", false, "x", now());
+    assert!(!c.extra.contains_key("iat"));
+    let got = verify(&token_for(&c), SECRET.as_bytes()).unwrap();
+    assert!(!got.extra.contains_key("iat"));
+}
+
+#[tokio::test]
+async fn verify_attempt_cap() {
+    let good = token_for(&claims("user", false, "x", now()));
+    // 16 candidatos inválidos agotan el tope: el válido número 17 no se prueba.
+    let bad: Vec<Vec<u8>> = (0..16)
+        .map(|i| cookie("auth_token", &format!("bad{i}")))
+        .collect();
+    let mut with_good_late: Vec<&[u8]> = bad.iter().map(|v| v.as_slice()).collect();
+    let g = cookie("admin_token", &good);
+    with_good_late.push(&g);
+    let (s, _, _) = call("/auth", &with_good_late).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // con 15 inválidos, el válido es el 16 y entra
+    let mut ok: Vec<&[u8]> = bad[..15].iter().map(|v| v.as_slice()).collect();
+    ok.push(&g);
+    let (s, _, _) = call("/auth", &ok).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[test]
+fn clear_cookies_header_has_expires_epoch() {
+    let h = set_cookie_values(&clear_cookies());
+    for v in h {
+        assert!(
+            v.to_str().unwrap().contains("Expires=Thu, 01 Jan 1970"),
+            "{v:?}"
+        );
+    }
 }

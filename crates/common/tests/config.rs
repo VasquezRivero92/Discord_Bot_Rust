@@ -69,6 +69,12 @@ fn empty_required_value_is_missing() {
 }
 
 #[test]
+fn jwt_secret_keeps_edge_whitespace() {
+    let cfg = Config::from_map(&with(&[("ADMIN_JWT_SECRET", " s3cr3t ")])).unwrap();
+    assert_eq!(cfg.admin_jwt_secret, " s3cr3t ");
+}
+
+#[test]
 fn defaults_apply() {
     let cfg = Config::from_map(&base()).unwrap();
     assert_eq!(cfg.port, 15633);

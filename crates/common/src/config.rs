@@ -187,7 +187,13 @@ fn origin_of(url: &str) -> Option<String> {
 impl Config {
     /// Construye la configuración a partir de un mapa de variables.
     pub fn from_map(vars: &HashMap<String, String>) -> Result<Config, ConfigError> {
-        let admin_jwt_secret = required(vars, "ADMIN_JWT_SECRET")?;
+        // El legacy usa el valor crudo de `process.env`: no se recorta (un
+        // secreto con espacios en los bordes firmaría distinto). Solo se
+        // rechaza si queda vacío tras recortar.
+        let admin_jwt_secret = match vars.get("ADMIN_JWT_SECRET") {
+            Some(v) if !v.trim().is_empty() => v.clone(),
+            _ => return Err(ConfigError::Missing("ADMIN_JWT_SECRET")),
+        };
         // config/index.js:28: `.replace(/\/+$/, '')`, una sola vez aquí.
         let raw_base_url = required(vars, "BASE_URL")?;
         let base_url = raw_base_url.trim_end_matches('/').to_owned();
