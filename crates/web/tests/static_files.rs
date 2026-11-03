@@ -72,6 +72,11 @@ fn fixture() -> Fixture {
     write(&public, "pic.png", "PNG");
     write(&public, "data.json", "{}");
     write(&public, "robots.txt", "User-agent: *");
+    write(&public, "assets/app.min.js", "min");
+    write(&public, ".secret", "DOTSECRET");
+    write(&public, ".hidden/x.txt", "DOTSECRET");
+    write(&public, "sub/.env", "DOTSECRET");
+    write(&public, ".well-known/x.txt", "DOTSECRET");
     fs::create_dir_all(public.join("emptydir")).unwrap();
     write(tmp.path(), "secret.txt", "SECRET-OUTSIDE");
     let app = marker_app(&public);
@@ -237,16 +242,16 @@ async fn halloween_case_variants_and_trailing_slash() {
         assert_eq!((s, b.as_str()), (StatusCode::OK, "HALLOWEEN"), "{uri}");
     }
     // Without slash: static dir redirect (Express 301, tower-http 307) to the slash form.
-    for uri in ["/halloween", "/Halloween"] {
-        let (s, h, _) = get(&f.app, uri).await;
-        assert!(s.is_redirection(), "{uri}");
-        assert!(h
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .ends_with('/'));
-    }
+    // Lowercase always matches the directory on disk -> redirect.
+    let (s, h, _) = get(&f.app, "/halloween").await;
+    assert!(s.is_redirection());
+    assert_eq!(h.get(header::LOCATION).unwrap(), "/halloween/");
+    // `/Halloween` depends on the filesystem: case-insensitive FS (Windows/macOS) matches the
+    // directory and redirects; case-sensitive FS (Linux) misses static and the route answers 200.
+    let (s, h, b) = get(&f.app, "/Halloween").await;
+    let redirected = s.is_redirection() && h.get(header::LOCATION).unwrap() == "/Halloween/";
+    let served = s == StatusCode::OK && b == "HALLOWEEN";
+    assert!(redirected || served, "{s:?} {b}");
     // Admin: halloween/admin.html (this fixture has no halloween/admin/ directory).
     for uri in [
         "/halloween/admin",
@@ -494,4 +499,28 @@ async fn routes_default_fallback_is_404() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _, b) = get(&app, "/tienda").await;
     assert_eq!((s, b.as_str()), (StatusCode::OK, "INDEX"));
+}
+
+#[tokio::test]
+async fn dotfiles_are_ignored_and_fall_through() {
+    let f = fixture();
+    for uri in [
+        "/.secret",
+        "/%2esecret",
+        "/%2Esecret",
+        "/.hidden/x.txt",
+        "/%2ehidden/x.txt",
+        "/sub/.env",
+        "/sub/%2eenv",
+        "/.well-known/x.txt",
+    ] {
+        let r = get(&f.app, uri).await;
+        assert!(!r.2.contains("DOTSECRET"), "{uri} leaked");
+        assert!(is_fallback(&r), "{uri} -> {:?}", r.0);
+    }
+    let (s, _, b) = get(&f.app, "/robots.txt").await;
+    assert_eq!((s, b.as_str()), (StatusCode::OK, "User-agent: *"));
+    let (s, h, b) = get(&f.app, "/assets/app.min.js").await;
+    assert_eq!((s, b.as_str()), (StatusCode::OK, "min"));
+    assert_eq!(cc(&h), "public, max-age=31536000, immutable");
 }

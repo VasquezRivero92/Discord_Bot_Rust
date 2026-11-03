@@ -8,6 +8,15 @@
 //! 3. the legacy `app.get` routes (admin, legal, public SPA, halloween);
 //! 4. the legacy `GET *` rule (index.html unless excluded);
 //! 5. anything else goes to the caller's fallback (the proxy).
+//!
+//! Requests with any dot-prefixed path segment (`.env`, `.git/x`, `%2e`-encoded, `.well-known`)
+//! are never served from `static_dir` (Express `dotfiles: 'ignore'`) and go straight to the
+//! caller's fallback.
+//!
+//! # Deviations from Express
+//! * Directory requests without trailing slash redirect with 307 (tower-http), Express uses 301.
+//! * No ETag / If-None-Match: only Last-Modified / If-Modified-Since are supported.
+//! * The `assets` cache rule is matched on the URL path, Express matches the absolute file path.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -132,6 +141,31 @@ fn spa_target(path: &str) -> Option<Target> {
     t("index.html", NoStoreFull)
 }
 
+/// True if any percent-decoded path segment starts with `.` (also checked on raw bytes,
+/// so invalid UTF-8 or odd encodings cannot hide a dot segment).
+fn has_dot_segment(path: &str) -> bool {
+    let raw = path.as_bytes();
+    let mut dec = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                dec.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        dec.push(raw[i]);
+        i += 1;
+    }
+    let starts_dot = |b: &[u8]| {
+        b.split(|c| *c == b'/' || *c == 0x5c)
+            .any(|seg| seg.first() == Some(&b'.'))
+    };
+    starts_dot(&dec) || starts_dot(raw)
+}
+
 /// Paths owned by the Node API/auth/webhook routers: never answered here.
 fn is_api_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -199,7 +233,7 @@ where
     let path = req.uri().path().to_owned();
     let is_read = matches!(*req.method(), Method::GET | Method::HEAD);
 
-    if !is_read || is_api_path(&path) {
+    if !is_read || is_api_path(&path) || has_dot_segment(&path) {
         return fallback.oneshot(req).await.unwrap_or_else(|e| match e {});
     }
 
