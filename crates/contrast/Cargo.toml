@@ -1,0 +1,18 @@
+[package]
+name = "contrast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["time"] }
+thiserror.workspace = true
+web = { path = "../web" }
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+tempfile = "3"

@@ -1,0 +1,24 @@
+# Rutas publicas migradas en la Tarea 12 (diagnostico y API publica de solo lectura).
+# `GET /health` no esta aqui: sigue en el proxy (depende del estado del gateway de Discord).
+
+[[case]]
+name = "ping sin cookies"
+path = "/api/ping"
+# El resto del cuerpo (ok, cookies, hasAdminToken, secure, protocol) debe ser identico.
+ignore_fields = ["timestamp"]
+
+[[case]]
+name = "ping con cookies y proxy https"
+path = "/api/ping"
+ignore_fields = ["timestamp"]
+# Las cookies viajan como cabecera cruda (el valor nunca se imprime en la respuesta).
+headers = { Cookie = "theme=dark; admin_token=valor-de-prueba; auth_token=otro", "X-Forwarded-Proto" = "https, http" }
+
+[[case]]
+name = "catalogo de productos"
+path = "/api/products"
+
+[[case]]
+name = "reclamacion inexistente"
+path = "/api/reclamaciones/LR-0000-000000"
+expect_status = 404

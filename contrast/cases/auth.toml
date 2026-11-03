@@ -1,0 +1,37 @@
+# Rutas de autenticacion migradas en la Tarea 13: GET /auth/discord y GET /auth/logout.
+# El runner no sigue redirecciones: se compara estado y `location`. Con el mismo entorno
+# (DISCORD_CLIENT_ID, BASE_URL) en ambos lados, la URL de autorizacion es identica.
+# `/auth/discord/callback` NO esta aqui: sigue en el proxy (escribe en Firestore).
+
+[[case]]
+name = "discord redirige a authorize"
+path = "/auth/discord"
+
+[[case]]
+name = "discord conserva la ruta de retorno segura"
+path = "/auth/discord?redirect=/admin"
+
+[[case]]
+name = "discord descarta redirect hacia otro sitio"
+path = "/auth/discord?redirect=//evil.example"
+
+[[case]]
+name = "discord descarta redirect con esquema"
+path = "/auth/discord?redirect=https://evil.example/"
+
+[[case]]
+name = "discord descarta redirect con barra invertida"
+path = "/auth/discord?redirect=/%5Cevil.example"
+
+[[case]]
+name = "discord con redirect repetido"
+path = "/auth/discord?redirect=/a&redirect=/b"
+
+[[case]]
+name = "logout sin cookies"
+path = "/auth/logout"
+
+[[case]]
+name = "logout con cookies"
+path = "/auth/logout"
+headers = { Cookie = "auth_token=valor-de-prueba; admin_token=otro" }
