@@ -2,6 +2,7 @@ use axum::Router;
 
 pub mod middleware;
 pub mod proxy;
+pub mod session;
 pub mod static_files;
 
 /// Builds the application router. Unknown routes return 404.
