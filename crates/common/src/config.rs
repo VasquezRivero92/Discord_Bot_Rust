@@ -76,6 +76,220 @@ pub fn firestore_mode(cfg: &Config) -> Result<FirestoreMode, ConfigError> {
     Err(ConfigError::NoFirestoreCredentials)
 }
 
+/// Cola de partidas definida por entorno (`getQueuesFromEnv` de `config/index.js`).
+///
+/// Los nombres legados (camelCase) son los del objeto que construye el legacy: `id`, `queueId`,
+/// `name`, `discordMatchesChannelId`, `discordWaitingRoomChannelId`, `discordMixtonChannelId`,
+/// `discordMatchAccessRoleId`, `hubRoleId` (solo en las colas numeradas) y `discordHubRoleId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvQueue {
+    pub id: String,
+    pub queue_id: String,
+    pub name: String,
+    pub discord_matches_channel_id: String,
+    pub discord_waiting_room_channel_id: String,
+    pub discord_mixton_channel_id: String,
+    pub discord_match_access_role_id: String,
+    /// `None` en las colas por listas separadas por coma (el legacy no pone la clave).
+    pub hub_role_id: Option<String>,
+    pub discord_hub_role_id: String,
+}
+
+/// Capa de entorno de `getEffectiveConfig` (`config/index.js` ~128-160): la última de la cadena
+/// `settings.x || process.env.X || env.X`. Como el resto de [`Config`], los valores se recortan y
+/// un valor vacío cuenta como ausente (en JS `''` también es falso).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvDefaults {
+    /// `DISCORD_LINK_CHANNEL_ID`
+    pub discord_link_channel_id: Option<String>,
+    /// `DISCORD_MATCHES_CHANNEL_ID`
+    pub discord_matches_channel_id: Option<String>,
+    /// `DISCORD_MIXTON_CHANNEL_ID`
+    pub discord_mixton_channel_id: Option<String>,
+    /// `DISCORD_ROLES_CHANNEL_ID`
+    pub discord_roles_channel_id: Option<String>,
+    /// `DISCORD_STATUS_CHANNEL_ID`
+    pub discord_status_channel_id: Option<String>,
+    /// `DISCORD_ADMIN_ALERTS_CHANNEL_ID`
+    pub discord_admin_alerts_channel_id: Option<String>,
+    /// `DISCORD_WAITING_ROOM_CHANNEL_ID`
+    pub discord_waiting_room_channel_id: Option<String>,
+    /// `DISCORD_SANCTIONS_CHANNEL_ID`
+    pub discord_sanctions_channel_id: Option<String>,
+    /// `DISCORD_SUPPORT_CHANNEL_ID`
+    pub discord_support_channel_id: Option<String>,
+    /// `DISCORD_MUSIC_CHANNEL_ID`
+    pub discord_music_channel_id: Option<String>,
+    /// `DISCORD_RECHARGE_CHANNEL_ID`
+    pub discord_recharge_channel_id: Option<String>,
+    /// `DISCORD_MIXTON_CHAT_CHANNEL_ID`
+    pub discord_mixton_chat_channel_id: Option<String>,
+    /// `DISCORD_MATCH_ACCESS_ROLE_ID`
+    pub discord_match_access_role_id: Option<String>,
+    /// `FACEIT_HUB_ROLE_ID`
+    pub faceit_hub_role_id: Option<String>,
+    /// `DISCORD_HUB_ROLE_ID`
+    pub discord_hub_role_id: Option<String>,
+    /// `FACEIT_CLUB_ID`
+    pub faceit_club_id: Option<String>,
+    /// `FACEIT_HUB_ID`
+    pub faceit_hub_id: Option<String>,
+    /// `FACEIT_LEADERBOARD_ID`
+    pub faceit_leaderboard_id: Option<String>,
+    /// `MATCH_TIMEOUT_MINUTES`, en crudo (el legacy le aplica `parseInt`).
+    pub match_timeout_minutes: Option<String>,
+    /// `GAMES_PER_MATCH`, en crudo (el legacy le aplica `Number`).
+    pub games_per_match: Option<String>,
+    /// `ROUNDS_PER_GAME`, en crudo (alias legado de `GAMES_PER_MATCH`).
+    pub rounds_per_game: Option<String>,
+    /// Colas de `getQueuesFromEnv`.
+    pub queues: Vec<EnvQueue>,
+}
+
+/// Lista separada por comas, recortada y sin vacíos.
+fn csv(vars: &HashMap<String, String>, key: &str) -> Vec<String> {
+    get(vars, key)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Primera de `keys` con valor.
+fn first_of(vars: &HashMap<String, String>, keys: &[String]) -> Option<String> {
+    keys.iter().find_map(|k| optional(vars, k))
+}
+
+/// Puerto de `getQueuesFromEnv` (`config/index.js` ~68-122).
+fn env_queues(vars: &HashMap<String, String>) -> Vec<EnvQueue> {
+    let mut queues = Vec::new();
+    // 1. Colas numeradas QUEUE1..QUEUE10.
+    for i in 1..=10 {
+        let pair = |a: String, b: String| first_of(vars, &[a, b]);
+        let queue_id = pair(
+            format!("FACEIT_QUEUE{i}_ID"),
+            format!("FACEIT_QUEUE_{i}_ID"),
+        );
+        let name = pair(
+            format!("DISCORD_QUEUE{i}_NAME"),
+            format!("FACEIT_QUEUE{i}_NAME"),
+        )
+        .unwrap_or_else(|| format!("Cola {i}"));
+        let matches = pair(
+            format!("DISCORD_QUEUE{i}_MATCHES_CHANNEL_ID"),
+            format!("DISCORD_QUEUE_{i}_MATCHES_CHANNEL_ID"),
+        );
+        let waiting = pair(
+            format!("DISCORD_QUEUE{i}_WAITING_ROOM_CHANNEL_ID"),
+            format!("DISCORD_QUEUE_{i}_WAITING_ROOM_CHANNEL_ID"),
+        );
+        let mixton = pair(
+            format!("DISCORD_QUEUE{i}_MIXTON_CHANNEL_ID"),
+            format!("DISCORD_QUEUE_{i}_MIXTON_CHANNEL_ID"),
+        );
+        let access = pair(
+            format!("DISCORD_QUEUE{i}_MATCH_ACCESS_ROLE_ID"),
+            format!("DISCORD_QUEUE_{i}_MATCH_ACCESS_ROLE_ID"),
+        );
+        let hub_role = first_of(
+            vars,
+            &[
+                format!("FACEIT_QUEUE{i}_HUB_ROLE_ID"),
+                format!("FACEIT_QUEUE_{i}_HUB_ROLE_ID"),
+                format!("QUEUE{i}_HUB_ROLE_ID"),
+                format!("QUEUE_{i}_HUB_ROLE_ID"),
+            ],
+        );
+        let discord_hub_role = pair(
+            format!("DISCORD_QUEUE{i}_HUB_ROLE_ID"),
+            format!("DISCORD_QUEUE_{i}_HUB_ROLE_ID"),
+        );
+        if queue_id.is_some() || matches.is_some() || waiting.is_some() {
+            let id = queue_id.unwrap_or_else(|| format!("queue_{i}"));
+            queues.push(EnvQueue {
+                queue_id: id.clone(),
+                id,
+                name,
+                discord_matches_channel_id: matches.unwrap_or_default(),
+                discord_waiting_room_channel_id: waiting.unwrap_or_default(),
+                discord_mixton_channel_id: mixton.unwrap_or_default(),
+                discord_match_access_role_id: access.unwrap_or_default(),
+                hub_role_id: Some(hub_role.unwrap_or_default()),
+                discord_hub_role_id: discord_hub_role.unwrap_or_default(),
+            });
+        }
+    }
+    // 2. Sin colas numeradas: listas separadas por coma en las variables base (más de una).
+    if queues.is_empty() {
+        let matches = csv(vars, "DISCORD_MATCHES_CHANNEL_ID");
+        let waiting = csv(vars, "DISCORD_WAITING_ROOM_CHANNEL_ID");
+        let mixton = csv(vars, "DISCORD_MIXTON_CHANNEL_ID");
+        let ids = csv(vars, "FACEIT_QUEUE_IDS");
+        // Como el legacy: la lista de Mixton no cuenta para la longitud.
+        let max_len = matches.len().max(waiting.len()).max(ids.len());
+        if max_len > 1 {
+            let at = |list: &[String], i: usize| {
+                list.get(i)
+                    .or_else(|| list.first())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            for i in 0..max_len {
+                let id = ids
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("queue_{}", i + 1));
+                queues.push(EnvQueue {
+                    queue_id: id.clone(),
+                    id,
+                    name: format!("Cola {}", i + 1),
+                    discord_matches_channel_id: at(&matches, i),
+                    discord_waiting_room_channel_id: at(&waiting, i),
+                    discord_mixton_channel_id: at(&mixton, i),
+                    discord_match_access_role_id: optional(vars, "DISCORD_MATCH_ACCESS_ROLE_ID")
+                        .unwrap_or_default(),
+                    hub_role_id: None,
+                    discord_hub_role_id: optional(vars, "DISCORD_HUB_ROLE_ID").unwrap_or_default(),
+                });
+            }
+        }
+    }
+    queues
+}
+
+impl EnvDefaults {
+    /// Lee la capa de entorno de un mapa de variables.
+    pub fn from_map(vars: &HashMap<String, String>) -> EnvDefaults {
+        let o = |key: &str| optional(vars, key);
+        EnvDefaults {
+            discord_link_channel_id: o("DISCORD_LINK_CHANNEL_ID"),
+            discord_matches_channel_id: o("DISCORD_MATCHES_CHANNEL_ID"),
+            discord_mixton_channel_id: o("DISCORD_MIXTON_CHANNEL_ID"),
+            discord_roles_channel_id: o("DISCORD_ROLES_CHANNEL_ID"),
+            discord_status_channel_id: o("DISCORD_STATUS_CHANNEL_ID"),
+            discord_admin_alerts_channel_id: o("DISCORD_ADMIN_ALERTS_CHANNEL_ID"),
+            discord_waiting_room_channel_id: o("DISCORD_WAITING_ROOM_CHANNEL_ID"),
+            discord_sanctions_channel_id: o("DISCORD_SANCTIONS_CHANNEL_ID"),
+            discord_support_channel_id: o("DISCORD_SUPPORT_CHANNEL_ID"),
+            discord_music_channel_id: o("DISCORD_MUSIC_CHANNEL_ID"),
+            discord_recharge_channel_id: o("DISCORD_RECHARGE_CHANNEL_ID"),
+            discord_mixton_chat_channel_id: o("DISCORD_MIXTON_CHAT_CHANNEL_ID"),
+            discord_match_access_role_id: o("DISCORD_MATCH_ACCESS_ROLE_ID"),
+            faceit_hub_role_id: o("FACEIT_HUB_ROLE_ID"),
+            discord_hub_role_id: o("DISCORD_HUB_ROLE_ID"),
+            faceit_club_id: o("FACEIT_CLUB_ID"),
+            faceit_hub_id: o("FACEIT_HUB_ID"),
+            faceit_leaderboard_id: o("FACEIT_LEADERBOARD_ID"),
+            match_timeout_minutes: o("MATCH_TIMEOUT_MINUTES"),
+            games_per_match: o("GAMES_PER_MATCH"),
+            rounds_per_game: o("ROUNDS_PER_GAME"),
+            queues: env_queues(vars),
+        }
+    }
+}
+
 /// Configuración de la aplicación.
 #[derive(Clone)]
 pub struct Config {
@@ -103,6 +317,8 @@ pub struct Config {
     pub firestore_emulator_host: Option<String>,
     /// Opt-in explícito a Application Default Credentials.
     pub firestore_use_adc: bool,
+    /// Capa de entorno de la configuración efectiva (`getEffectiveConfig`).
+    pub env_defaults: EnvDefaults,
 }
 
 impl fmt::Debug for Config {
@@ -132,6 +348,7 @@ impl fmt::Debug for Config {
             )
             .field("firestore_emulator_host", &self.firestore_emulator_host)
             .field("firestore_use_adc", &self.firestore_use_adc)
+            .field("env_defaults", &self.env_defaults)
             .finish()
     }
 }
@@ -260,6 +477,7 @@ impl Config {
                 .map(PathBuf::from),
             firestore_emulator_host: optional(vars, "FIRESTORE_EMULATOR_HOST"),
             firestore_use_adc,
+            env_defaults: EnvDefaults::from_map(vars),
         })
     }
 

@@ -9,28 +9,24 @@
 use crate::cache::TtlCache;
 use crate::error::DataError;
 use crate::firestore::{ChangeEvent, FirestoreClient};
+use crate::model::node_timestamp_verbatim;
 use crate::source::{from_json, strip_synthetic, DocSource};
+pub(crate) use crate::watch::WatcherHandle;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 /// Vida de una entrada de `guild_settings` en caché (`GUILD_SETTINGS_TTL` de `database.js`).
 pub const GUILD_SETTINGS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 const COLLECTION: &str = "guild_settings";
 const MAX_GUILDS: u64 = 10_000;
-const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// Un stream que aguanta más que esto se considera sano: la espera vuelve al mínimo.
-const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Ok(match Option::<Value>::deserialize(d)? {
@@ -231,13 +227,15 @@ pub struct GuildSettings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub queues: Vec<Value>,
-    /// `updatedAt`: `serverTimestamp()` de la última escritura (texto RFC 3339 al decodificar).
+    /// `updatedAt`: `serverTimestamp()` de la última escritura; se serializa como
+    /// `{ _seconds, _nanoseconds }` (como `res.json` del legacy). Otro valor presente (`null`,
+    /// un número, ...) se conserva tal cual.
     #[serde(
         default,
-        deserialize_with = "lenient_string",
+        deserialize_with = "node_timestamp_verbatim",
         skip_serializing_if = "Option::is_none"
     )]
-    pub updated_at: Option<String>,
+    pub updated_at: Option<Value>,
     /// Cualquier otro campo del documento, sin perder nada.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -279,29 +277,6 @@ impl GuildSettingsSource for FirestoreClient {
 
     fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>> {
         self.watch_collection(COLLECTION).boxed()
-    }
-}
-
-/// Tarea del watcher; soltarla (o `abort`) la detiene.
-pub struct WatcherHandle {
-    task: JoinHandle<()>,
-}
-
-impl WatcherHandle {
-    /// Detiene el watcher.
-    pub fn abort(&self) {
-        self.task.abort();
-    }
-
-    /// `true` si la tarea ya terminó.
-    pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
-    }
-}
-
-impl Drop for WatcherHandle {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 
@@ -363,54 +338,13 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
     /// borrado entre la apertura y ese momento, que nunca recibe `Removed`). Cuando el stream termina
     /// (error o fin) se invalida todo y se reabre con espera exponencial (1 s, el doble cada vez,
     /// tope 60 s; vuelve a 1 s tras un stream que duró más de 60 s). El TTL sigue siendo la única
-    /// cota si el listener cae sin avisar.
+    /// cota si el listener cae sin avisar. (El bucle es [`crate::watch::keep_cache_in_sync`],
+    /// compartido con `global_settings`.)
     pub fn spawn_watcher(self: Arc<Self>) -> WatcherHandle {
-        let task = tokio::spawn(async move { self.watch_loop().await });
-        WatcherHandle { task }
-    }
-
-    async fn watch_loop(&self) {
-        let mut backoff = BACKOFF_MIN;
-        let mut first = true;
-        loop {
-            if !first {
-                self.restarts.fetch_add(1, Ordering::Relaxed);
-            }
-            first = false;
-            let opened = Instant::now();
-            let mut stream = self.source.watch();
-            // Al (re)abrir también se invalida todo: un borrado durante la espera no emite evento.
-            self.cache.invalidate_all();
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(ChangeEvent::Added(id)) | Ok(ChangeEvent::Modified(id)) => {
-                        self.invalidate(&id).await
-                    }
-                    // Borrado: se descarta también la copia vieja (no servirla ante cuota).
-                    Ok(ChangeEvent::Removed(id)) => self.cache.purge(&id).await,
-                    Ok(ChangeEvent::Reset) => self.cache.invalidate_all(),
-                    // Instantánea actual: lo que no está en ella se borró (quizá sin evento) y
-                    // tampoco se sirve su copia vieja ante cuota.
-                    Ok(ChangeEvent::Synced(ids)) => {
-                        let present: HashSet<String> = ids.into_iter().collect();
-                        self.cache
-                            .invalidate_all_and_purge_stale_unless(|id| present.contains(id))
-                            .await
-                    }
-                    Err(_) => {
-                        self.cache.invalidate_all();
-                        break;
-                    }
-                }
-            }
-            drop(stream);
-            self.cache.invalidate_all();
-            if opened.elapsed() > STABLE_AFTER {
-                backoff = BACKOFF_MIN;
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
-        }
+        WatcherHandle::new(tokio::spawn(async move {
+            crate::watch::keep_cache_in_sync(&self.cache, &self.restarts, || self.source.watch())
+                .await
+        }))
     }
 }
 
@@ -507,7 +441,10 @@ mod tests {
         assert_eq!(id, "g1");
         assert_eq!(s.admin_role_id.as_deref(), Some("9"));
         assert_eq!(s.games_per_match, Some(3));
-        assert!(s.updated_at.unwrap().starts_with("2026-11-02T10:00:00"));
+        assert_eq!(
+            s.updated_at,
+            Some(serde_json::json!({"_seconds": 1_793_613_600_i64, "_nanoseconds": 0}))
+        );
         assert_eq!(s.extra["customFlag"], Value::Bool(true));
     }
 
