@@ -1,0 +1,98 @@
+[
+  {
+    "id": "prod_torneo_diario",
+    "name": "Entrada a Torneo Mixtón Diario",
+    "category": "Torneos",
+    "price": 5,
+    "currency": "PEN",
+    "badge": "Popular",
+    "description": "Pase de acceso individual para 1 jornada completa de torneos Mixtón en servidores oficiales con anticheat FACEIT. Emparejamiento por Tiers competitivos (S, A, B, C) y registro de estadísticas.",
+    "features": [
+      "Acceso a partidas clasificatorias del día",
+      "Servidores dedicados de bajo ping en Lima",
+      "Anticheat oficial de FACEIT activo",
+      "Registro de estadísticas K/D y ADR"
+    ],
+    "image": "https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=600&q=80"
+  },
+  {
+    "id": "prod_pack_10",
+    "name": "Pack Gamer - 10 Créditos de Pozo",
+    "category": "Créditos",
+    "price": 10,
+    "currency": "PEN",
+    "badge": "Básico",
+    "description": "Paquete de 10 créditos para participar en cuotas y pozos de premios de partidas competitivas en la Arena Mixtón. Acreditación automática e inmediata a tu billetera.",
+    "features": [
+      "10 créditos para cuotas de partidas",
+      "Participación en pozos de torneos",
+      "Acreditación inmediata tras verificación del depósito Yape",
+      "Saldo sin fecha de caducidad"
+    ],
+    "image": "https://images.unsplash.com/photo-1614680376593-902f749f7ffc?auto=format&fit=crop&w=600&q=80"
+  },
+  {
+    "id": "prod_pack_25",
+    "name": "Pack Pro - 25 Créditos + Insignia",
+    "category": "Créditos",
+    "price": 25,
+    "currency": "PEN",
+    "badge": "Recomendado",
+    "description": "Paquete de 25 créditos para torneos y partidas. Incluye insignia distintiva dorada en tu perfil del lobby y prioridad en colas de emparejamiento.",
+    "features": [
+      "25 créditos para cuotas y torneos",
+      "Insignia PRO dorada en el lobby",
+      "Prioridad de asignación en salas",
+      "Soporte preferencial en Discord"
+    ],
+    "image": "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?auto=format&fit=crop&w=600&q=80"
+  },
+  {
+    "id": "prod_vip_30",
+    "name": "Membresía VIP Club Mensual (30 Días)",
+    "category": "Membresías",
+    "price": 35,
+    "currency": "PEN",
+    "badge": "VIP",
+    "description": "Suscripción mensual con acceso total a salas de entrenamiento exclusivas, registro de estadísticas avanzadas de rendimiento, canal VIP en Discord y soporte prioritario 24/7.",
+    "features": [
+      "Acceso irrestricto a salas VIP",
+      "Rol VIP en Discord con color exclusivo",
+      "Analítica avanzada de partidas y mapas",
+      "Sorteos mensuales de skins de CS2"
+    ],
+    "image": "https://images.unsplash.com/photo-1511512578047-dfb367046420?auto=format&fit=crop&w=600&q=80"
+  },
+  {
+    "id": "prod_season_pass",
+    "name": "Season Pass CS2 Arena (Pase Oficial)",
+    "category": "Temporadas",
+    "price": 50,
+    "currency": "PEN",
+    "badge": "Temporada",
+    "description": "Inscripción oficial a la tabla de clasificación por premios en efectivo al final de la temporada oficial, con premios en Soles (PEN) para el top 10 y medalla honorífica.",
+    "features": [
+      "Inscripción al Leaderboard de la Temporada",
+      "Acceso a pozo final de premios en efectivo",
+      "Medalla conmemorativa en perfil",
+      "Pase para las finales de temporada"
+    ],
+    "image": "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?auto=format&fit=crop&w=600&q=80"
+  },
+  {
+    "id": "prod_coaching_1h",
+    "name": "Sesión de Coaching Táctico 1v1 (60 Min)",
+    "category": "Entrenamiento",
+    "price": 40,
+    "currency": "PEN",
+    "badge": "Pro",
+    "description": "Clase táctica de 60 minutos con un jugador de nivel 10 FACEIT. Incluye revisión de repeticiones de partidas, posicionamiento, crosshair placement, utilidades y optimización de binds.",
+    "features": [
+      "60 minutos de análisis 1 a 1 por voz y pantalla",
+      "Revisión profunda de repeticiones de tus partidas de CS2",
+      "Guía personalizada de utilidades y setups",
+      "Plan de mejora individual de puntería y juego"
+    ],
+    "image": "https://images.unsplash.com/photo-1550745165-9bc0b252726f?auto=format&fit=crop&w=600&q=80"
+  }
+]

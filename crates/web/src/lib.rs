@@ -2,6 +2,7 @@ use axum::Router;
 
 pub mod middleware;
 pub mod proxy;
+pub mod routes;
 pub mod session;
 pub mod static_files;
 

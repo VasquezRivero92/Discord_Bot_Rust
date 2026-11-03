@@ -19,7 +19,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | metodo | ruta | auth | origen | linea | colecciones | usa Discord | fase | notas |
 |---|---|---|---|---|---|---|---|---|
-| GET | /health | none | index.js | 280 | - | gateway? | 1 | Lee client.readyAt (estado del gateway del bot); en Rust sin bot hay que decidir como reportarlo |
+| GET | /health | none | index.js | 280 | - | gateway | proxy | Sigue en el proxy: el cuerpo incluye discord (client.readyAt, estado del gateway) y uptime del proceso Node; Rust no puede reportarlo |
 | GET | /webhook/faceit | none | index.js | 290 | - | no | 2 | Verificacion GET del webhook |
 | GET | /webhooks/faceit | none | index.js | 290 | - | no | 2 | Alias de verificacion GET |
 | POST | /webhook/faceit | webhookLimiter | index.js | 299 | (via webhooks/faceit.js) | ? | 2 | Webhook Faceit |
@@ -28,7 +28,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | GET | /api/matchmaking/status | requireSteamApiKey | index.js | 350 | - | no | proxy | Steam/matchmaking |
 | POST | /api/matchmaking/launch | requireSteamApiKey | index.js | 353 | - | no | proxy | Steam/matchmaking |
 | POST | /api/matchzy/event | none | index.js | 360 | ? | ? | 2 | Eventos MatchZy |
-| GET | /api/ping | none | index.js | 399 | - | no | 1 | Diagnostico: cookies/protocolo |
+| GET | /api/ping | none | index.js | 399 | - | no | 1 | migrado (Tarea 12): diagnostico cookies/protocolo |
 | ALL | /api/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
 | ALL | /api/club/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
 | ALL | /api/leaderboard/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
@@ -223,7 +223,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | metodo | ruta | auth | origen | linea | colecciones | usa Discord | fase | notas |
 |---|---|---|---|---|---|---|---|---|
-| GET | /api/products | none | routes/publicApi.js | 108 | - | no | 1 | Catalogo estatico en el codigo |
-| POST | /api/reclamaciones | none | routes/publicApi.js | 123 | claims | no | proxy | Escritura |
-| GET | /api/reclamaciones/:code | none | routes/publicApi.js | 209 | claims | no | 1 |  |
+| GET | /api/products | none | routes/publicApi.js | 108 | - | no | 1 | migrado (Tarea 12): catalogo estatico en crates/web/src/routes/products.json (tools/gen-products.mjs) |
+| POST | /api/reclamaciones | none | routes/publicApi.js | 123 | claims | no | proxy | Escritura; sigue en el proxy |
+| GET | /api/reclamaciones/:code | none | routes/publicApi.js | 209 | claims | no | 1 | migrado (Tarea 12): lectura por id de documento (claims/{code}) |
 | POST | /api/checkout/purchase | none | routes/publicApi.js | 224 | orders, faceit_users | no | proxy | Escritura (descuenta saldo) |

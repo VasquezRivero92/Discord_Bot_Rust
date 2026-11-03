@@ -1,11 +1,13 @@
 //! Crate `data`: acceso a Firestore (lecturas, listados y listeners de colecciones).
 
 mod cache;
+mod claims;
 mod error;
 mod firestore;
 mod guild_settings;
 
 pub use crate::cache::TtlCache;
+pub use crate::claims::{Claim, ClaimsRepo, FirestoreClaimsRepo, InMemoryClaimsRepo};
 pub use crate::error::DataError;
 pub use crate::firestore::{document_id, ChangeEvent, FirestoreClient};
 pub use crate::guild_settings::{

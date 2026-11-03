@@ -522,6 +522,7 @@ name = "data"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "firestore",
  "futures",
  "moka",
@@ -3372,9 +3373,12 @@ dependencies = [
 name = "web"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "chrono",
  "common",
  "cookie",
+ "data",
  "futures-util",
  "governor",
  "http-body",
