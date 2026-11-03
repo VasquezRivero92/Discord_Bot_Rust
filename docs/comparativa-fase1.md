@@ -35,16 +35,14 @@ carga, fecha y máquina anotadas).
    ```
 3. Rellenar la tabla de abajo y escribir la conclusión.
 
-**Aviso de protocolo (resolver antes de medir).** Tanto Node (`globalLimiter`)
-como Rust (`middleware::apply`) limitan a 100 peticiones por minuto por cliente.
-`tools/baseline.mjs` lanza 250 peticiones por endpoint (200 secuenciales y 50
-concurrentes) desde una sola IP y sin `X-Forwarded-For`, así que la mayoría
-recibirían 429. Esas respuestas cuentan como `errors` y quedan fuera de los
-percentiles. Antes de medir hay que hacer una de dos cosas, igual en ambos
-lados: o el medidor envía un `X-Forwarded-For` distinto por petición (Node con
-`trust proxy 1` y Rust usan la entrada derecha como clave), o se mide en un
-entorno de prueba con el límite desactivado. Esto no está implementado; queda
-como tarea pendiente del medidor.
+**Rate limit.** Tanto Node (`globalLimiter`) como Rust limitan a 100
+peticiones por minuto por cliente. `tools/baseline.mjs` envía un
+`X-Forwarded-For` aleatorio en cada petición para que cada una caiga en su
+propio cubo en ambos servidores. Mide siempre directo (no a través de
+Cloudflare), con `PROXY_APPEND_PEER_TO_XFF` vacío y `TRUST_CF_CONNECTING_IP`
+desactivado en Rust, y reinicia cada proceso medido después de la ejecución,
+porque las IP aleatorias hacen crecer los mapas del limitador (ver
+`docs/baseline-node.md`).
 
 ## Tabla (a rellenar; ms, salvo RAM)
 

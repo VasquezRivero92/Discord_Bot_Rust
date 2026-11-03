@@ -2,7 +2,10 @@
 // (Node legacy ahora, servidor Rust despues). Uso:
 //   node tools/baseline.mjs --base http://127.0.0.1:3001 --pid <pid> --out docs/baseline-node.json
 //   [--jwt-secret <secreto de prueba> | env BASELINE_JWT_SECRET] [--guild-id 0] [--sequential 200] [--concurrent 50]
-//   [--timeout-ms 10000]
+//   [--timeout-ms 10000] [--no-xff]
+// Cada peticion lleva un X-Forwarded-For IPv4 aleatorio (salvo --no-xff) para que el rate limit
+// de 100/min por cliente (Node `trust proxy 1` y Rust: entrada derecha de XFF) no convierta la
+// medicion en un muro de 429. El objetivo se mide directo, nunca a traves de Cloudflare.
 // p50/p95/p99 de primer nivel = fase secuencial (solo 2xx); `concurrent` = fase en rafaga (solo 2xx).
 // Sin muestras 2xx los percentiles son null. `errors` de primer nivel suma ambas fases.
 import crypto from 'node:crypto';
@@ -80,6 +83,15 @@ export function buildEndpoints(guildId = '0') {
 
 export const DEFAULT_TIMEOUT_MS = 10000;
 
+// IPv4 aleatoria (octetos 1..254) para X-Forwarded-For.
+export function randomIpv4() {
+  return Array.from({ length: 4 }, () => crypto.randomInt(1, 255)).join('.');
+}
+
+function withXff(headers, xff) {
+  return xff ? { ...headers, 'x-forwarded-for': randomIpv4() } : headers;
+}
+
 async function timedRequest(url, headers, timeoutMs) {
   const t0 = performance.now();
   let ok = false;
@@ -106,6 +118,7 @@ function stats(results) {
 
 export async function measure({
   base, pid, jwtSecret, guildId = '0', sequential = 200, concurrent = 50, timeoutMs = DEFAULT_TIMEOUT_MS,
+  xff = true,
 }) {
   let rssMb = null;
   try { rssMb = await readRssMb(pid); } catch { /* se informa abajo */ }
@@ -116,8 +129,10 @@ export async function measure({
     const url = new URL(ep.path, base).toString();
     const headers = ep.auth ? { cookie } : {};
     const seq = [];
-    for (let i = 0; i < sequential; i++) seq.push(await timedRequest(url, headers, timeoutMs));
-    const conc = await Promise.all(Array.from({ length: concurrent }, () => timedRequest(url, headers, timeoutMs)));
+    for (let i = 0; i < sequential; i++) seq.push(await timedRequest(url, withXff(headers, xff), timeoutMs));
+    const conc = await Promise.all(
+      Array.from({ length: concurrent }, () => timedRequest(url, withXff(headers, xff), timeoutMs)),
+    );
     const s = stats(seq);
     const c = stats(conc);
     endpoints[`${ep.method} ${ep.path}`] = { ...s, errors: s.errors + c.errors, concurrent: c };
@@ -127,6 +142,7 @@ export async function measure({
 
 export class ArgError extends Error {}
 
+const BOOL_FLAGS = new Set(['no-xff']);
 const VALUE_FLAGS = new Set(['base', 'pid', 'out', 'jwt-secret', 'guild-id', 'sequential', 'concurrent', 'timeout-ms']);
 
 function posInt(name, raw, def) {
@@ -142,6 +158,10 @@ export function parseArgs(argv, env = {}) {
     const tok = argv[i];
     if (!tok.startsWith('--')) throw new ArgError(`argumento inesperado: ${tok}`);
     const name = tok.slice(2);
+    if (BOOL_FLAGS.has(name)) {
+      a[name] = true;
+      continue;
+    }
     if (!VALUE_FLAGS.has(name)) throw new ArgError(`opcion desconocida: ${tok}`);
     const v = argv[i + 1];
     if (v === undefined || v.startsWith('--')) throw new ArgError(`--${name} requiere un valor`);
@@ -164,6 +184,7 @@ export function parseArgs(argv, env = {}) {
     sequential: posInt('sequential', a.sequential, 200),
     concurrent: posInt('concurrent', a.concurrent, 50),
     timeoutMs: posInt('timeout-ms', a['timeout-ms'], DEFAULT_TIMEOUT_MS),
+    xff: !a['no-xff'],
   };
 }
 

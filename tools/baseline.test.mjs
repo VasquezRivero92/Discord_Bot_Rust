@@ -10,6 +10,7 @@ import {
   buildEndpoints,
   measure,
   parseArgs,
+  randomIpv4,
   ArgError,
 } from './baseline.mjs';
 
@@ -186,7 +187,7 @@ test('parseArgs: valores por defecto y env', () => {
   const c = parseArgs(['--base', 'http://h:1', '--pid', '9'], { BASELINE_JWT_SECRET: 'e' });
   assert.deepEqual(c, {
     base: 'http://h:1', pid: 9, out: undefined, jwtSecret: 'e', guildId: '0',
-    sequential: 200, concurrent: 50, timeoutMs: 10000,
+    sequential: 200, concurrent: 50, timeoutMs: 10000, xff: true,
   });
   const d = parseArgs([...okArgs, '--sequential', '5', '--concurrent', '2', '--timeout-ms', '300', '--out', 'o.json']);
   assert.equal(d.sequential, 5);
@@ -214,4 +215,56 @@ test('parseArgs: entradas invalidas lanzan ArgError', () => {
   for (const [argv, re] of bad) {
     assert.throws(() => parseArgs(argv, {}), (e) => e instanceof ArgError && re.test(e.message), argv.join(' '));
   }
+});
+
+// X-Forwarded-For aleatorio por peticion: cada una cae en su propio cubo del rate limit
+// (Node `trust proxy 1` y Rust usan la entrada derecha), asi no se mide un muro de 429.
+function startXffStub() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push(req.headers['x-forwarded-for']);
+    res.end('ok');
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
+    resolve({ server, seen, base: `http://127.0.0.1:${server.address().port}` });
+  }));
+}
+
+test('randomIpv4: IPv4 valida', () => {
+  for (let i = 0; i < 200; i++) {
+    const ip = randomIpv4();
+    assert.match(ip, /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/);
+    assert.ok(ip.split('.').every((o) => Number(o) >= 1 && Number(o) <= 254), ip);
+  }
+});
+
+test('measure: cada peticion lleva un X-Forwarded-For distinto por defecto', async () => {
+  const { server, seen, base } = await startXffStub();
+  try {
+    await measure({ base, pid: process.pid, jwtSecret: 's', sequential: 5, concurrent: 3 });
+    assert.equal(seen.length, 7 * 8);
+    assert.ok(seen.every((v) => typeof v === 'string' && /^[\d.]+$/.test(v)), String(seen));
+    assert.equal(new Set(seen).size, seen.length, 'IPs distintas');
+  } finally {
+    server.close();
+  }
+});
+
+test('measure: xff=false no envia X-Forwarded-For', async () => {
+  const { server, seen, base } = await startXffStub();
+  try {
+    await measure({ base, pid: process.pid, jwtSecret: 's', sequential: 2, concurrent: 2, xff: false });
+    assert.equal(seen.length, 7 * 4);
+    assert.ok(seen.every((v) => v === undefined), String(seen));
+  } finally {
+    server.close();
+  }
+});
+
+test('parseArgs: --no-xff desactiva la cabecera', () => {
+  const c = parseArgs([...okArgs, '--no-xff']);
+  assert.equal(c.xff, false);
+  const d = parseArgs(['--no-xff', ...okArgs]);
+  assert.equal(d.xff, false);
+  assert.throws(() => parseArgs([...okArgs, '--no-xff', 'x']), ArgError);
 });
