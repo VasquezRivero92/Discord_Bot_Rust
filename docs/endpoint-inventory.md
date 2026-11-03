@@ -19,7 +19,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | metodo | ruta | auth | origen | linea | colecciones | usa Discord | fase | notas |
 |---|---|---|---|---|---|---|---|---|
-| GET | /health | none | index.js | 280 | - | gateway | proxy | Sigue en el proxy: el cuerpo incluye discord (client.readyAt, estado del gateway) y uptime del proceso Node; Rust no puede reportarlo |
+| GET | /health | none | index.js | 280 | - | gateway | proxy | Sigue en el proxy: el cuerpo incluye discord (client.readyAt, estado del gateway) y uptime del proceso Node; Rust no puede reportarlo. Tarea 17: `static_files` lo excluye del catch-all SPA (antes lo tapaba con index.html) |
 | GET | /webhook/faceit | none | index.js | 290 | - | no | 2 | Verificacion GET del webhook |
 | GET | /webhooks/faceit | none | index.js | 290 | - | no | 2 | Alias de verificacion GET |
 | POST | /webhook/faceit | webhookLimiter | index.js | 299 | (via webhooks/faceit.js) | ? | 2 | Webhook Faceit |
@@ -225,5 +225,5 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 |---|---|---|---|---|---|---|---|---|
 | GET | /api/products | none | routes/publicApi.js | 108 | - | no | 1 | migrado (Tarea 12): catalogo estatico en crates/web/src/routes/products.json (tools/gen-products.mjs) |
 | POST | /api/reclamaciones | none | routes/publicApi.js | 123 | claims | no | proxy | Escritura; sigue en el proxy |
-| GET | /api/reclamaciones/:code | none | routes/publicApi.js | 209 | claims | no | 1 | migrado (Tarea 12): lectura por id de documento (claims/{code}) |
+| GET | /api/reclamaciones/:code | none | routes/publicApi.js | 209 | claims | no | 1 | migrado (Tarea 12): lectura por id de documento (claims/{code}). Tarea 17: solo se monta con Firestore configurado (`firestore_mode` distinto de `Disabled`); sin él la ruta sigue en el proxy |
 | POST | /api/checkout/purchase | none | routes/publicApi.js | 224 | orders, faceit_users | no | proxy | Escritura (descuenta saldo) |
