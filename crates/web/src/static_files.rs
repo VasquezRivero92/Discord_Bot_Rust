@@ -77,6 +77,11 @@ fn spa_target(path: &str) -> Option<Target> {
         lower.as_str()
     };
 
+    // index.js:280 `app.get('/health')` (Node; its body reports the Discord gateway).
+    // Registered before `GET *`, so the SPA catch-all must not shadow it.
+    if trimmed == "/health" {
+        return None;
+    }
     // index.js:458-465
     if trimmed == "/admin" || lower.starts_with("/admin/") {
         return t("admin/index.html", AdminPrivate);

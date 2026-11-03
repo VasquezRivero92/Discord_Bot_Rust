@@ -27,8 +27,18 @@ fn products() -> &'static Value {
 
 /// Rutas de la API publica; las reclamaciones se leen con `claims`.
 pub fn router(claims: Arc<dyn ClaimsRepo>) -> Router {
+    products_router().merge(claims_router(claims))
+}
+
+/// Solo `GET /api/products` (no necesita Firestore).
+pub fn products_router() -> Router {
+    Router::new().route("/api/products", get(list_products))
+}
+
+/// Solo `GET /api/reclamaciones/:code`. Sin fuente de reclamaciones no se monta y la
+/// ruta sigue llegando a Node por el proxy.
+pub fn claims_router(claims: Arc<dyn ClaimsRepo>) -> Router {
     Router::new()
-        .route("/api/products", get(list_products))
         .route("/api/reclamaciones/{code}", get(get_claim))
         .with_state(claims)
 }

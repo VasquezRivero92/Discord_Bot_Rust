@@ -157,7 +157,20 @@ async fn discord_state_with_control_chars_cannot_split_headers() {
 
 #[tokio::test]
 async fn base_url_trailing_slashes_are_stripped_like_the_legacy() {
-    let app = auth::router(AuthState::new("123", "https://machupeek.example//"));
+    // La normalizacion vive en `Config` (una sola vez); `from_config` la consume.
+    let vars: HashMap<String, String> = [
+        ("ADMIN_JWT_SECRET", "s"),
+        ("BASE_URL", "https://machupeek.example//"),
+        ("DISCORD_CLIENT_ID", "123"),
+        ("DISCORD_CLIENT_SECRET", "s"),
+        ("DISCORD_TOKEN", "t"),
+        ("DISCORD_GUILD_ID", "g"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let cfg = common::config::Config::from_map(&vars).unwrap();
+    let app = auth::router(AuthState::from_config(&cfg));
     let res = app
         .oneshot(Request::get("/auth/discord").body(Body::empty()).unwrap())
         .await

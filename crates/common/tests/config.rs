@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use common::config::{Config, ConfigError};
+use common::config::{firestore_mode, Config, ConfigError, FirestoreMode};
 
 fn base() -> HashMap<String, String> {
     [
@@ -255,4 +255,196 @@ fn admin_role_name_is_the_fallback_for_admin_role_id() {
     ]))
     .unwrap();
     assert_eq!(cfg.admin_role_id.as_deref(), Some("7"));
+}
+
+// ------------------------------------------------------------ BASE_URL
+
+#[test]
+fn base_url_trailing_slashes_are_stripped_once() {
+    // config/index.js:28: `.replace(/\/+$/, '')`.
+    let cfg = Config::from_map(&with(&[("BASE_URL", "https://machupeek.example///")])).unwrap();
+    assert_eq!(cfg.base_url, "https://machupeek.example");
+    let cfg = Config::from_map(&with(&[("BASE_URL", "https://machupeek.example/app/")])).unwrap();
+    assert_eq!(cfg.base_url, "https://machupeek.example/app");
+    let cfg = Config::from_map(&base()).unwrap();
+    assert_eq!(cfg.base_url, "http://localhost:15633");
+}
+
+#[test]
+fn base_url_made_only_of_slashes_is_invalid() {
+    assert_eq!(
+        Config::from_map(&with(&[("BASE_URL", "///")])).unwrap_err(),
+        ConfigError::Invalid("BASE_URL", "///".into())
+    );
+}
+
+// ------------------------------------------------------------ proxy XFF
+
+#[test]
+fn proxy_append_peer_to_xff_defaults_off_and_parses() {
+    assert!(!Config::from_map(&base()).unwrap().proxy_append_peer_to_xff);
+    let m = with(&[("PROXY_APPEND_PEER_TO_XFF", "1")]);
+    assert!(Config::from_map(&m).unwrap().proxy_append_peer_to_xff);
+    let m = with(&[("PROXY_APPEND_PEER_TO_XFF", "nope")]);
+    assert_eq!(
+        Config::from_map(&m).unwrap_err(),
+        ConfigError::Invalid("PROXY_APPEND_PEER_TO_XFF", "nope".into())
+    );
+}
+
+// ------------------------------------------------------------ Firestore
+
+fn mode(extra: &[(&str, &str)]) -> Result<FirestoreMode, ConfigError> {
+    firestore_mode(&Config::from_map(&with(extra)).unwrap())
+}
+
+#[test]
+fn firestore_disabled_without_project_id() {
+    assert_eq!(mode(&[]), Ok(FirestoreMode::Disabled));
+    assert_eq!(
+        mode(&[("FIRESTORE_PROJECT_ID", "  ")]),
+        Ok(FirestoreMode::Disabled)
+    );
+    // Credential variables alone never enable Firestore.
+    assert_eq!(
+        mode(&[
+            ("FIREBASE_SERVICE_ACCOUNT_PATH", "/k.json"),
+            ("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080"),
+            ("FIRESTORE_USE_ADC", "1"),
+        ]),
+        Ok(FirestoreMode::Disabled)
+    );
+}
+
+#[test]
+fn firestore_project_without_credentials_is_an_error_never_implicit_adc() {
+    let err = mode(&[("FIRESTORE_PROJECT_ID", "p")]).unwrap_err();
+    assert_eq!(err, ConfigError::NoFirestoreCredentials);
+    let err = mode(&[("FIRESTORE_PROJECT_ID", "p"), ("FIRESTORE_USE_ADC", "0")]).unwrap_err();
+    assert_eq!(err, ConfigError::NoFirestoreCredentials);
+    let err = mode(&[
+        ("FIRESTORE_PROJECT_ID", "p"),
+        ("FIREBASE_SERVICE_ACCOUNT_PATH", ""),
+        ("FIRESTORE_EMULATOR_HOST", " "),
+    ])
+    .unwrap_err();
+    assert_eq!(err, ConfigError::NoFirestoreCredentials);
+    // The message names every way out and no value.
+    let msg = err.to_string();
+    for name in [
+        "FIRESTORE_EMULATOR_HOST",
+        "FIREBASE_SERVICE_ACCOUNT_PATH",
+        "FIRESTORE_USE_ADC",
+    ] {
+        assert!(msg.contains(name), "{msg}");
+    }
+}
+
+#[test]
+fn firestore_emulator_mode() {
+    assert_eq!(
+        mode(&[
+            ("FIRESTORE_PROJECT_ID", "p"),
+            ("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080")
+        ]),
+        Ok(FirestoreMode::Emulator {
+            host: "127.0.0.1:8080".into()
+        })
+    );
+}
+
+#[test]
+fn firestore_emulator_wins_over_key_file_and_adc() {
+    // The crate talks to the emulator whenever the variable is set, so the
+    // reported mode must say so (fail-safe: never production data).
+    assert_eq!(
+        mode(&[
+            ("FIRESTORE_PROJECT_ID", "p"),
+            ("FIRESTORE_EMULATOR_HOST", "localhost:8080"),
+            ("FIREBASE_SERVICE_ACCOUNT_PATH", "/k.json"),
+            ("FIRESTORE_USE_ADC", "1"),
+        ]),
+        Ok(FirestoreMode::Emulator {
+            host: "localhost:8080".into()
+        })
+    );
+}
+
+#[test]
+fn firestore_key_file_mode() {
+    assert_eq!(
+        mode(&[
+            ("FIRESTORE_PROJECT_ID", "p"),
+            ("FIREBASE_SERVICE_ACCOUNT_PATH", "/secrets/sa.json")
+        ]),
+        Ok(FirestoreMode::KeyFile {
+            path: PathBuf::from("/secrets/sa.json")
+        })
+    );
+}
+
+#[test]
+fn firestore_key_file_wins_over_adc() {
+    assert_eq!(
+        mode(&[
+            ("FIRESTORE_PROJECT_ID", "p"),
+            ("FIREBASE_SERVICE_ACCOUNT_PATH", "/k.json"),
+            ("FIRESTORE_USE_ADC", "true"),
+        ]),
+        Ok(FirestoreMode::KeyFile {
+            path: PathBuf::from("/k.json")
+        })
+    );
+}
+
+#[test]
+fn firestore_adc_only_on_explicit_opt_in() {
+    for v in ["1", "true", "YES", "on"] {
+        assert_eq!(
+            mode(&[("FIRESTORE_PROJECT_ID", "p"), ("FIRESTORE_USE_ADC", v)]),
+            Ok(FirestoreMode::Adc),
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn firestore_use_adc_invalid_value_is_a_config_error() {
+    let m = with(&[("FIRESTORE_USE_ADC", "si")]);
+    assert_eq!(
+        Config::from_map(&m).unwrap_err(),
+        ConfigError::Invalid("FIRESTORE_USE_ADC", "si".into())
+    );
+}
+
+#[test]
+fn firestore_fields_are_parsed_and_debug_shows_no_secret() {
+    let cfg = Config::from_map(&with(&[
+        ("FIRESTORE_PROJECT_ID", "proj"),
+        ("FIREBASE_SERVICE_ACCOUNT_PATH", "/k.json"),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.firestore_project_id.as_deref(), Some("proj"));
+    assert_eq!(
+        cfg.firebase_service_account_path,
+        Some(PathBuf::from("/k.json"))
+    );
+    assert_eq!(cfg.firestore_emulator_host, None);
+    assert!(!cfg.firestore_use_adc);
+    let dbg = format!("{cfg:?}");
+    assert!(!dbg.contains("jwt-secret-value"));
+}
+
+#[test]
+fn firestore_mode_describe_never_includes_secrets() {
+    assert_eq!(FirestoreMode::Disabled.describe(), "disabled");
+    assert_eq!(FirestoreMode::Adc.describe(), "adc");
+    assert!(FirestoreMode::Emulator { host: "h:1".into() }
+        .describe()
+        .contains("h:1"));
+    assert!(FirestoreMode::KeyFile {
+        path: PathBuf::from("/k.json")
+    }
+    .describe()
+    .starts_with("key-file"));
 }

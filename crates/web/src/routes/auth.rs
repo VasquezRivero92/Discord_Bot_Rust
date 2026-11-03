@@ -50,12 +50,12 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    /// `base_url` es `BASE_URL`; como en el legacy se le quitan las `/` finales
-    /// (`config/index.js:28`).
+    /// `base_url` es `BASE_URL` ya normalizado (sin `/` finales, como
+    /// `config/index.js:28`); `Config::from_map` lo normaliza una sola vez.
     pub fn new(client_id: &str, base_url: &str) -> Self {
         Self {
             client_id: client_id.to_owned(),
-            redirect_uri: format!("{}/auth/discord/callback", base_url.trim_end_matches('/')),
+            redirect_uri: format!("{base_url}/auth/discord/callback"),
         }
     }
 

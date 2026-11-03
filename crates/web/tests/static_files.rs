@@ -524,3 +524,18 @@ async fn dotfiles_are_ignored_and_fall_through() {
     assert_eq!((s, b.as_str()), (StatusCode::OK, "min"));
     assert_eq!(cc(&h), "public, max-age=31536000, immutable");
 }
+
+#[tokio::test]
+async fn health_is_not_shadowed_by_the_spa_catch_all() {
+    // index.js:280 `app.get('/health')` runs before `GET *` (577), so Node answers it.
+    // Express matching: case-insensitive, one optional trailing slash.
+    let f = fixture();
+    for uri in ["/health", "/health/", "/HEALTH", "/Health/", "/health?x=1"] {
+        assert!(is_fallback(&get(&f.app, uri).await), "{uri}");
+    }
+    // Only that exact route: deeper paths still get the SPA like the legacy `GET *`.
+    let r = get(&f.app, "/healthz").await;
+    assert_eq!(r.2, "INDEX");
+    let r = get(&f.app, "/health/x").await;
+    assert_eq!(r.2, "INDEX");
+}
