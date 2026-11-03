@@ -199,6 +199,8 @@ fn log_banner(cfg: &Config, mode: &FirestoreMode) {
         production = cfg.production,
         trust_cf_connecting_ip = cfg.trust_cf_connecting_ip,
         proxy_append_peer_to_xff = cfg.proxy_append_peer_to_xff,
+        proxy_first_byte_timeout_secs = cfg.proxy_first_byte_timeout.map_or(0, |d| d.as_secs()),
+        ws_idle_timeout_secs = cfg.ws_idle_timeout.map_or(0, |d| d.as_secs()),
         firestore = %mode.describe(),
         "machupeek web front door starting"
     );

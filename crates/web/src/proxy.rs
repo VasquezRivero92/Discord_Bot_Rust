@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::{
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocketUpgrade},
         ConnectInfo, FromRequestParts, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::{
     self, client::IntoClientRequest, protocol::frame::coding::CloseCode,
 };
@@ -31,6 +32,20 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
+/// Close code sent to both ends of a WebSocket tunnel closed for inactivity
+/// (RFC 6455 1001, "going away").
+const WS_IDLE_CLOSE_CODE: u16 = 1001;
+const WS_IDLE_CLOSE_REASON: &str = "idle timeout";
+
+/// Paths exempt from [`ProxyOptions::first_byte_timeout`]: long-lived
+/// responses (SSE / long polls) of the legacy. Audited in the legacy
+/// (`index.js`, `routes/*.js`, `services/*.js`): the only `text/event-stream`
+/// is `GET /api/halloween/stream` (`index.js:560`, `addHalloweenSseClient`);
+/// there are no long polls. Matched like an Express app route (case-insensitive,
+/// one optional trailing slash), on the raw path and for every method.
+/// WebSocket upgrades never use the first-byte timeout (see `ws_idle_timeout`).
+const FIRST_BYTE_TIMEOUT_EXEMPT: &[&str] = &["/api/halloween/stream"];
+
 /// Behavior switches for the proxy.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProxyOptions {
@@ -43,6 +58,25 @@ pub struct ProxyOptions {
     /// would make `req.ip` in Node wrong. By default the header is forwarded
     /// untouched (byte-for-byte) and never injected when absent.
     pub append_peer_to_xff: bool,
+    /// Max time from sending a proxied HTTP request until the response HEAD
+    /// (status and headers) of the legacy arrives; on expiry the client gets
+    /// `504 {"error":"Servicio no disponible"}`. It includes uploading the
+    /// request body when Node reads it before answering. Once the head has
+    /// arrived the body streams with no limit. Never applies to
+    /// [`FIRST_BYTE_TIMEOUT_EXEMPT`] nor to WebSocket upgrades. `None` = no limit.
+    pub first_byte_timeout: Option<Duration>,
+    /// Close a proxied WebSocket (both ends, close frame 1001) after this long
+    /// without any frame in either direction (ping/pong and close included).
+    /// `None` = never.
+    pub ws_idle_timeout: Option<Duration>,
+}
+
+/// Whether `path` is one of [`FIRST_BYTE_TIMEOUT_EXEMPT`].
+fn first_byte_exempt(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    FIRST_BYTE_TIMEOUT_EXEMPT
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(path))
 }
 
 #[derive(Clone)]
@@ -96,6 +130,15 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
 fn bad_gateway() -> Response {
     (
         StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"Servicio no disponible"}"#,
+    )
+        .into_response()
+}
+
+fn gateway_timeout() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
         [(header::CONTENT_TYPE, "application/json")],
         r#"{"error":"Servicio no disponible"}"#,
     )
@@ -234,12 +277,32 @@ async fn proxy_http(state: ProxyState, req: Request) -> Response {
     strip_hop_by_hop(&mut headers);
     add_forwarded_headers(&mut headers, peer, host, state.options.append_peer_to_xff);
 
+    let method = parts.method.clone();
     let mut builder = state.client.request(parts.method, url).headers(headers);
     if has_body {
         // Streamed, never buffered in memory.
         builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
-    let upstream = match builder.send().await {
+    // `send` resolves as soon as the response head arrives: the limit covers
+    // the time to first byte, never the body.
+    let sent = match state.options.first_byte_timeout {
+        Some(limit) if !first_byte_exempt(pq.path()) => {
+            match tokio::time::timeout(limit, builder.send()).await {
+                Ok(sent) => sent,
+                Err(_) => {
+                    // Method and path only: the query may carry tokens.
+                    tracing::warn!(
+                        "proxy first-byte timeout ({}s): {method} {:?}",
+                        limit.as_secs(),
+                        pq.path()
+                    );
+                    return gateway_timeout();
+                }
+            }
+        }
+        _ => builder.send().await,
+    };
+    let upstream = match sent {
         Ok(res) => res,
         Err(_) => return bad_gateway(),
     };
@@ -257,9 +320,6 @@ async fn proxy_http(state: ProxyState, req: Request) -> Response {
         .body(Body::from_stream(upstream.bytes_stream()))
         .unwrap_or_else(|_| bad_gateway())
 }
-
-type UpstreamSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn ws_url(legacy: &str, path_and_query: &str) -> String {
     let base = if let Some(rest) = legacy.strip_prefix("https://") {
@@ -337,7 +397,12 @@ async fn proxy_websocket(state: ProxyState, req: Request) -> Response {
         Some(proto) => ws.protocols([proto.to_owned()]),
         None => ws,
     };
-    ws.on_upgrade(move |client| tunnel(client, upstream))
+    let idle = state.options.ws_idle_timeout;
+    ws.on_upgrade(move |client| async move {
+        let (client_tx, client_rx) = client.split();
+        let (up_tx, up_rx) = upstream.split();
+        tunnel(client_tx, client_rx, up_tx, up_rx, idle).await;
+    })
 }
 
 fn to_upstream(msg: Message) -> Option<tungstenite::Message> {
@@ -369,57 +434,289 @@ fn to_client(msg: tungstenite::Message) -> Option<Message> {
     })
 }
 
+/// Completes once `idle` passes without a `notify_one` on `activity`.
+async fn idle_expired(activity: &Notify, idle: Duration) {
+    // `notify_one` stores a permit when nobody waits, so activity between two
+    // iterations is never lost.
+    while tokio::time::timeout(idle, activity.notified())
+        .await
+        .is_ok()
+    {}
+}
+
 /// Pumps frames both ways until either side closes. Runs inside a single task:
 /// when one direction ends the other gets a short grace period (to deliver the
 /// close handshake) and is then dropped, so nothing outlives the tunnel.
-async fn tunnel(client: WebSocket, upstream: UpstreamSocket) {
-    let (mut client_tx, mut client_rx) = client.split();
-    let (mut up_tx, mut up_rx) = upstream.split();
-
-    let client_to_up = async {
-        while let Some(Ok(msg)) = client_rx.next().await {
-            let is_close = matches!(msg, Message::Close(_));
-            if let Some(m) = to_upstream(msg) {
-                if up_tx.send(m).await.is_err() {
+///
+/// With `idle`, every frame received from either side (data, ping, pong,
+/// close) restarts the timer; if it runs out both ends get a close frame
+/// ([`WS_IDLE_CLOSE_CODE`]) and the tunnel ends.
+///
+/// Generic over the halves so the timing can be tested without sockets.
+async fn tunnel<CTx, CRx, CErr, UTx, URx, UErr>(
+    mut client_tx: CTx,
+    mut client_rx: CRx,
+    mut up_tx: UTx,
+    mut up_rx: URx,
+    idle: Option<Duration>,
+) where
+    CTx: futures_util::Sink<Message> + Unpin,
+    CRx: futures_util::Stream<Item = Result<Message, CErr>> + Unpin,
+    UTx: futures_util::Sink<tungstenite::Message> + Unpin,
+    URx: futures_util::Stream<Item = Result<tungstenite::Message, UErr>> + Unpin,
+{
+    let activity = Notify::new();
+    let idle_fired = {
+        let client_to_up = async {
+            while let Some(Ok(msg)) = client_rx.next().await {
+                activity.notify_one();
+                let is_close = matches!(msg, Message::Close(_));
+                if let Some(m) = to_upstream(msg) {
+                    if up_tx.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                if is_close {
                     break;
                 }
             }
-            if is_close {
-                break;
-            }
-        }
-        let _ = up_tx.close().await;
-    };
-    let up_to_client = async {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let is_close = matches!(msg, tungstenite::Message::Close(_));
-            if let Some(m) = to_client(msg) {
-                if client_tx.send(m).await.is_err() {
+            let _ = up_tx.close().await;
+        };
+        let up_to_client = async {
+            while let Some(Ok(msg)) = up_rx.next().await {
+                activity.notify_one();
+                let is_close = matches!(msg, tungstenite::Message::Close(_));
+                if let Some(m) = to_client(msg) {
+                    if client_tx.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                if is_close {
                     break;
                 }
             }
-            if is_close {
-                break;
+            let _ = client_tx.close().await;
+        };
+        let idle_timer = async {
+            match idle {
+                Some(idle) => idle_expired(&activity, idle).await,
+                None => std::future::pending().await,
             }
-        }
-        let _ = client_tx.close().await;
-    };
-    tokio::pin!(client_to_up, up_to_client);
+        };
+        tokio::pin!(client_to_up, up_to_client, idle_timer);
 
-    tokio::select! {
-        _ = &mut client_to_up => {
-            let _ = tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut up_to_client).await;
+        tokio::select! {
+            _ = &mut client_to_up => {
+                let _ = tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut up_to_client).await;
+                false
+            }
+            _ = &mut up_to_client => {
+                let _ = tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut client_to_up).await;
+                false
+            }
+            _ = &mut idle_timer => true,
         }
-        _ = &mut up_to_client => {
-            let _ = tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut client_to_up).await;
-        }
+    };
+    if idle_fired {
+        let close_client = async {
+            let frame = CloseFrame {
+                code: WS_IDLE_CLOSE_CODE,
+                reason: WS_IDLE_CLOSE_REASON.into(),
+            };
+            let _ = client_tx.send(Message::Close(Some(frame))).await;
+            let _ = client_tx.close().await;
+        };
+        let close_upstream = async {
+            let frame = tungstenite::protocol::CloseFrame {
+                code: CloseCode::from(WS_IDLE_CLOSE_CODE),
+                reason: WS_IDLE_CLOSE_REASON.into(),
+            };
+            let _ = up_tx.send(tungstenite::Message::Close(Some(frame))).await;
+            let _ = up_tx.close().await;
+        };
+        let _ = tokio::time::timeout(
+            WS_DRAIN_TIMEOUT,
+            futures_util::future::join(close_client, close_upstream),
+        )
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::invalid_path_log;
+    use super::{
+        first_byte_exempt, invalid_path_log, tunnel, FIRST_BYTE_TIMEOUT_EXEMPT, WS_IDLE_CLOSE_CODE,
+    };
+    use axum::extract::ws::Message;
     use axum::http::{uri::PathAndQuery, Method};
+    use futures_util::{Sink, Stream};
+    use std::pin::Pin;
+    use std::time::Duration;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::tungstenite;
+
+    #[test]
+    fn every_exempt_path_is_exempt_like_an_express_route() {
+        for path in FIRST_BYTE_TIMEOUT_EXEMPT {
+            assert!(first_byte_exempt(path), "{path}");
+            assert!(first_byte_exempt(&format!("{path}/")), "{path}/");
+            assert!(first_byte_exempt(&path.to_uppercase()), "{path} upper");
+            assert!(!first_byte_exempt(&format!("{path}//")), "{path}//");
+            assert!(!first_byte_exempt(&format!("{path}x")), "{path}x");
+            assert!(!first_byte_exempt(&format!("{path}/x")), "{path}/x");
+            assert!(!first_byte_exempt(&format!("/{path}")), "/{path}");
+        }
+    }
+
+    #[test]
+    fn halloween_stream_is_the_exempt_route() {
+        assert_eq!(FIRST_BYTE_TIMEOUT_EXEMPT, &["/api/halloween/stream"]);
+        assert!(first_byte_exempt("/API/Halloween/Stream"));
+        assert!(!first_byte_exempt("/api/halloween/status"));
+        assert!(!first_byte_exempt("/api/halloween/%73tream"));
+        assert!(!first_byte_exempt("/"));
+    }
+
+    type BoxSink<T> = Pin<Box<dyn Sink<T, Error = ()> + Send>>;
+    type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, ()>> + Send>>;
+
+    fn sink<T: Send + 'static>(tx: UnboundedSender<T>) -> BoxSink<T> {
+        Box::pin(futures_util::sink::unfold(tx, |tx, item| async move {
+            tx.send(item).map_err(|_| ())?;
+            Ok(tx)
+        }))
+    }
+
+    fn stream<T: Send + 'static>(rx: UnboundedReceiver<T>) -> BoxStream<T> {
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|m| (Ok(m), rx))
+        }))
+    }
+
+    /// A tunnel over channels. `client_in`/`up_in` feed the tunnel (what the
+    /// browser / Node send); `client_out`/`up_out` collect what it forwards.
+    struct FakeTunnel {
+        client_in: UnboundedSender<Message>,
+        up_in: UnboundedSender<tungstenite::Message>,
+        client_out: UnboundedReceiver<Message>,
+        up_out: UnboundedReceiver<tungstenite::Message>,
+        task: JoinHandle<()>,
+    }
+
+    fn fake_tunnel(idle: Option<Duration>) -> FakeTunnel {
+        let (client_in, client_rx) = unbounded_channel();
+        let (up_in, up_rx) = unbounded_channel();
+        let (client_tx, client_out) = unbounded_channel();
+        let (up_tx, up_out) = unbounded_channel();
+        let task = tokio::spawn(tunnel(
+            sink(client_tx),
+            stream(client_rx),
+            sink(up_tx),
+            stream(up_rx),
+            idle,
+        ));
+        FakeTunnel {
+            client_in,
+            up_in,
+            client_out,
+            up_out,
+            task,
+        }
+    }
+
+    fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    fn assert_idle_close(client: &[Message], upstream: &[tungstenite::Message]) {
+        match client.last() {
+            Some(Message::Close(Some(f))) => assert_eq!(f.code, WS_IDLE_CLOSE_CODE),
+            other => panic!("client did not get the idle close frame: {other:?}"),
+        }
+        match upstream.last() {
+            Some(tungstenite::Message::Close(Some(f))) => {
+                assert_eq!(u16::from(f.code), WS_IDLE_CLOSE_CODE)
+            }
+            other => panic!("upstream did not get the idle close frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_tunnel_sends_close_to_both_ends_after_exactly_the_timeout() {
+        let idle = Duration::from_secs(30);
+        let mut t = fake_tunnel(Some(idle));
+        let started = tokio::time::Instant::now();
+        (&mut t.task).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= idle && elapsed < idle + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        assert_idle_close(&drain(&mut t.client_out), &drain(&mut t.up_out));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_kind_of_frame_in_either_direction_resets_the_idle_timer() {
+        let idle = Duration::from_secs(30);
+        let mut t = fake_tunnel(Some(idle));
+        let step = Duration::from_secs(20);
+        // `Ok`: frame from the browser; `Err`: frame from Node.
+        let frames: Vec<Result<Message, tungstenite::Message>> = vec![
+            Ok(Message::text("hola")),
+            Err(tungstenite::Message::text("hola")),
+            Ok(Message::Ping(vec![1].into())),
+            Ok(Message::Pong(vec![2].into())),
+            Err(tungstenite::Message::Ping(vec![3].into())),
+            Err(tungstenite::Message::Pong(vec![4].into())),
+            Ok(Message::Binary(vec![5].into())),
+        ];
+        for frame in frames {
+            tokio::time::sleep(step).await;
+            match frame {
+                Ok(m) => t.client_in.send(m).unwrap(),
+                Err(m) => t.up_in.send(m).unwrap(),
+            }
+        }
+        // 7 x 20 s = 140 s, far beyond 30 s: still open.
+        tokio::time::sleep(step).await;
+        assert!(!t.task.is_finished(), "active tunnel was closed");
+        assert!(drain(&mut t.client_out)
+            .iter()
+            .all(|m| !matches!(m, Message::Close(_))));
+        assert!(drain(&mut t.up_out)
+            .iter()
+            .all(|m| !matches!(m, tungstenite::Message::Close(_))));
+
+        // Silence from now on: closes 30 s after the last frame (20 s already passed).
+        let quiet = tokio::time::Instant::now();
+        (&mut t.task).await.unwrap();
+        let elapsed = quiet.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(11),
+            "{elapsed:?}"
+        );
+        assert_idle_close(&drain(&mut t.client_out), &drain(&mut t.up_out));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_idle_timeout_a_silent_tunnel_stays_open() {
+        let t = fake_tunnel(None);
+        tokio::time::sleep(Duration::from_secs(365 * 24 * 3600)).await;
+        assert!(!t.task.is_finished());
+        // A close from the browser still ends it normally.
+        t.client_in.send(Message::Close(None)).unwrap();
+        let mut t = t;
+        (&mut t.task).await.unwrap();
+        assert!(matches!(
+            drain(&mut t.up_out).last(),
+            Some(tungstenite::Message::Close(None))
+        ));
+    }
 
     #[test]
     fn invalid_path_log_has_method_and_path_but_never_the_query() {

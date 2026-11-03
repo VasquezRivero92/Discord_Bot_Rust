@@ -82,6 +82,8 @@ pub fn build_app(deps: AppDeps) -> Router {
         cfg.legacy_url.clone(),
         proxy::ProxyOptions {
             append_peer_to_xff: cfg.proxy_append_peer_to_xff,
+            first_byte_timeout: cfg.proxy_first_byte_timeout,
+            ws_idle_timeout: cfg.ws_idle_timeout,
         },
     );
     let limited_proxy = limit.layer(proxy.clone());

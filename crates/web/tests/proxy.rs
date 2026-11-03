@@ -524,6 +524,7 @@ async fn xff_appends_peer_when_opted_in() {
         format!("http://{}", legacy.addr),
         web::proxy::ProxyOptions {
             append_peer_to_xff: true,
+            ..Default::default()
         },
     ))
     .await;

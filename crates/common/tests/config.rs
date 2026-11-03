@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use common::config::{firestore_mode, Config, ConfigError, EnvQueue, FirestoreMode};
 
@@ -373,6 +374,48 @@ fn proxy_append_peer_to_xff_defaults_off_and_parses() {
         Config::from_map(&m).unwrap_err(),
         ConfigError::Invalid("PROXY_APPEND_PEER_TO_XFF", "nope".into())
     );
+}
+
+// ------------------------------------------------------------ proxy timeouts
+
+#[test]
+fn proxy_timeouts_are_disabled_when_unset_empty_or_zero() {
+    let cfg = Config::from_map(&base()).unwrap();
+    assert_eq!(cfg.proxy_first_byte_timeout, None);
+    assert_eq!(cfg.ws_idle_timeout, None);
+    for v in ["", "  ", "0", "00", " 0 "] {
+        let cfg = Config::from_map(&with(&[
+            ("PROXY_FIRST_BYTE_TIMEOUT_SECS", v),
+            ("WS_IDLE_TIMEOUT_SECS", v),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.proxy_first_byte_timeout, None, "{v:?}");
+        assert_eq!(cfg.ws_idle_timeout, None, "{v:?}");
+    }
+}
+
+#[test]
+fn proxy_timeouts_parse_whole_seconds() {
+    let cfg = Config::from_map(&with(&[
+        ("PROXY_FIRST_BYTE_TIMEOUT_SECS", "120"),
+        ("WS_IDLE_TIMEOUT_SECS", " 900 "),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.proxy_first_byte_timeout, Some(Duration::from_secs(120)));
+    assert_eq!(cfg.ws_idle_timeout, Some(Duration::from_secs(900)));
+}
+
+#[test]
+fn invalid_proxy_timeouts_are_config_errors() {
+    for key in ["PROXY_FIRST_BYTE_TIMEOUT_SECS", "WS_IDLE_TIMEOUT_SECS"] {
+        for v in ["abc", "-1", "+5", "1.5", "30s", "99999999999999999999999"] {
+            assert_eq!(
+                Config::from_map(&with(&[(key, v)])).unwrap_err(),
+                ConfigError::Invalid(key, v.into()),
+                "{key}={v}"
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------ Firestore

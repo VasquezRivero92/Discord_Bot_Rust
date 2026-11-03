@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -312,6 +313,12 @@ pub struct Config {
     pub admin_role_id: Option<String>,
     /// Añadir la IP del par TCP a `X-Forwarded-For` en el proxy (por defecto no).
     pub proxy_append_peer_to_xff: bool,
+    /// `PROXY_FIRST_BYTE_TIMEOUT_SECS`: tope hasta la cabecera de respuesta de
+    /// Node en el proxy HTTP (504 al vencer). `None` (vacío o `0`) = sin tope.
+    pub proxy_first_byte_timeout: Option<Duration>,
+    /// `WS_IDLE_TIMEOUT_SECS`: cierre de un WebSocket proxificado sin ningún
+    /// frame en ninguna dirección. `None` (vacío o `0`) = nunca.
+    pub ws_idle_timeout: Option<Duration>,
     pub firestore_project_id: Option<String>,
     pub firebase_service_account_path: Option<PathBuf>,
     pub firestore_emulator_host: Option<String>,
@@ -341,6 +348,8 @@ impl fmt::Debug for Config {
             .field("mixton_server_ip", &self.mixton_server_ip)
             .field("admin_role_id", &self.admin_role_id)
             .field("proxy_append_peer_to_xff", &self.proxy_append_peer_to_xff)
+            .field("proxy_first_byte_timeout", &self.proxy_first_byte_timeout)
+            .field("ws_idle_timeout", &self.ws_idle_timeout)
             .field("firestore_project_id", &self.firestore_project_id)
             .field(
                 "firebase_service_account_path",
@@ -382,6 +391,25 @@ fn flag(vars: &HashMap<String, String>, key: &'static str) -> Result<bool, Confi
             _ => Err(ConfigError::Invalid(key, v.to_owned())),
         },
     }
+}
+
+/// Segundos opcionales: ausente, vacío o `0` = `None` (desactivado); un entero
+/// no negativo en base 10 = `Some`; cualquier otra cosa = error.
+fn seconds(
+    vars: &HashMap<String, String>,
+    key: &'static str,
+) -> Result<Option<Duration>, ConfigError> {
+    let Some(v) = get(vars, key) else {
+        return Ok(None);
+    };
+    // Solo dígitos: `u64::from_str` aceptaría también `+5`.
+    let n = v
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| v.parse::<u64>().ok())
+        .flatten()
+        .ok_or_else(|| ConfigError::Invalid(key, v.to_owned()))?;
+    Ok((n > 0).then(|| Duration::from_secs(n)))
 }
 
 /// Equivalente a `new URL(base).origin` para URLs http(s).
@@ -435,6 +463,8 @@ impl Config {
         let trust_cf_connecting_ip = flag(vars, "TRUST_CF_CONNECTING_IP")?;
         let proxy_append_peer_to_xff = flag(vars, "PROXY_APPEND_PEER_TO_XFF")?;
         let firestore_use_adc = flag(vars, "FIRESTORE_USE_ADC")?;
+        let proxy_first_byte_timeout = seconds(vars, "PROXY_FIRST_BYTE_TIMEOUT_SECS")?;
+        let ws_idle_timeout = seconds(vars, "WS_IDLE_TIMEOUT_SECS")?;
 
         let raw_origins = get(vars, "CORS_ORIGINS")
             .or_else(|| get(vars, "ADMIN_ALLOWED_ORIGINS"))
@@ -472,6 +502,8 @@ impl Config {
             admin_role_id: optional(vars, "ADMIN_ROLE_ID")
                 .or_else(|| optional(vars, "ADMIN_ROLE_NAME")),
             proxy_append_peer_to_xff,
+            proxy_first_byte_timeout,
+            ws_idle_timeout,
             firestore_project_id: optional(vars, "FIRESTORE_PROJECT_ID"),
             firebase_service_account_path: optional(vars, "FIREBASE_SERVICE_ACCOUNT_PATH")
                 .map(PathBuf::from),
