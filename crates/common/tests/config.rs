@@ -209,3 +209,31 @@ fn debug_redacts_secrets() {
     assert!(dbg.contains("<redacted>"));
     assert!(dbg.contains("15633"));
 }
+
+#[test]
+fn trust_cf_connecting_ip_defaults_to_false() {
+    assert!(!Config::from_map(&base()).unwrap().trust_cf_connecting_ip);
+    let m = with(&[("TRUST_CF_CONNECTING_IP", "")]);
+    assert!(!Config::from_map(&m).unwrap().trust_cf_connecting_ip);
+}
+
+#[test]
+fn trust_cf_connecting_ip_parses_values() {
+    for v in ["1", "true", "TRUE", "Yes", "on"] {
+        let m = with(&[("TRUST_CF_CONNECTING_IP", v)]);
+        assert!(Config::from_map(&m).unwrap().trust_cf_connecting_ip, "{v}");
+    }
+    for v in ["0", "false", "No", "OFF"] {
+        let m = with(&[("TRUST_CF_CONNECTING_IP", v)]);
+        assert!(!Config::from_map(&m).unwrap().trust_cf_connecting_ip, "{v}");
+    }
+}
+
+#[test]
+fn trust_cf_connecting_ip_invalid_is_error() {
+    let m = with(&[("TRUST_CF_CONNECTING_IP", "maybe")]);
+    assert_eq!(
+        Config::from_map(&m).unwrap_err(),
+        ConfigError::Invalid("TRUST_CF_CONNECTING_IP", "maybe".into())
+    );
+}

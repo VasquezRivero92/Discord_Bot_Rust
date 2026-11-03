@@ -32,6 +32,8 @@ pub struct Config {
     pub discord_guild_id: String,
     pub cors_origins: Vec<String>,
     pub production: bool,
+    /// Confiar en `CF-Connecting-IP` para identificar al cliente (opt-in).
+    pub trust_cf_connecting_ip: bool,
     pub cs2_server_public_ip: Option<String>,
     pub mixton_server_ip: Option<String>,
     pub admin_role_id: Option<String>,
@@ -52,6 +54,7 @@ impl fmt::Debug for Config {
             .field("discord_guild_id", &self.discord_guild_id)
             .field("cors_origins", &self.cors_origins)
             .field("production", &self.production)
+            .field("trust_cf_connecting_ip", &self.trust_cf_connecting_ip)
             .field("cs2_server_public_ip", &self.cs2_server_public_ip)
             .field("mixton_server_ip", &self.mixton_server_ip)
             .field("admin_role_id", &self.admin_role_id)
@@ -115,6 +118,15 @@ impl Config {
         let node_production = get(vars, "NODE_ENV") == Some("production");
         let production = node_production || base_url.starts_with("https");
 
+        let trust_cf_connecting_ip = match get(vars, "TRUST_CF_CONNECTING_IP") {
+            None => false,
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => return Err(ConfigError::Invalid("TRUST_CF_CONNECTING_IP", v.to_owned())),
+            },
+        };
+
         let raw_origins = get(vars, "CORS_ORIGINS")
             .or_else(|| get(vars, "ADMIN_ALLOWED_ORIGINS"))
             .unwrap_or("");
@@ -144,6 +156,7 @@ impl Config {
             discord_guild_id,
             cors_origins,
             production,
+            trust_cf_connecting_ip,
             cs2_server_public_ip: optional(vars, "CS2_SERVER_PUBLIC_IP"),
             mixton_server_ip: optional(vars, "MIXTON_SERVER_IP"),
             admin_role_id: optional(vars, "ADMIN_ROLE_ID"),

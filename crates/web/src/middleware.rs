@@ -8,18 +8,16 @@
 //! Orden de capas (de fuera hacia dentro, es decir, orden de ejecución de la
 //! petición):
 //!
-//! 1. redirección HTTPS (antes de leer nada ni consumir cuota),
-//! 2. CORS (el preflight se responde aquí y no consume cuota; un origen no
+//! 1. cabeceras de seguridad (solo tocan la respuesta, así que también cubren
+//!    301, 403, 413 y 429; helmet era el primer middleware del legacy),
+//! 2. redirección HTTPS (antes de leer nada ni consumir cuota),
+//! 3. CORS (el preflight se responde aquí y no consume cuota; un origen no
 //!    permitido se rechaza aquí),
-//! 3. rate limit,
-//! 4. límite de cuerpo JSON,
-//! 5. cabeceras de seguridad (se añaden a la respuesta del router interno).
-//!
-//! Las respuestas generadas por las capas 1 a 4 (301, 403, 429, 413) no pasan
-//! por la capa de cabeceras de seguridad.
+//! 4. rate limit,
+//! 5. límite de cuerpo JSON.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -72,6 +70,7 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 
 struct Shared {
     production: bool,
+    trust_cf_connecting_ip: bool,
     cors_origins: Vec<String>,
     limiter: DefaultKeyedRateLimiter<IpAddr>,
     requests: AtomicU64,
@@ -84,6 +83,7 @@ pub fn apply(router: Router, cfg: &Config) -> Router {
     );
     let shared = Arc::new(Shared {
         production: cfg.production,
+        trust_cf_connecting_ip: cfg.trust_cf_connecting_ip,
         cors_origins: cfg.cors_origins.clone(),
         limiter: DefaultKeyedRateLimiter::keyed(quota),
         requests: AtomicU64::new(0),
@@ -91,11 +91,11 @@ pub fn apply(router: Router, cfg: &Config) -> Router {
 
     // La última capa añadida es la más externa.
     router
-        .layer(from_fn(security_headers))
         .layer(from_fn(body_limit))
         .layer(from_fn_with_state(shared.clone(), rate_limit))
         .layer(from_fn_with_state(shared.clone(), cors))
         .layer(from_fn_with_state(shared, https_redirect))
+        .layer(from_fn(security_headers))
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -145,7 +145,15 @@ async fn https_redirect(State(shared): State<Arc<Shared>>, req: Request, next: N
 // ----------------------------------------------------------------- CORS
 
 fn append_vary(headers: &mut HeaderMap, value: &'static str) {
-    headers.append(header::VARY, HeaderValue::from_static(value));
+    let present = headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case(value) || t.trim() == "*");
+    if !present {
+        headers.append(header::VARY, HeaderValue::from_static(value));
+    }
 }
 
 fn set_cors_origin(headers: &mut HeaderMap, origin: &HeaderValue) {
@@ -161,7 +169,15 @@ fn set_cors_origin(headers: &mut HeaderMap, origin: &HeaderValue) {
 /// pasaba un `Error` a Express y respondía 500).
 async fn cors(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
     let Some(origin) = req.headers().get(header::ORIGIN).cloned() else {
-        return next.run(req).await;
+        // Como el paquete `cors`: sin Origin no hay ACAO, pero sí
+        // credenciales y `Vary: Origin`.
+        let mut res = next.run(req).await;
+        res.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        append_vary(res.headers_mut(), "Origin");
+        return res;
     };
 
     let allowed = shared.cors_origins.is_empty()
@@ -202,20 +218,32 @@ async fn cors(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Re
 // ----------------------------------------------------------- Rate limit
 
 fn parse_ip(value: &str) -> Option<IpAddr> {
-    value
-        .trim()
-        .parse::<IpAddr>()
-        .ok()
-        .map(|ip| ip.to_canonical())
+    value.trim().parse::<IpAddr>().ok().map(bucket_ip)
+}
+
+/// IPv4 (incluida IPv4-mapeada) tal cual; IPv6 agrupada por prefijo /56, como
+/// `ipKeyGenerator` de express-rate-limit 8 (`ipv6Subnet: 56`).
+fn bucket_ip(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX << (128 - 56);
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
+        }
+        v4 => v4,
+    }
 }
 
 /// Clave del cliente: `CF-Connecting-IP` si es una IP válida; si no, la
 /// entrada válida más a la derecha de `X-Forwarded-For` (`trust proxy 1`);
 /// si no, la dirección del socket; si no, una clave fija.
-fn client_key(req: &Request) -> IpAddr {
+fn client_key(req: &Request, trust_cf: bool) -> IpAddr {
     let headers = req.headers();
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
+    // `CF-Connecting-IP` es opt-in: el origen puede ser alcanzable sin pasar
+    // por Cloudflare y entonces cualquiera podría falsearla. Cloudflare añade
+    // la IP real del cliente al final de `X-Forwarded-For`, que ya se usa.
+    if let Some(ip) = trust_cf
+        .then(|| headers.get("cf-connecting-ip"))
+        .flatten()
         .and_then(|v| v.to_str().ok())
         .and_then(parse_ip)
     {
@@ -232,7 +260,7 @@ fn client_key(req: &Request) -> IpAddr {
         return ip;
     }
     if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.ip().to_canonical();
+        return bucket_ip(addr.ip());
     }
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
@@ -244,7 +272,7 @@ async fn rate_limit(State(shared): State<Arc<Shared>>, req: Request, next: Next)
         shared.limiter.shrink_to_fit();
     }
 
-    let key = client_key(&req);
+    let key = client_key(&req, shared.trust_cf_connecting_ip);
     match shared.limiter.check_key(&key) {
         Ok(()) => next.run(req).await,
         Err(not_until) => {

@@ -58,6 +58,12 @@ fn base() -> Router {
         .route("/any", any(|| async { "any" }))
 }
 
+fn router_trust_cf() -> Router {
+    let mut c = cfg(false, "");
+    c.trust_cf_connecting_ip = true;
+    apply(base(), &c)
+}
+
 fn router(production: bool, cors: &str) -> Router {
     apply(base(), &cfg(production, cors))
 }
@@ -235,6 +241,8 @@ async fn cors_without_origin_or_with_empty_list_allows() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert!(res.headers().get("access-control-allow-origin").is_none());
+    assert_eq!(res.headers()["access-control-allow-credentials"], "true");
+    assert_eq!(res.headers()["vary"], "Origin");
 
     let res = router(false, "")
         .oneshot(
@@ -325,7 +333,7 @@ async fn rate_limit_does_not_exempt_health() {
 
 #[tokio::test]
 async fn rate_limit_keys_on_cf_connecting_ip() {
-    let app = router(false, "");
+    let app = router_trust_cf();
     exhaust(&app, || with_cf("1.1.1.1")).await;
     assert_eq!(
         status_of(&app, with_cf("1.1.1.1")).await,
@@ -336,7 +344,7 @@ async fn rate_limit_keys_on_cf_connecting_ip() {
 
 #[tokio::test]
 async fn invalid_cf_connecting_ip_is_ignored() {
-    let app = router(false, "");
+    let app = router_trust_cf();
     // clave inválida: cae a X-Forwarded-For
     let mk = || {
         get_req("/")
@@ -517,4 +525,126 @@ async fn large_non_json_body_is_not_limited() {
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(body_string(res).await, size.to_string());
+}
+
+// ---------- fix round 1 ----------
+
+#[tokio::test]
+async fn vary_origin_is_not_duplicated() {
+    let app = apply(
+        Router::new().route("/", get(|| async { ([("vary", "Origin")], "ok") })),
+        &cfg(false, ""),
+    );
+    let res = app
+        .oneshot(get_req("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.headers().get_all("vary").iter().count(), 1);
+}
+
+#[tokio::test]
+async fn cf_connecting_ip_ignored_when_not_trusted() {
+    let app = router(false, "");
+    let mk = |cf: &str| {
+        get_req("/")
+            .header("cf-connecting-ip", cf)
+            .header("x-forwarded-for", "4.4.4.4")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for i in 0..100 {
+        assert_eq!(
+            status_of(&app, mk(&format!("1.1.1.{i}"))).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        status_of(&app, mk("2.2.2.2")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+fn xff(ip: &str) -> Request {
+    get_req("/")
+        .header("x-forwarded-for", ip)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ipv6_same_slash_56_shares_bucket() {
+    let app = router(false, "");
+    for i in 0..100 {
+        assert_eq!(
+            status_of(&app, xff(&format!("2001:db8:0:ab{:02x}::1", i % 16))).await,
+            StatusCode::OK
+        );
+    }
+    // 2001:db8:0:ab00::/56 abarca ab00..abff en el cuarto grupo
+    assert_eq!(
+        status_of(&app, xff("2001:db8:0:abff::9")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // otro /56 es independiente
+    assert_eq!(
+        status_of(&app, xff("2001:db8:0:ac00::1")).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn ipv4_mapped_shares_bucket_with_ipv4() {
+    let app = router(false, "");
+    for _ in 0..100 {
+        status_of(&app, xff("1.2.3.4")).await;
+    }
+    assert_eq!(
+        status_of(&app, xff("::ffff:1.2.3.4")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn early_responses_carry_security_headers() {
+    fn check(res: &Response) {
+        assert!(res.headers().contains_key("permissions-policy"));
+        assert!(res.headers().contains_key("x-content-type-options"));
+    }
+    // 301
+    let res = router(true, "")
+        .oneshot(
+            get_req("/")
+                .header(header::HOST, "h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    check(&res);
+    // 403 (CORS)
+    let res = router(false, "https://ok.example")
+        .oneshot(
+            get_req("/")
+                .header(header::ORIGIN, "https://evil")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    check(&res);
+    // 413
+    let res = router(false, "")
+        .oneshot(json_post(true, 65 * 1024, false))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    check(&res);
+    // 429
+    let app = router(false, "");
+    exhaust(&app, || with_cf("1.1.1.1")).await;
+    let res = app.oneshot(with_cf("1.1.1.1")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    check(&res);
 }
