@@ -20,3 +20,4 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 governor = "0.10"
 http-body = "1"
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
