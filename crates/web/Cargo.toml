@@ -21,8 +21,9 @@ cookie.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 data = { path = "../data" }
+async-trait.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 futures-util.workspace = true
-async-trait.workspace = true

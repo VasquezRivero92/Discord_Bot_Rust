@@ -28,3 +28,4 @@ toml = "0.8"
 moka = { version = "0.12", features = ["future"] }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+url = "2"

@@ -237,3 +237,22 @@ fn trust_cf_connecting_ip_invalid_is_error() {
         ConfigError::Invalid("TRUST_CF_CONNECTING_IP", "maybe".into())
     );
 }
+
+#[test]
+fn admin_role_name_is_the_fallback_for_admin_role_id() {
+    // Como `env.ADMIN_ROLE_ID = ADMIN_ROLE_ID || ADMIN_ROLE_NAME` en config/index.js.
+    let cfg = Config::from_map(&with(&[("ADMIN_ROLE_NAME", "STAFF")])).unwrap();
+    assert_eq!(cfg.admin_role_id.as_deref(), Some("STAFF"));
+    let cfg = Config::from_map(&with(&[
+        ("ADMIN_ROLE_ID", ""),
+        ("ADMIN_ROLE_NAME", "STAFF"),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.admin_role_id.as_deref(), Some("STAFF"));
+    let cfg = Config::from_map(&with(&[
+        ("ADMIN_ROLE_ID", "7"),
+        ("ADMIN_ROLE_NAME", "STAFF"),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.admin_role_id.as_deref(), Some("7"));
+}

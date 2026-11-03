@@ -159,7 +159,9 @@ impl Config {
             trust_cf_connecting_ip,
             cs2_server_public_ip: optional(vars, "CS2_SERVER_PUBLIC_IP"),
             mixton_server_ip: optional(vars, "MIXTON_SERVER_IP"),
-            admin_role_id: optional(vars, "ADMIN_ROLE_ID"),
+            // config/index.js: ADMIN_ROLE_ID || ADMIN_ROLE_NAME.
+            admin_role_id: optional(vars, "ADMIN_ROLE_ID")
+                .or_else(|| optional(vars, "ADMIN_ROLE_NAME")),
         })
     }
 

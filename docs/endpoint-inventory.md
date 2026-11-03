@@ -148,13 +148,13 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | metodo | ruta | auth | origen | linea | colecciones | usa Discord | fase | notas |
 |---|---|---|---|---|---|---|---|---|
-| GET | /auth/discord | none | routes/auth.js | 36 | - | no | 1 | Redirect OAuth2 a discord.com (HTTP directo, sin discord.js) |
-| GET | /auth/discord/callback | none | routes/auth.js | 48 | faceit_users (lectura/rol), faceit_active_matches (capitan) | no | proxy | OAuth2 por HTTP a discord.com; escribe rol/guild del usuario y firma cookie; marcado proxy por la escritura (Task 13 decide) |
+| GET | /auth/discord | none | routes/auth.js | 36 | - | no | 1 | Migrado (Tarea 13, `routes::auth`). Redirect OAuth2 a discord.com: client_id, redirect_uri, response_type=code, scope=identify, state=ruta saneada (`redirect`), prompt=consent. `state` es la ruta de retorno, NO un anti-CSRF (paridad con el legacy) |
+| GET | /auth/discord/callback | none | routes/auth.js | 48 | faceit_users (lectura/rol), faceit_active_matches (capitan) | no | proxy | OAuth2 por HTTP a discord.com; escribe rol/guild del usuario y firma cookie; NO migrado (Tarea 13): `db.setUserRoleAndGuild` escribe en Firestore para GLOBAL_ADMIN_DISCORD_IDS (L137, un solo escritor), el rol/servidor salen de `db.getFullUser` (faceit_users) y `db.isUserCaptain` (capitanes, sin repo en `data`); no usa `checkIsAdmin`. Bloques listos para la fase siguiente: `DiscordApi`/`RestDiscordApi`/`is_admin` en `web::discord` |
 | GET | /auth/steam | none | routes/auth.js | 280 | - | no | proxy | Redirect OpenID Steam |
 | GET | /auth/steam/callback | none | routes/auth.js | 310 | faceit_users, faceit_bot_logs, faceit_pending_verifications | gateway? | proxy | Usa client.guilds.cache.get con fallback fetch (REST); escribe steamId/link |
 | POST | /auth/demo-login | none | routes/auth.js | 454 | - | no | proxy | Login demo con credenciales fijas |
 | POST | /auth/login | none | routes/auth.js | 454 | - | no | proxy | Alias de demo-login |
-| GET | /auth/logout | none | routes/auth.js | 499 | - | no | 1 | Limpia cookie |
+| GET | /auth/logout | none | routes/auth.js | 499 | - | no | 1 | Migrado (Tarea 13, `routes::auth`). Borra `auth_token` y `admin_token` (Path=/) y redirige a `/` |
 
 ## routes/cs2Api.js
 

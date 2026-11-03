@@ -1,5 +1,6 @@
 use axum::Router;
 
+pub mod discord;
 pub mod middleware;
 pub mod proxy;
 pub mod routes;
