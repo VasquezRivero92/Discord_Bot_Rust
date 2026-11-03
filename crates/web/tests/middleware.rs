@@ -648,3 +648,63 @@ async fn early_responses_carry_security_headers() {
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
     check(&res);
 }
+
+// ---------- X-Forwarded-Proto: primera entrada (trust proxy 1) ----------
+
+async fn redirect_status(proto: Option<HeaderValue>) -> StatusCode {
+    let mut b = get_req("/").header(header::HOST, "example.com");
+    if let Some(v) = proto {
+        b = b.header("x-forwarded-proto", v);
+    }
+    router(true, "")
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn https_redirect_uses_the_first_forwarded_proto_entry() {
+    for v in [
+        "https",
+        "HTTPS",
+        "https, http",
+        " https ,http",
+        "https,https",
+    ] {
+        assert_eq!(
+            redirect_status(Some(HeaderValue::from_static(v))).await,
+            StatusCode::OK,
+            "{v:?}"
+        );
+    }
+    for v in ["http", "http, https", "", " , https", "httpss", "ws"] {
+        assert_eq!(
+            redirect_status(Some(HeaderValue::from_static(v))).await,
+            StatusCode::MOVED_PERMANENTLY,
+            "{v:?}"
+        );
+    }
+    assert_eq!(redirect_status(None).await, StatusCode::MOVED_PERMANENTLY);
+    let non_utf8 = HeaderValue::from_bytes(b"https\xff").unwrap();
+    assert_eq!(
+        redirect_status(Some(non_utf8)).await,
+        StatusCode::MOVED_PERMANENTLY
+    );
+}
+
+#[test]
+fn forwarded_proto_helper_matches_express_first_entry() {
+    use axum::http::HeaderMap;
+    use web::middleware::forwarded_proto;
+    let h = |v: &'static str| {
+        let mut m = HeaderMap::new();
+        m.insert("x-forwarded-proto", HeaderValue::from_static(v));
+        m
+    };
+    assert_eq!(forwarded_proto(&HeaderMap::new()), "http");
+    assert_eq!(forwarded_proto(&h("https, http")), "https");
+    assert_eq!(forwarded_proto(&h(" HTTPS ")), "https");
+    assert_eq!(forwarded_proto(&h("http, https")), "http");
+    assert_eq!(forwarded_proto(&h("")), "http");
+}

@@ -594,6 +594,27 @@ async fn https_redirect_in_production() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
+    // Primera entrada, como Express (`trust proxy 1`): sin redirección, y
+    // /api/ping informa lo mismo que decidió la redirección.
+    let first = f
+        .client
+        .get(f.url("/api/ping"))
+        .header("x-forwarded-proto", "https, http")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let v = json_body(first).await;
+    assert_eq!(v["protocol"], "https");
+    assert_eq!(v["secure"], true);
+    let last = f
+        .client
+        .get(f.url("/api/ping"))
+        .header("x-forwarded-proto", "http, https")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(last.status(), 301);
     // Proxificado tampoco sale sin redirigir.
     let proxied = f
         .client

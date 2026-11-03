@@ -24,14 +24,9 @@ async fn ping(headers: HeaderMap) -> Response {
     let has_admin_token = cookies
         .iter()
         .any(|(name, value)| name == "admin_token" && !value.is_empty());
-    // `trust proxy 1` en Express: protocolo = primera entrada de X-Forwarded-Proto.
-    let protocol = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|p| p.trim().to_ascii_lowercase())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "http".to_string());
+    // `trust proxy 1` en Express: protocolo = primera entrada de X-Forwarded-Proto
+    // (el mismo criterio que la redirección HTTPS).
+    let protocol = crate::middleware::forwarded_proto(&headers);
     let names: Vec<&str> = cookies.iter().map(|(n, _)| n.as_str()).collect();
     json_response(
         axum::http::StatusCode::OK,

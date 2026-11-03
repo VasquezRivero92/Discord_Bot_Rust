@@ -159,12 +159,24 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 
 // ---------------------------------------------------------------- HTTPS
 
+/// Protocolo del cliente como `req.protocol` de Express con `trust proxy 1`:
+/// la PRIMERA entrada de `X-Forwarded-Proto`, sin espacios; `http` si falta,
+/// está vacía o no es UTF-8. Se normaliza a minúsculas (Express no lo hace; con
+/// Cloudflare el valor siempre llega en minúsculas). Lo usan la redirección
+/// HTTPS y `GET /api/ping`, para que nunca discrepen.
+pub fn forwarded_proto(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "http".to_owned())
+}
+
 async fn https_redirect(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
     if shared.production {
-        let https = req
-            .headers()
-            .get("x-forwarded-proto")
-            .is_some_and(|v| v.as_bytes() == b"https");
+        let https = forwarded_proto(req.headers()) == "https";
         if !https {
             let host = req
                 .headers()
