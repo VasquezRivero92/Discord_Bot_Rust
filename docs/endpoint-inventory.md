@@ -85,7 +85,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | metodo | ruta | auth | origen | linea | colecciones | usa Discord | fase | notas |
 |---|---|---|---|---|---|---|---|---|
-| GET | /api/admin/me | requireAuth | routes/api.js | 135 | faceit_users | no | 1 |  |
+| GET | /api/admin/me | requireAuth | routes/api.js | 135 | faceit_users | no | proxy | db.getFullUser (faceit_users) sin repo en data; hasSavedPhone no reproducible (Tarea 14) |
 | GET | /api/admin/steam/status | requireAuth | routes/api.js | 149 | - | no | proxy | Estado del bot de Steam en memoria |
 | POST | /api/admin/steam/guard | requireAuth | routes/api.js | 157 | - | no | proxy | Bot de Steam |
 | POST | /api/admin/steam/login | requireAuth | routes/api.js | 177 | - | no | proxy | Bot de Steam |
@@ -130,7 +130,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | POST | /api/admin/support-calls/:id/resolve | requireAuth | routes/api.js | 1742 | faceit_support_calls, faceit_bot_logs | gateway? | proxy | guilds.cache.get con fallback fetch; envia DM y alerta |
 | GET | /api/admin/messages | requireAuth | routes/api.js | 1825 | faceit_config (messages) | no | 1 |  |
 | POST | /api/admin/messages | requireAuth | routes/api.js | 1835 | faceit_config (messages), faceit_bot_logs | no | proxy |  |
-| GET | /api/admin/guilds | requireAuth | routes/api.js | 1851 | - | gateway? | 1 | client.guilds.cache; fallback a DISCORD_GUILD_ID; REST: GET /users/@me/guilds |
+| GET | /api/admin/guilds | requireAuth | routes/api.js | 1851 | - | gateway? | proxy | client.guilds.cache (gateway), memberCount/iconURL no reproducibles por REST de forma exacta; fallback a DISCORD_GUILD_ID; REST: GET /users/@me/guilds |
 | GET | /api/admin/claims | requireAuth | routes/api.js | 1880 | claims | no | 1 |  |
 | GET | /api/admin/claims/:code | requireAuth | routes/api.js | 1892 | claims | no | 1 |  |
 | POST | /api/admin/claims/:code/respond | requireAuth | routes/api.js | 1905 | claims, faceit_bot_logs | no | proxy |  |
@@ -139,9 +139,9 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | POST | /api/admin/orders/:id/status | requireAuth | routes/api.js | 1968 | orders, faceit_bot_logs | no | proxy |  |
 | GET | /api/admin/yape/transactions | requireAuth | routes/api.js | 1989 | yape_transacciones, yape_operations, yape_audit_logs | no | 1 |  |
 | POST | /api/admin/yape/manual-approve | requireAuth | routes/api.js | 2024 | yape_operations, yape_audit_logs, faceit_users, faceit_bot_logs | no | proxy | Transaccion Firestore |
-| GET | /api/admin/guilds/:guildId/settings | requireAuth | routes/api.js | 2063 | guild_settings | no | 1 |  |
+| GET | /api/admin/guilds/:guildId/settings | requireAuth | routes/api.js | 2063 | guild_settings | no | proxy | getEffectiveConfigForGuild mezcla env + settings globales + guild (config/index.js:178), no solo guild_settings (Tarea 14) |
 | POST | /api/admin/guilds/:guildId/settings | requireAuth | routes/api.js | 2079 | guild_settings, faceit_config, faceit_bot_logs | gateway? | proxy | Usa client; verificar |
-| GET | /api/admin/map-catalog | requireAuth | routes/api.js | 2124 | faceit_config (mixton lobby state) | no | 1 |  |
+| GET | /api/admin/map-catalog | requireAuth | routes/api.js | 2124 | faceit_config (mixton lobby state) | no | proxy | getMixtonLobbyState escribe estado por defecto si falta el doc y cae a estado por defecto ante error; catálogo estático en lobby.js (Tarea 14) |
 | POST | /api/admin/map-catalog | requireAuth | routes/api.js | 2138 | faceit_config (mixton lobby state) | no | proxy |  |
 
 ## routes/auth.js
