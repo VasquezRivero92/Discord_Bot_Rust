@@ -74,7 +74,7 @@ Cloudflare Tunnel
 **Fase 1: Rust como puerta de entrada y servidor web**
 - Axum con proxy transparente a Node (incluidos WebSockets).
 - Estáticos, redirects de rutas públicas (`/terms`, `/privacy`, `/support`) y SPA.
-- `/auth/*` (OAuth de Discord, JWT, cookies compatibles) y `routes/publicApi.js` (4 endpoints de solo lectura) primero; luego `routes/api.js` (56 rutas) y `routes/cs2Api.js`, endpoint por endpoint.
+- `/auth/*` (OAuth de Discord, JWT, cookies compatibles) y los 2 GET de `routes/publicApi.js` (`/products`, `/reclamaciones/:code`; los 2 POST escriben y siguen en Node) primero; luego `routes/api.js` (56 rutas) y `routes/cs2Api.js`, endpoint por endpoint.
 - Equivalentes de `helmet`, `cors` y rate limiting (`tower-http`, `governor`).
 - Criterio de salida: tests de contraste pasan y p95 y RAM son iguales o mejores que la línea base.
 
