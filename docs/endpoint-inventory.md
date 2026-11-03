@@ -163,7 +163,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | GET | /api/cs2/current-match | none | routes/cs2Api.js | 16 | cs2_pending_matches, faceit_users | no | proxy | Tambien escribe (saveUser); consumido por plugin CS2 |
 | POST | /api/cs2/match-finish | none | routes/cs2Api.js | 120 | faceit_match_stats, faceit_matches_history | no | proxy | Escritura de stats |
 | POST | /api/cs2/match-cancel | none | routes/cs2Api.js | 206 | - | no | proxy | Delegado a cs2ServerManager (estado en memoria) |
-| GET | /api/cs2/server-info | none | routes/cs2Api.js | 230 | - | no | 1 | Estado en memoria de cs2ServerManager |
+| GET | /api/cs2/server-info | none | routes/cs2Api.js | 230 | - | no | proxy | Responde serverIp (MIXTON_SERVER_IP + normalizacion) y activeMatch = getCurrentMatch() (estado en memoria de cs2ServerManager, migra en fase 2); no migrable solo con Config |
 
 ## routes/lobby.js
 
