@@ -293,7 +293,10 @@ pub(crate) fn legacy_write(method: &Method, path: &str) -> Option<LegacyWrite> {
         return None;
     }
     let path = path.strip_suffix('/').unwrap_or(path).to_ascii_lowercase();
+    // El montaje `app.use('/api/admin', router)` deja `/resto`, y su `trim_prefix`
+    // admite una `/` extra (`/api/admin//users/verify` llega al handler).
     let rest = path.strip_prefix("/api/admin/")?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
     let segments: Vec<&str> = rest.split('/').collect();
     match segments.as_slice() {
         ["users", id, "unlink"] if !id.is_empty() => Some(LegacyWrite::Users),
@@ -339,6 +342,23 @@ mod tests {
             ("/api/admin/users/backup", None),
             ("/api/admin/yape/transactions", None),
             ("/api/lobby/yape/manual-approve", None),
+            // Express 4.22 (sondeado): el `trim_prefix` del montaje se traga una `/`
+            // extra tras `/api/admin`; con tres, 404.
+            ("/api/admin//users/verify", Some(LegacyWrite::Users)),
+            ("/api/admin//users/x/unlink", Some(LegacyWrite::Users)),
+            ("/api/admin//yape/manual-approve", Some(LegacyWrite::Yape)),
+            ("/api/admin///users/verify", None),
+            ("/API/ADMIN/USERS/VERIFY", Some(LegacyWrite::Users)),
+            ("/api/admin/yape/manual-approve/", Some(LegacyWrite::Yape)),
+            ("/api/admin/users/verify//", None),
+            // Los literales no se decodifican; el `:id` admite `%2F`.
+            ("/api/admin/%75sers/verify", None),
+            ("/api/admin/users/ver%69fy", None),
+            ("/api/admin/users/a%2Fb/unlink", Some(LegacyWrite::Users)),
+            ("/api/admin%2Fusers/verify", None),
+            ("/api/admin/./users/verify", None),
+            ("//api/admin/users/verify", None),
+            ("/api//admin/users/verify", None),
         ] {
             assert_eq!(legacy_write(&post, path), want, "{path}");
         }
