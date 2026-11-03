@@ -154,7 +154,8 @@ async fn proxies_get_with_query_and_headers() {
     assert!(body.starts_with("GET /echo?a=1&b=dos%20x\n"), "{body}");
     assert!(body.contains("x-custom: hola\n"), "{body}");
     assert!(body.contains("cookie: sid=abc\n"), "{body}");
-    assert!(body.contains("x-forwarded-for: 127.0.0.1\n"), "{body}");
+    // Transparent by default: no peer injected when the client sent none.
+    assert!(!body.contains("x-forwarded-for"), "{body}");
 }
 
 #[tokio::test]
@@ -323,10 +324,7 @@ async fn preserves_existing_forwarded_headers() {
         .unwrap();
     assert!(body.contains("x-forwarded-proto: https\n"), "{body}");
     assert!(body.contains("x-forwarded-host: machupeek.com\n"), "{body}");
-    assert!(
-        body.contains("x-forwarded-for: 203.0.113.9, 127.0.0.1\n"),
-        "{body}"
-    );
+    assert!(body.contains("x-forwarded-for: 203.0.113.9\n"), "{body}");
     assert_eq!(body.matches("x-forwarded-proto").count(), 1);
 }
 
@@ -404,4 +402,139 @@ async fn does_not_forward_hop_by_hop_headers() {
         assert!(!body.contains(gone), "{gone} leaked: {body}");
     }
     assert!(body.contains("x-keep: yes\n"), "{body}");
+}
+
+/// Legacy that records every request target and raw X-Forwarded-For value.
+#[derive(Clone, Default)]
+struct Recorder {
+    uris: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    xff: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+async fn recording_legacy() -> (TestServer, Recorder) {
+    let rec = Recorder::default();
+    let r = rec.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let r = r.clone();
+        async move {
+            r.uris
+                .lock()
+                .unwrap()
+                .push(req.uri().path_and_query().unwrap().to_string());
+            for v in req.headers().get_all("x-forwarded-for") {
+                r.xff.lock().unwrap().push(v.as_bytes().to_vec());
+            }
+            "ok"
+        }
+    });
+    (serve(app).await, rec)
+}
+
+/// Sends a raw request line (no client-side normalization); returns the status line.
+async fn raw_get(addr: SocketAddr, target: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET {target} HTTP/1.1
+Host: x
+Connection: close
+
+"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn rejects_paths_the_url_crate_would_rewrite() {
+    let (legacy, rec) = recording_legacy().await;
+    let proxy = proxy_to(legacy.addr).await;
+    for target in [
+        "/echo/%2e%2e/x",
+        "/echo/.%2e/x",
+        "/echo/%2e./x",
+        "/echo/%2e/x",
+        "/echo/./x",
+        "/a/../b",
+    ] {
+        let res = raw_get(proxy.addr, target).await;
+        assert!(res.starts_with("HTTP/1.1 400"), "{target}: {res}");
+        assert!(
+            res.contains(r#"{"error":"Ruta no válida"}"#),
+            "{target}: {res}"
+        );
+        assert!(res
+            .to_lowercase()
+            .contains("content-type: application/json"));
+    }
+    assert!(rec.uris.lock().unwrap().is_empty(), "legacy was contacted");
+}
+
+#[tokio::test]
+async fn forwards_encoded_paths_and_queries_byte_identical() {
+    let (legacy, rec) = recording_legacy().await;
+    let proxy = proxy_to(legacy.addr).await;
+    let targets = [
+        "/a%20b?x=%41",
+        "/caf%C3%A9",
+        "/dir/",
+        "//double//slash",
+        "/x?",
+        "/x?a=1&a=2",
+    ];
+    for target in targets {
+        let res = raw_get(proxy.addr, target).await;
+        assert!(res.starts_with("HTTP/1.1 200"), "{target}: {res}");
+    }
+    // `/x?` keeps its empty query: forwarded exactly as received.
+    assert_eq!(*rec.uris.lock().unwrap(), targets);
+}
+
+#[tokio::test]
+async fn xff_is_transparent_by_default() {
+    let (legacy, rec) = recording_legacy().await;
+    let proxy = proxy_to(legacy.addr).await;
+    let c = client();
+
+    c.get(format!("http://{}/a", proxy.addr))
+        .send()
+        .await
+        .unwrap();
+    assert!(rec.xff.lock().unwrap().is_empty(), "peer was injected");
+
+    // Non-UTF-8 value must survive byte-for-byte.
+    let raw = axum::http::HeaderValue::from_bytes(b"203.0.113.9, \xff\xfe").unwrap();
+    c.get(format!("http://{}/b", proxy.addr))
+        .header("x-forwarded-for", raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        *rec.xff.lock().unwrap(),
+        vec![b"203.0.113.9, \xff\xfe".to_vec()]
+    );
+}
+
+#[tokio::test]
+async fn xff_appends_peer_when_opted_in() {
+    let (legacy, rec) = recording_legacy().await;
+    let proxy = serve(web::app_with_proxy_options(
+        format!("http://{}", legacy.addr),
+        web::proxy::ProxyOptions {
+            append_peer_to_xff: true,
+        },
+    ))
+    .await;
+    client()
+        .get(format!("http://{}/a", proxy.addr))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        *rec.xff.lock().unwrap(),
+        vec![b"203.0.113.9, 127.0.0.1".to_vec()]
+    );
 }

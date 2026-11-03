@@ -31,8 +31,25 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
+/// Behavior switches for the proxy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProxyOptions {
+    /// Append the TCP peer address to `X-Forwarded-For`. Off by default.
+    ///
+    /// The legacy runs with `trust proxy 1` and reads the rightmost
+    /// `X-Forwarded-For` entry as the client IP. The chain is
+    /// cloudflared -> Rust -> Node, so cloudflared's entry (the real visitor)
+    /// must stay rightmost: appending the peer (cloudflared's loopback address)
+    /// would make `req.ip` in Node wrong. By default the header is forwarded
+    /// untouched (byte-for-byte) and never injected when absent.
+    pub append_peer_to_xff: bool,
+}
+
 #[derive(Clone)]
 struct ProxyState {
+    options: ProxyOptions,
+    /// Path of the legacy base URL without trailing slash ("" for a bare origin).
+    base_path: Arc<str>,
     /// Legacy base URL without trailing slash, e.g. `http://127.0.0.1:3001`.
     legacy: Arc<str>,
     client: reqwest::Client,
@@ -43,7 +60,7 @@ struct ProxyState {
 /// Mount it with `Router::fallback_service(fallback_proxy(url))`. For the
 /// `X-Forwarded-For` header to carry the peer address the outer app must be
 /// served with `into_make_service_with_connect_info::<SocketAddr>()`.
-pub fn fallback_proxy(legacy_url: String) -> Router {
+pub fn fallback_proxy(legacy_url: String, options: ProxyOptions) -> Router {
     let client = reqwest::Client::builder()
         // 3xx from Node must reach the browser untouched.
         .redirect(reqwest::redirect::Policy::none())
@@ -55,7 +72,13 @@ pub fn fallback_proxy(legacy_url: String) -> Router {
         .no_proxy()
         .build()
         .expect("reqwest client");
+    let base_path: Arc<str> = reqwest::Url::parse(&legacy_url)
+        .map(|u| u.path().trim_end_matches('/').to_owned())
+        .unwrap_or_default()
+        .into();
     let state = ProxyState {
+        options,
+        base_path,
         legacy: legacy_url.trim_end_matches('/').into(),
         client,
     };
@@ -124,22 +147,23 @@ fn client_ip(req: &Request) -> Option<std::net::IpAddr> {
         .map(|ConnectInfo(addr)| addr.ip())
 }
 
-/// Adds `X-Forwarded-For` (appending the peer) and, only if absent,
-/// `X-Forwarded-Proto` / `X-Forwarded-Host`.
+/// Adds `X-Forwarded-Proto` / `X-Forwarded-Host` only if absent and, when
+/// `append_peer` is set, appends the peer to `X-Forwarded-For` (raw bytes, so
+/// non-UTF-8 values survive). Otherwise `X-Forwarded-For` is left untouched.
 fn add_forwarded_headers(
     headers: &mut HeaderMap,
     peer: Option<std::net::IpAddr>,
     host: Option<HeaderValue>,
+    append_peer: bool,
 ) {
-    if let Some(ip) = peer {
-        let mut parts: Vec<String> = headers
-            .get_all(X_FORWARDED_FOR)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .collect();
-        parts.push(ip.to_string());
-        if let Ok(v) = HeaderValue::from_str(&parts.join(", ")) {
+    if let (true, Some(ip)) = (append_peer, peer) {
+        let mut joined: Vec<u8> = Vec::new();
+        for v in headers.get_all(X_FORWARDED_FOR) {
+            joined.extend_from_slice(v.as_bytes());
+            joined.extend_from_slice(b", ");
+        }
+        joined.extend_from_slice(ip.to_string().as_bytes());
+        if let Ok(v) = HeaderValue::from_bytes(&joined) {
             headers.insert(X_FORWARDED_FOR, v);
         }
     }
@@ -153,15 +177,36 @@ fn add_forwarded_headers(
     }
 }
 
+fn invalid_path() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"Ruta no válida"}"#,
+    )
+        .into_response()
+}
+
+/// Builds the upstream URL and verifies the `url` crate did not alter the
+/// request target (dot-segment resolution, re-encoding). A mismatch would let
+/// Rust and Node disagree on the path, so such requests are rejected.
+/// An empty query (`/x?`) is preserved as `?` on both sides.
+fn upstream_url(state: &ProxyState, pq: &axum::http::uri::PathAndQuery) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(&format!("{}{}", state.legacy, pq.as_str())).ok()?;
+    let path_ok = url.path() == format!("{}{}", state.base_path, pq.path());
+    (path_ok && url.query() == pq.query()).then_some(url)
+}
+
 async fn proxy_http(state: ProxyState, req: Request) -> Response {
     let peer = client_ip(&req);
     let (parts, body) = req.into_parts();
-    let path_and_query = parts
+    let pq = parts
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let url = format!("{}{}", state.legacy, path_and_query);
+        .cloned()
+        .unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
+    let Some(url) = upstream_url(&state, &pq) else {
+        return invalid_path();
+    };
 
     // Decide before stripping (Transfer-Encoding is hop-by-hop): send a body
     // only when the client announced one, otherwise reqwest would add
@@ -177,7 +222,7 @@ async fn proxy_http(state: ProxyState, req: Request) -> Response {
     let host = parts.headers.get(header::HOST).cloned();
     let mut headers = parts.headers;
     strip_hop_by_hop(&mut headers);
-    add_forwarded_headers(&mut headers, peer, host);
+    add_forwarded_headers(&mut headers, peer, host, state.options.append_peer_to_xff);
 
     let mut builder = state.client.request(parts.method, url).headers(headers);
     if has_body {
@@ -221,12 +266,15 @@ async fn proxy_websocket(state: ProxyState, req: Request) -> Response {
     let peer = client_ip(&req);
     let (mut parts, _body) = req.into_parts();
 
-    let path_and_query = parts
+    let pq = parts
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let url = ws_url(&state.legacy, path_and_query);
+        .cloned()
+        .unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
+    if upstream_url(&state, &pq).is_none() {
+        return invalid_path();
+    }
+    let url = ws_url(&state.legacy, pq.as_str());
 
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(ws) => ws,
@@ -255,7 +303,7 @@ async fn proxy_websocket(state: ProxyState, req: Request) -> Response {
             out.append(X_FORWARDED_FOR, value.clone());
         }
         let host = parts.headers.get(header::HOST).cloned();
-        add_forwarded_headers(out, peer, host);
+        add_forwarded_headers(out, peer, host, state.options.append_peer_to_xff);
     }
 
     // Connect upstream BEFORE accepting the client upgrade, so a dead legacy
