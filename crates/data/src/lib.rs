@@ -5,6 +5,13 @@ mod claims;
 mod error;
 mod firestore;
 mod guild_settings;
+mod logs;
+mod match_history;
+mod messages;
+mod model;
+mod orders;
+mod source;
+mod support_calls;
 
 pub use crate::cache::TtlCache;
 pub use crate::claims::{Claim, ClaimsRepo, FirestoreClaimsRepo, InMemoryClaimsRepo};
@@ -13,4 +20,16 @@ pub use crate::firestore::{document_id, ChangeEvent, Dir, FirestoreClient, Op, Q
 pub use crate::guild_settings::{
     FirestoreGuildSettingsRepo, GuildSettings, GuildSettingsRepo, GuildSettingsSource,
     InMemoryGuildSettingsRepo, WatcherHandle, GUILD_SETTINGS_TTL,
+};
+pub use crate::logs::{FakeLogsRepo, FirestoreLogsRepo, LogEntry, LogsRepo};
+pub use crate::match_history::{
+    FakeMatchHistoryRepo, FirestoreMatchHistoryRepo, MatchHistoryEntry, MatchHistoryRepo,
+};
+pub use crate::messages::{
+    default_message_templates, FakeMessagesRepo, FirestoreMessagesRepo, MessagesRepo,
+};
+pub use crate::orders::{FakeOrdersRepo, FirestoreOrdersRepo, Order, OrdersRepo};
+pub use crate::source::DocSource;
+pub use crate::support_calls::{
+    FakeSupportCallsRepo, FirestoreSupportCallsRepo, SupportCall, SupportCallsRepo,
 };

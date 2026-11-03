@@ -190,3 +190,14 @@ la única cota de lo desactualizados que pueden estar los datos.
     (el legacy ordena en memoria). No necesitan índice si el repositorio hace lo mismo.
   - `faceit_users` (`mixton_ready ==` + `mixton_guild_id ==`): solo igualdades, índice ya listado en
     `firestore.indexes.json`.
+- **Listas vacías que pueden esconder un índice que falta (Tarea 4).** El legacy traga cualquier
+  error de `getRecentLogs` y `getSupportCalls` y responde `{ logs: [] }` / `{ calls: [] }` con 200;
+  si en producción falta el índice compuesto `guild_id` + `createdAt desc` de `faceit_bot_logs` o
+  de `faceit_support_calls`, el panel de un admin de servidor (que siempre filtra por su guild)
+  puede llevar tiempo mostrando listas vacías sin que nadie lo note. Los repos de Rust
+  (`LogsRepo`, `SupportCallsRepo`) **no** tragan: devuelven el `DataError` (`Firestore` con
+  `FAILED_PRECONDITION`, o `QuotaExceeded`) y es la ruta (Tarea 7) la que, para no cambiar la
+  respuesta, debe convertirlo en la lista vacía del legacy, pero registrándolo en el log, de modo
+  que el índice que falte salga a la luz. `MatchHistoryRepo` reproduce el respaldo del legacy
+  (barrido por `createdAt` y filtro en memoria) ante cualquier error salvo `QuotaExceeded`; ahí el
+  índice sí consta en `firestore.indexes.json`. `claims`/`orders` no necesitan índices.
