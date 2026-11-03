@@ -1,0 +1,11 @@
+[package]
+name = "web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

@@ -1,0 +1,8 @@
+target/
+.env
+.env.*
+!.env.example
+firebase-service-account*.json
+*service-account*.json
+cookies.txt
+.superpowers/
