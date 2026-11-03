@@ -24,12 +24,25 @@ Precedencia dentro de `web::build_app` (gana la primera que coincide):
    `/api/admin/*`, `/api/lobby/*` (incluido el WebSocket `/api/lobby/mixton-ws`),
    `/api/cs2/*`, `/webhook*`, `POST /api/reclamaciones` y `POST /api/checkout/purchase`.
 
-Por fuera de todo va `middleware::apply`: cabeceras de seguridad (helmet sin CSP),
-redirección HTTPS en producción, CORS, rate limit de 100 peticiones por minuto
-por cliente y límite de 64 kB para cuerpos JSON. Cubre también lo que va a Node,
-así que el rate limit de Rust y el de Node se suman. Si Node no responde, el
-proxy devuelve `502 {"error":"Servicio no disponible"}` y lo migrado sigue
-funcionando.
+Por fuera de todo van las cabeceras de seguridad (helmet sin CSP), la
+redirección HTTPS en producción, CORS y el límite de 64 kB para cuerpos JSON
+(`middleware::apply_except_rate_limit`). Se aplican a todo, incluido lo que va a
+Node.
+
+El **rate limit** (100 peticiones por minuto por cliente) es un único limitador
+con un solo cubo por cliente, compartido por las rutas migradas (1 y 2) y por
+todo lo que pasa al proxy (4). Lo que contesta `static_files` (3) está
+**exento**: archivos, `index.html` y rutas SPA y legales. En el legado,
+`express.static` corría antes del `globalLimiter`, y un visitante detrás de
+CGNAT no debe recibir 429 en los assets. Hay una desviación consciente: en el
+legado, las rutas SPA y legales (`/`, `/tienda`, `/terms`, `/admin`...) eran
+`app.get` posteriores al limitador y sí consumían cuota; en Rust solo sirven
+HTML estático y quedan exentas. Lo que `static_files` no contesta y pasa a Node
+(p. ej. un asset que no existe) sí cuenta. Lo proxificado consume cuota en
+Rust y otra vez en Node.
+
+Si Node no responde, el proxy devuelve
+`502 {"error":"Servicio no disponible"}` y lo migrado sigue funcionando.
 
 ## 2. Requisitos previos
 
@@ -151,43 +164,83 @@ docker compose build web
 
 ### 4.2 Orden del corte
 
-1. **Node a `:3001`.** En el `.env` del legado pon `PORT=3001`. En su
-   `docker-compose.yml`, quita `80:15633`, publica `127.0.0.1:3001:3001` y
-   **para su servicio `tunnel`** (si quedan dos conectores del mismo túnel, el
-   tráfico se reparte entre ambos). Reinicia Node:
-   ```bash
-   cd /d/Discord_Faceit
-   docker compose stop tunnel
-   docker compose up -d discord-faceit-bot
-   docker compose logs --tail 50 discord-faceit-bot   # "Servidor Express escuchando en http://0.0.0.0:3001"
-   ```
-   Desde este momento machupeek.com no responde hasta el paso 4. Hazlo en una
-   ventana de bajo tráfico. Node sigue atendiendo todo lo que todavía le
-   pertenece: bot, webhooks y API admin.
-2. **Comprueba que un contenedor llega a Node** por `host.docker.internal`:
-   ```bash
-   docker run --rm --add-host host.docker.internal:host-gateway curlimages/curl:8.10.1 \
-     -s -o /dev/null -w "%{http_code}\n" http://host.docker.internal:3001/health
-   ```
-   Tiene que imprimir `200`. En Linux, `host-gateway` es la IP del puente docker
-   y un puerto publicado solo en `127.0.0.1` no se alcanza. En ese caso publica
-   Node en la IP del puente o, mejor, conecta ambos proyectos a una red docker
-   externa común y usa `WEB_LEGACY_URL=http://discord-faceit-bot:3001`.
-3. **Rust y el túnel nuevo:**
+En cada paso, el sitio solo depende de algo que ya se comprobó. El conector
+del legado se para al final, cuando el conector nuevo ya está sirviendo
+tráfico. Antes de cambiar nada en el túnel, cada paso tiene un punto de
+abandono. Si algo falla después, ve a la sección 6.
+
+Plazo de abandono: si un servicio no está `healthy` o conectado en **60 s**, no
+sigas. Aplica la rama de abandono de ese paso.
+
+1. **Arranca solo `web`, sin tráfico.** Node aún no ha cambiado de puerto, y
+   `/api/ping` lo contesta Rust de todas formas.
    ```bash
    cd /d/MACHUPEEK
    export LEGACY_PUBLIC_DIR=/d/Discord_Faceit/public
-   export TUNNEL_TOKEN='<token del túnel>'    # en la shell, nunca en un archivo versionado
-   docker compose up -d --build
-   docker compose ps                          # web: healthy
+   export TUNNEL_TOKEN=unused-until-step-3   # compose exige la variable para interpretar el archivo
+   docker compose up -d --build web
+   docker compose ps web                                                # STATUS: (healthy)
+   docker compose exec web /usr/local/bin/web --healthcheck; echo $?    # 0
    docker compose logs --tail 30 web
    ```
    El banner de arranque muestra `port`, `legacy_url`, `static_dir`, `base_url`,
    `production`, `trust_cf_connecting_ip`, `proxy_append_peer_to_xff` y
-   `firestore` (modo de credenciales). No muestra ningún secreto.
-4. **Apunta el túnel a Rust.** En Zero Trust > Tunnels > *túnel* > Public
-   Hostname `machupeek.com` > Service, pon `http://web:15633`. El túnel nuevo
-   vive en la red de compose de `D:\MACHUPEEK` y resuelve `web`.
+   `firestore` (modo de credenciales). No muestra ningún secreto. Un `.env`
+   inválido produce `configuration error: ...` y un bucle de reinicios con
+   código 2.
+   **Abandono:** `docker compose down`. El sitio no se ha tocado; corrige `.env`
+   o el montaje y repite.
+2. **Node a `:3001`.** En el `.env` del legado pon `PORT=3001`. En su
+   `docker-compose.yml`, quita `80:15633` y publica `127.0.0.1:3001:3001`. Deja
+   su `tunnel` en marcha. Reinicia Node y, nada más arrancar, apunta el Service
+   del hostname público a Node en su puerto nuevo, en una dirección que puedan
+   resolver **los dos** conectores (el del legado y el nuevo del paso 3):
+   `http://host.docker.internal:3001`. Docker Desktop define
+   `host.docker.internal` en todos los contenedores; en Linux el conector del
+   legado no lo tiene, así que usa `http://discord-faceit-bot:3001` y no
+   arranques el conector nuevo hasta haber parado el del legado (pasos 3 y 4 en
+   orden inverso, aceptando un corte breve).
+   ```bash
+   cd /d/Discord_Faceit
+   docker compose up -d discord-faceit-bot
+   docker compose logs --tail 50 discord-faceit-bot   # "Servidor Express escuchando en http://0.0.0.0:3001"
+   # Panel o API (6.1): Service = http://host.docker.internal:3001
+   curl -sI https://machupeek.com/api/ping            # 200, servido por Node
+   ```
+   Entre el reinicio de Node y el cambio del Service el sitio da error. Hazlo en
+   una ventana de bajo tráfico.
+   **Abandono:** si Node no arranca en `:3001`, restaura su `PORT` anterior y
+   vuelve a poner el Service que anotaste en los requisitos previos.
+3. **Comprueba que un contenedor llega a Node** y arranca el conector nuevo:
+   ```bash
+   docker run --rm --add-host host.docker.internal:host-gateway curlimages/curl:8.10.1 \
+     -s -o /dev/null -w "%{http_code}\n" http://host.docker.internal:3001/health   # 200
+   cd /d/MACHUPEEK
+   read -rs TUNNEL_TOKEN && export TUNNEL_TOKEN   # se pega sin que se vea ni quede en el historial
+   docker compose up -d tunnel
+   docker compose logs --tail 30 tunnel           # "Registered tunnel connection"
+   ```
+   Durante unos minutos el túnel tiene dos conectores: el del legado y el
+   nuevo. Cloudflare admite varias réplicas de `cloudflared` para el mismo
+   túnel y reparte el tráfico entre ellas. **Comprueba en el panel** (Tunnels >
+   *túnel* > Connectors) que aparecen ambos como sanos. Como el Service apunta a
+   una dirección que los dos resuelven, cualquier conector sirve a Node.
+   En Linux, el `curl` de arriba falla si Node solo está publicado en
+   `127.0.0.1`. En ese caso publica Node en la IP del puente docker o conecta
+   ambos proyectos a una red externa común y usa
+   `WEB_LEGACY_URL=http://discord-faceit-bot:3001`.
+   **Abandono:** `docker compose stop tunnel`. El conector del legado sigue
+   sirviendo y no hay que hacer nada más.
+4. **Para el conector del legado**, cuando el nuevo ya sirve tráfico:
+   ```bash
+   docker compose -f /d/Discord_Faceit/docker-compose.yml stop tunnel
+   curl -sI https://machupeek.com/api/ping       # sigue 200 (Node, por el conector nuevo)
+   ```
+   **Abandono:** `docker compose -f /d/Discord_Faceit/docker-compose.yml up -d tunnel`.
+5. **Apunta el túnel a Rust.** Zero Trust > Tunnels > *túnel* > Public Hostname
+   `machupeek.com` > Service: `http://web:15633`. Solo queda el conector nuevo,
+   que vive en la red de compose de `D:\MACHUPEEK` y resuelve `web`. Verifica la
+   sección 5 de inmediato. Ante cualquier fallo, ve a 6.1.
 
 ### 4.3 Desarrollo en Windows (sin Docker)
 
@@ -219,6 +272,7 @@ arranca con un `.env` de PRUEBA.
 | Webhook | enviar un webhook de prueba desde Faceit (o esperar uno real) | llega a Node: `docker compose -f /d/Discord_Faceit/docker-compose.yml logs discord-faceit-bot` |
 | Logs Rust | `docker compose logs -f web` | sin errores; sin 502 continuos |
 | IP real en Node | logs de Node o rate limit de Node | IP del visitante, no la de un contenedor |
+| HTTPS sin bucle | `curl -s https://machupeek.com/api/ping` | `"protocol":"https"` y `"secure":true` (ver 5.2) |
 
 ### 5.1 Contraste Node vs Rust (solo entorno de PRUEBA)
 
@@ -234,9 +288,43 @@ casos futuros. Salida 0 = sin diferencias. Las rutas no migradas comparan Node
 directo con Node a través del proxy Rust, lo que sirve para comprobar que el
 proxy es transparente.
 
-## 6. Rollback (menos de un minuto)
+### 5.2 Modo de fallo: redirección HTTPS en bucle
 
-El rollback no reinicia Node, que sigue en `:3001`.
+En producción (`BASE_URL` con `https` o `NODE_ENV=production`), Rust responde
+`301 https://<host><ruta>` a toda petición que no traiga
+`X-Forwarded-Proto: https` (la primera entrada). cloudflared reenvía esa
+cabecera que pone Cloudflare. Si se pierde por el camino (un proxy intermedio,
+un Service mal configurado), el sitio entra en un bucle: todas las respuestas
+son 301 a la misma URL y el navegador termina con "demasiadas redirecciones".
+
+Diagnóstico desde la red de compose (el nombre de la red suele ser
+`machupeek_default`, compruébalo con `docker network ls`):
+
+```bash
+docker run --rm --network machupeek_default curlimages/curl:8.10.1 -sI http://web:15633/api/ping
+#   -> 301 (esperado sin la cabecera)
+docker run --rm --network machupeek_default curlimages/curl:8.10.1 -sI \
+  -H 'X-Forwarded-Proto: https' http://web:15633/api/ping
+#   -> 200
+curl -s https://machupeek.com/api/ping   # tiene que decir "protocol":"https","secure":true
+```
+
+En el binario local (Windows, 4.3) es lo mismo con
+`curl -sI [-H 'X-Forwarded-Proto: https'] http://127.0.0.1:15633/api/ping`.
+
+Si `https://machupeek.com/api/ping` da 301 o no informa `"secure":true`, **haz
+rollback (6.1)**. Poner `NODE_ENV` sin `production` con un `BASE_URL` `http`
+desactiva la redirección y solo sirve **para diagnosticar** en un entorno de
+prueba. No es un arreglo: también apaga el modo producción. La causa real es
+que la cabecera no llega y hay que corregirla.
+
+## 6. Rollback
+
+### 6.1 Después del paso 5 (el conector nuevo está en marcha), menos de un minuto
+
+Activa el rollback si ocurre cualquiera de estas cosas: los checks de la
+sección 5 fallan, aparece el bucle 301 de 5.2, hay 502 continuos o el login se
+rompe. El rollback no reinicia Node, que sigue en `:3001`.
 
 1. Devuelve el tráfico a Node cambiando el Service del hostname público a
    `http://host.docker.internal:3001` (el túnel nuevo llega al host por
@@ -252,13 +340,47 @@ El rollback no reinicia Node, que sigue en `:3001`.
    Si la configuración tiene más hostnames, inclúyelos todos: el PUT reemplaza
    la configuración entera.
 2. Para Rust: `docker compose -f /d/MACHUPEEK/docker-compose.yml stop web`.
-3. Comprueba que `https://machupeek.com/health` responde con el JSON del legado.
+3. Haz la comprobación de recuperación (al final de esta sección).
 
-Para volver del todo al estado anterior al corte, en una ventana tranquila
-(implica reiniciar el bot): `docker compose -f /d/MACHUPEEK/docker-compose.yml down`,
-y en el legado `PORT` vuelve a su valor anterior, se arranca de nuevo su
-`tunnel` y el Service vuelve al destino que anotaste en el paso 2. Sin el
-mapeo `80:15633`.
+### 6.2 El conector nuevo no está en marcha (o `web` no llega a `healthy`)
+
+El servicio `tunnel` tiene `depends_on: web: condition: service_healthy`. Si
+`web` nunca llega a estar sano (`.env` inválido con reinicios en código 2, error
+de montaje, Firestore inaccesible), **el conector nuevo no arranca**. Lo mismo
+pasa si cloudflared no registra la conexión. Si eso ocurre después del paso 4
+(conector del legado parado), el sitio está caído. Reacciona en cuanto se
+cumpla el plazo de 60 s:
+
+1. Arranca de nuevo el conector del legado:
+   ```bash
+   docker compose -f /d/Discord_Faceit/docker-compose.yml up -d tunnel
+   docker compose -f /d/Discord_Faceit/docker-compose.yml logs --tail 20 tunnel   # "Registered tunnel connection"
+   ```
+2. Pon el Service del hostname en Node en su puerto nuevo, con una dirección que
+   resuelva el conector del legado. Dentro de la red de compose del legado es el
+   nombre del servicio, `http://discord-faceit-bot:3001`. En Docker Desktop
+   también vale `http://host.docker.internal:3001`. Usa el panel o el PUT de 6.1
+   con ese `service`.
+3. Para lo que quede del stack nuevo:
+   `docker compose -f /d/MACHUPEEK/docker-compose.yml down`.
+
+### Comprobación de recuperación (6.1 y 6.2)
+
+```bash
+curl -sI https://machupeek.com/api/ping     # 200; sin bucle 301
+curl -s  https://machupeek.com/health       # JSON del legado con "discord"
+curl -sI https://machupeek.com/             # 200 (el SPA lo sirve Node)
+```
+
+Además, un login con Discord en el navegador.
+
+### 6.3 Volver del todo al estado anterior
+
+En una ventana tranquila, porque implica reiniciar el bot:
+`docker compose -f /d/MACHUPEEK/docker-compose.yml down`. En el legado, `PORT`
+vuelve a su valor anterior, se arranca de nuevo su `tunnel` y el Service vuelve
+al destino que anotaste en los requisitos previos, todo sin el mapeo
+`80:15633`.
 
 ## 7. Limitaciones conocidas
 
@@ -284,7 +406,9 @@ mapeo `80:15633`.
 - **Solo HTTP/1.** El proxy hacia Node usa HTTP/1.1. cloudflared habla con el
   origen en HTTP/1.1, así que esto no cambia nada para el visitante.
 - **Doble rate limit.** Rust (100/min por cliente) y Node (su `globalLimiter`)
-  limitan por separado. Lo que pasa por el proxy consume cuota en ambos.
+  limitan por separado. Lo que pasa por el proxy consume cuota en ambos. Lo
+  que sirve `static_files` no consume cuota en ninguno; las rutas SPA y legales,
+  que el legado sí limitaba, quedan exentas a propósito (ver sección 1).
 - **Cierre de conexiones largas.** Al parar, los WebSocket y SSE abiertos se
   cortan a los 8 s y los clientes tienen que reconectar.
 
