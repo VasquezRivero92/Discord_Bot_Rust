@@ -342,10 +342,14 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
 
     /// Lanza la tarea que mantiene la caché al día con los cambios de la colección.
     ///
-    /// `Added`/`Modified`/`Removed` invalidan la clave; `Reset` y cualquier error invalidan todo.
-    /// Cuando el stream termina (error o fin) se invalida todo y se reabre con espera
-    /// exponencial (1 s, el doble cada vez, tope 60 s; vuelve a 1 s tras un stream que duró más
-    /// de 60 s). El TTL sigue siendo la única cota si el listener cae sin avisar.
+    /// `Added`/`Modified` invalidan la clave (conservan la copia vieja para la cuota); `Removed`
+    /// la purga (entrada y copia vieja); `Reset` y cualquier error invalidan todo (`Reset` es
+    /// idempotente y puede llegar varias veces). Al abrir (y reabrir) el stream se invalida todo,
+    /// y otra vez con el `Reset` que emite el listener cuando su instantánea inicial es actual
+    /// (cubre lo cacheado y borrado entre la apertura y ese momento). Cuando el stream termina
+    /// (error o fin) se invalida todo y se reabre con espera exponencial (1 s, el doble cada vez,
+    /// tope 60 s; vuelve a 1 s tras un stream que duró más de 60 s). El TTL sigue siendo la única
+    /// cota si el listener cae sin avisar.
     pub fn spawn_watcher(self: Arc<Self>) -> WatcherHandle {
         let task = tokio::spawn(async move { self.watch_loop().await });
         WatcherHandle { task }
@@ -483,5 +487,105 @@ mod tests {
         assert_eq!(s.games_per_match, Some(3));
         assert!(s.updated_at.unwrap().starts_with("2026-11-02T10:00:00"));
         assert_eq!(s.extra["customFlag"], Value::Bool(true));
+    }
+
+    // --- Repo + traducción real del listener (WatchState) -------------------------------------
+
+    use crate::firestore::WatchState;
+    use firestore::gcloud_sdk::google::firestore::v1::target_change::TargetChangeType;
+    use firestore::gcloud_sdk::google::firestore::v1::TargetChange;
+    use firestore::FirestoreListenEvent;
+    use tokio::sync::mpsc;
+
+    const TARGET: i32 = 1;
+    type Docs = Arc<Mutex<HashMap<String, GuildSettings>>>;
+
+    /// Fuente cuyo `watch()` pasa eventos crudos del listener por [`WatchState`], como
+    /// `FirestoreClient::watch_collection` (sin red).
+    struct RawSource {
+        docs: Docs,
+        events: Mutex<Option<mpsc::UnboundedReceiver<FirestoreListenEvent>>>,
+    }
+
+    #[async_trait]
+    impl GuildSettingsSource for RawSource {
+        async fn fetch(&self, guild_id: &str) -> Result<Option<GuildSettings>, DataError> {
+            Ok(self.docs.lock().unwrap().get(guild_id).cloned())
+        }
+
+        fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>> {
+            match self.events.lock().unwrap().take() {
+                Some(rx) => futures::stream::unfold(
+                    (rx, WatchState::new(TARGET)),
+                    |(mut rx, mut state)| async move {
+                        loop {
+                            let event = rx.recv().await?;
+                            if let Some(change) = state.on_event(event) {
+                                return Some((Ok(change), (rx, state)));
+                            }
+                        }
+                    },
+                )
+                .boxed(),
+                None => futures::stream::pending().boxed(),
+            }
+        }
+    }
+
+    fn target_change(kind: TargetChangeType) -> FirestoreListenEvent {
+        FirestoreListenEvent::TargetChange(TargetChange {
+            target_change_type: kind as i32,
+            target_ids: vec![TARGET],
+            ..Default::default()
+        })
+    }
+
+    async fn settle() {
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Ventana residual de la fase 1: un documento cacheado tras abrir el stream y borrado antes
+    /// de que la instantánea inicial sea actual no llega como evento (la instantánea ya no lo
+    /// incluye). El `Reset` del primer `CURRENT` invalida la caché y la lectura recarga.
+    #[tokio::test(start_paused = true)]
+    async fn doc_deleted_before_initial_snapshot_is_not_served() {
+        let docs: Docs = Arc::default();
+        docs.lock().unwrap().insert(
+            "g1".into(),
+            GuildSettings {
+                admin_role_id: Some("r".into()),
+                ..Default::default()
+            },
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let source = RawSource {
+            docs: docs.clone(),
+            events: Mutex::new(Some(rx)),
+        };
+        let repo = Arc::new(FirestoreGuildSettingsRepo::new(
+            source,
+            Duration::from_secs(3600),
+        ));
+        let _watcher = repo.clone().spawn_watcher();
+        settle().await; // stream abierto e invalidate_all de apertura ya hecho
+        tx.send(target_change(TargetChangeType::Add)).unwrap();
+        settle().await;
+
+        assert!(
+            repo.get("g1").await.unwrap().is_some(),
+            "cargado y cacheado"
+        );
+        // Borrado antes de la instantánea: Firestore no manda ningún evento del documento.
+        docs.lock().unwrap().remove("g1");
+        tx.send(target_change(TargetChangeType::Current)).unwrap();
+        settle().await;
+
+        assert_eq!(
+            repo.get("g1").await.unwrap(),
+            None,
+            "tras el Reset del CURRENT la lectura recarga y ve que no existe"
+        );
     }
 }
