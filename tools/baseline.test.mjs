@@ -9,6 +9,8 @@ import {
   readRssMb,
   buildEndpoints,
   measure,
+  parseArgs,
+  ArgError,
 } from './baseline.mjs';
 
 test('percentile: nearest-rank', () => {
@@ -93,9 +95,13 @@ test('measure contra stub local', async () => {
     assert.equal(keys.length, 7);
     for (const k of keys) {
       const r = out.endpoints[k];
-      assert.ok(r.p50 <= r.p95 && r.p95 <= r.p99, `${k} percentiles`);
+      if (k !== 'GET /api/products') assert.ok(r.p50 <= r.p95 && r.p95 <= r.p99, `${k} percentiles`);
+      const c = r.concurrent;
+      if (c.p50 !== null) assert.ok(c.p50 <= c.p95 && c.p95 <= c.p99, `${k} concurrent percentiles`);
     }
     assert.equal(out.endpoints['GET /api/products'].errors, 10);
+    assert.equal(out.endpoints['GET /api/products'].concurrent.errors, 4);
+    assert.equal(out.endpoints['GET /api/products'].p50, null, 'solo 500: sin percentiles');
     assert.equal(out.endpoints['GET /api/ping'].errors, 0);
     assert.equal(out.endpoints['GET /api/admin/me'].errors, 0, 'cookie enviada');
     assert.equal(out.endpoints['GET /api/lobby/me'].errors, 0);
@@ -112,5 +118,100 @@ test('measure: peticiones fallidas (conexion rechazada) cuentan como error', asy
   const out = await measure({
     base, pid: process.pid, jwtSecret: 's', guildId: '0', sequential: 2, concurrent: 2,
   });
-  assert.equal(out.endpoints['GET /api/ping'].errors, 4);
+  const r = out.endpoints['GET /api/ping'];
+  assert.equal(r.errors, 4);
+  assert.equal(r.concurrent.errors, 2);
+  assert.deepEqual([r.p50, r.p95, r.p99], [null, null, null]);
+  assert.deepEqual([r.concurrent.p50, r.concurrent.p95, r.concurrent.p99], [null, null, null]);
+});
+
+test('measure: fase secuencial y concurrente se separan', async () => {
+  // El stub responde rapido en secuencial y lento solo bajo rafaga (>1 peticion en vuelo).
+  let inflight = 0;
+  const server = http.createServer((req, res) => {
+    inflight++;
+    const delay = inflight > 1 ? 120 : 0;
+    setTimeout(() => { inflight--; res.end('ok'); }, delay);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const out = await measure({
+      base: `http://127.0.0.1:${server.address().port}`, pid: process.pid, jwtSecret: 's',
+      sequential: 3, concurrent: 4,
+    });
+    const r = out.endpoints['GET /api/ping'];
+    assert.ok(r.p99 < 60, `secuencial rapido: ${r.p99}`);
+    assert.ok(r.concurrent.p99 >= 100, `rafaga lenta: ${r.concurrent.p99}`);
+    assert.equal(r.errors, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('measure: una ruta que nunca responde cuenta como error por timeout', async () => {
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/health') return; // nunca responde
+    res.end('ok');
+  });
+  server.on('connection', (s) => sockets.add(s));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const t0 = Date.now();
+    const out = await measure({
+      base: `http://127.0.0.1:${server.address().port}`, pid: process.pid, jwtSecret: 's',
+      sequential: 1, concurrent: 1, timeoutMs: 200,
+    });
+    assert.ok(Date.now() - t0 < 5000, 'termina pronto');
+    const h = out.endpoints['GET /health'];
+    assert.equal(h.errors, 2);
+    assert.equal(h.p50, null);
+    assert.equal(out.endpoints['GET /api/ping'].errors, 0);
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.close();
+  }
+});
+
+test('measure: pid sin RSS legible es error', async () => {
+  await assert.rejects(
+    measure({ base: 'http://127.0.0.1:1', pid: 2147483646, jwtSecret: 's', sequential: 1, concurrent: 1 }),
+    /RSS/,
+  );
+});
+
+const okArgs = ['--base', 'http://127.0.0.1:3001', '--pid', '123', '--jwt-secret', 'x'];
+
+test('parseArgs: valores por defecto y env', () => {
+  const c = parseArgs(['--base', 'http://h:1', '--pid', '9'], { BASELINE_JWT_SECRET: 'e' });
+  assert.deepEqual(c, {
+    base: 'http://h:1', pid: 9, out: undefined, jwtSecret: 'e', guildId: '0',
+    sequential: 200, concurrent: 50, timeoutMs: 10000,
+  });
+  const d = parseArgs([...okArgs, '--sequential', '5', '--concurrent', '2', '--timeout-ms', '300', '--out', 'o.json']);
+  assert.equal(d.sequential, 5);
+  assert.equal(d.concurrent, 2);
+  assert.equal(d.timeoutMs, 300);
+  assert.equal(d.out, 'o.json');
+});
+
+test('parseArgs: entradas invalidas lanzan ArgError', () => {
+  const bad = [
+    [['--pid', '1', '--jwt-secret', 'x'], /--base/],
+    [['--base', 'nope', '--pid', '1', '--jwt-secret', 'x'], /URL/],
+    [['--base', 'ftp://h', '--pid', '1', '--jwt-secret', 'x'], /http/],
+    [[...okArgs, '--sequential', '0'], /--sequential/],
+    [[...okArgs, '--concurrent', 'abc'], /--concurrent/],
+    [[...okArgs, '--timeout-ms', '-5'], /--timeout-ms/],
+    [['--base', 'http://h', '--pid', '0', '--jwt-secret', 'x'], /--pid/],
+    [['--base', 'http://h', '--pid', '1.5', '--jwt-secret', 'x'], /--pid/],
+    [['--base', 'http://h', '--jwt-secret', 'x'], /--pid/],
+    [['--base', 'http://h', '--pid', '1'], /jwt/i],
+    [[...okArgs, '--out', '--guild-id', '1'], /--out requiere/],
+    [[...okArgs, '--out'], /--out requiere/],
+    [[...okArgs, '--bogus', '1'], /desconocida/],
+  ];
+  for (const [argv, re] of bad) {
+    assert.throws(() => parseArgs(argv, {}), (e) => e instanceof ArgError && re.test(e.message), argv.join(' '));
+  }
 });

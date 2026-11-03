@@ -2,6 +2,9 @@
 // (Node legacy ahora, servidor Rust despues). Uso:
 //   node tools/baseline.mjs --base http://127.0.0.1:3001 --pid <pid> --out docs/baseline-node.json
 //   [--jwt-secret <secreto de prueba> | env BASELINE_JWT_SECRET] [--guild-id 0] [--sequential 200] [--concurrent 50]
+//   [--timeout-ms 10000]
+// p50/p95/p99 de primer nivel = fase secuencial (solo 2xx); `concurrent` = fase en rafaga (solo 2xx).
+// Sin muestras 2xx los percentiles son null. `errors` de primer nivel suma ambas fases.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -75,63 +78,102 @@ export function buildEndpoints(guildId = '0') {
   ];
 }
 
-async function timedRequest(url, headers) {
+export const DEFAULT_TIMEOUT_MS = 10000;
+
+async function timedRequest(url, headers, timeoutMs) {
   const t0 = performance.now();
   let ok = false;
   try {
-    const res = await fetch(url, { headers });
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
     await res.arrayBuffer();
     ok = res.status >= 200 && res.status < 300;
-  } catch { /* conexion fallida: error */ }
+  } catch { /* conexion fallida o timeout: error */ }
   return { ms: performance.now() - t0, ok };
 }
 
 const round = (n) => (n === null ? null : Math.round(n * 1000) / 1000);
 
-export async function measure({ base, pid, jwtSecret, guildId = '0', sequential = 200, concurrent = 50 }) {
-  const rssMb = await readRssMb(pid);
+// Percentiles solo sobre muestras exitosas; errors = fallidas de ese conjunto.
+function stats(results) {
+  const times = results.filter((r) => r.ok).map((r) => r.ms);
+  return {
+    p50: round(percentile(times, 50)),
+    p95: round(percentile(times, 95)),
+    p99: round(percentile(times, 99)),
+    errors: results.length - times.length,
+  };
+}
+
+export async function measure({
+  base, pid, jwtSecret, guildId = '0', sequential = 200, concurrent = 50, timeoutMs = DEFAULT_TIMEOUT_MS,
+}) {
+  let rssMb = null;
+  try { rssMb = await readRssMb(pid); } catch { /* se informa abajo */ }
+  if (rssMb === null) throw new Error(`no se pudo leer el RSS del pid ${pid}`);
   const cookie = `auth_token=${signTestJwt(jwtSecret)}`;
   const endpoints = {};
   for (const ep of buildEndpoints(guildId)) {
     const url = new URL(ep.path, base).toString();
     const headers = ep.auth ? { cookie } : {};
-    const results = [];
-    for (let i = 0; i < sequential; i++) results.push(await timedRequest(url, headers));
-    results.push(...await Promise.all(Array.from({ length: concurrent }, () => timedRequest(url, headers))));
-    const times = results.map((r) => r.ms);
-    endpoints[`${ep.method} ${ep.path}`] = {
-      p50: round(percentile(times, 50)),
-      p95: round(percentile(times, 95)),
-      p99: round(percentile(times, 99)),
-      errors: results.filter((r) => !r.ok).length,
-    };
+    const seq = [];
+    for (let i = 0; i < sequential; i++) seq.push(await timedRequest(url, headers, timeoutMs));
+    const conc = await Promise.all(Array.from({ length: concurrent }, () => timedRequest(url, headers, timeoutMs)));
+    const s = stats(seq);
+    const c = stats(conc);
+    endpoints[`${ep.method} ${ep.path}`] = { ...s, errors: s.errors + c.errors, concurrent: c };
   }
-  return { rssMb: rssMb === null ? null : round(rssMb), endpoints };
+  return { rssMb: round(rssMb), endpoints };
 }
 
-function parseArgs(argv) {
-  const args = {};
+export class ArgError extends Error {}
+
+const VALUE_FLAGS = new Set(['base', 'pid', 'out', 'jwt-secret', 'guild-id', 'sequential', 'concurrent', 'timeout-ms']);
+
+function posInt(name, raw, def) {
+  if (raw === undefined) return def;
+  if (!/^[1-9]\d*$/.test(raw)) throw new ArgError(`--${name} debe ser un entero positivo (recibido: ${raw})`);
+  return Number(raw);
+}
+
+// Valida argv y entorno; lanza ArgError con mensaje en espanol.
+export function parseArgs(argv, env = {}) {
+  const a = {};
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) args[argv[i].slice(2)] = argv[++i];
+    const tok = argv[i];
+    if (!tok.startsWith('--')) throw new ArgError(`argumento inesperado: ${tok}`);
+    const name = tok.slice(2);
+    if (!VALUE_FLAGS.has(name)) throw new ArgError(`opcion desconocida: ${tok}`);
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith('--')) throw new ArgError(`--${name} requiere un valor`);
+    a[name] = v;
+    i++;
   }
-  return args;
+  if (a.base === undefined) throw new ArgError('falta --base');
+  let url;
+  try { url = new URL(a.base); } catch { throw new ArgError(`--base no es una URL valida: ${a.base}`); }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new ArgError('--base debe ser http o https');
+  if (a.pid === undefined) throw new ArgError('falta --pid');
+  const jwtSecret = a['jwt-secret'] ?? env.BASELINE_JWT_SECRET;
+  if (!jwtSecret) throw new ArgError('falta --jwt-secret o la variable BASELINE_JWT_SECRET');
+  return {
+    base: a.base,
+    pid: posInt('pid', a.pid),
+    out: a.out,
+    jwtSecret,
+    guildId: a['guild-id'] ?? '0',
+    sequential: posInt('sequential', a.sequential, 200),
+    concurrent: posInt('concurrent', a.concurrent, 50),
+    timeoutMs: posInt('timeout-ms', a['timeout-ms'], DEFAULT_TIMEOUT_MS),
+  };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const a = parseArgs(process.argv.slice(2));
-  const jwtSecret = a['jwt-secret'] ?? process.env.BASELINE_JWT_SECRET;
-  if (!a.base || !a.pid || !jwtSecret) {
-    console.error('uso: node tools/baseline.mjs --base <url> --pid <pid> [--out <json>] [--jwt-secret <s> | BASELINE_JWT_SECRET] [--guild-id 0] [--sequential 200] [--concurrent 50]');
-    process.exit(1);
+  try {
+    const { out, ...cfg } = parseArgs(process.argv.slice(2), process.env);
+    const json = JSON.stringify(await measure(cfg), null, 2) + '\n';
+    if (out) { fs.writeFileSync(out, json); console.log(`escrito ${out}`); } else process.stdout.write(json);
+  } catch (e) {
+    console.error(`error: ${e.message}`);
+    process.exit(2);
   }
-  const result = await measure({
-    base: a.base,
-    pid: Number(a.pid),
-    jwtSecret,
-    guildId: a['guild-id'] ?? '0',
-    sequential: Number(a.sequential ?? 200),
-    concurrent: Number(a.concurrent ?? 50),
-  });
-  const json = JSON.stringify(result, null, 2) + '\n';
-  if (a.out) { fs.writeFileSync(a.out, json); console.log(`escrito ${a.out}`); } else process.stdout.write(json);
 }
