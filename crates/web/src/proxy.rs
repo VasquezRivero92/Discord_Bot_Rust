@@ -177,7 +177,17 @@ fn add_forwarded_headers(
     }
 }
 
-fn invalid_path() -> Response {
+/// Log line for a rejected target: method and PATH only. The query string is
+/// never logged (it can carry OAuth codes or tokens); `{:?}` escapes the path.
+fn invalid_path_log(method: &axum::http::Method, pq: &axum::http::uri::PathAndQuery) -> String {
+    format!(
+        "proxy rejected a target the url crate would rewrite: {method} {:?}",
+        pq.path()
+    )
+}
+
+fn invalid_path(method: &axum::http::Method, pq: &axum::http::uri::PathAndQuery) -> Response {
+    tracing::warn!("{}", invalid_path_log(method, pq));
     (
         StatusCode::BAD_REQUEST,
         [(header::CONTENT_TYPE, "application/json")],
@@ -205,7 +215,7 @@ async fn proxy_http(state: ProxyState, req: Request) -> Response {
         .cloned()
         .unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
     let Some(url) = upstream_url(&state, &pq) else {
-        return invalid_path();
+        return invalid_path(&parts.method, &pq);
     };
 
     // Decide before stripping (Transfer-Encoding is hop-by-hop): send a body
@@ -272,7 +282,7 @@ async fn proxy_websocket(state: ProxyState, req: Request) -> Response {
         .cloned()
         .unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
     if upstream_url(&state, &pq).is_none() {
-        return invalid_path();
+        return invalid_path(&parts.method, &pq);
     }
     let url = ws_url(&state.legacy, pq.as_str());
 
@@ -403,5 +413,22 @@ async fn tunnel(client: WebSocket, upstream: UpstreamSocket) {
         _ = &mut up_to_client => {
             let _ = tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut client_to_up).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invalid_path_log;
+    use axum::http::{uri::PathAndQuery, Method};
+
+    #[test]
+    fn invalid_path_log_has_method_and_path_but_never_the_query() {
+        let pq = PathAndQuery::from_static("/a/%2e%2e/admin?code=SECRET-OAUTH&state=x");
+        let line = invalid_path_log(&Method::GET, &pq);
+        assert!(line.contains("GET"), "{line}");
+        assert!(line.contains("/a/%2e%2e/admin"), "{line}");
+        assert!(!line.contains("SECRET"), "{line}");
+        assert!(!line.contains("code="), "{line}");
+        assert!(!line.contains('?'), "{line}");
     }
 }
