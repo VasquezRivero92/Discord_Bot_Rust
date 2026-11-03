@@ -1,0 +1,51 @@
+# Frente de entrada en Rust + túnel de Cloudflare (fase 1 de la migración).
+#
+# Uso (ver docs/runbook-corte.md):
+#   export LEGACY_PUBLIC_DIR=/d/Discord_Faceit/public   # build de public/ del legado
+#   export TUNNEL_TOKEN=...                              # nunca en un archivo versionado
+#   docker compose up -d --build
+#
+# `web` NO publica puertos en el host: solo el túnel lo alcanza por la red de
+# compose. Así nadie puede llegar al origen saltándose Cloudflare y falsear
+# X-Forwarded-For / CF-Connecting-IP.
+
+services:
+  web:
+    build: .
+    image: machupeek-web:fase1
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Fijados aquí: ganan sobre .env (que puede traer valores de desarrollo).
+      PORT: "15633"
+      STATIC_DIR: /srv/public
+      # Node legado en el host, en :3001. Nombre distinto de LEGACY_URL para que un
+      # LEGACY_URL=127.0.0.1 de .env no se cuele en la interpolación.
+      LEGACY_URL: ${WEB_LEGACY_URL:-http://host.docker.internal:3001}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ${LEGACY_PUBLIC_DIR:?set LEGACY_PUBLIC_DIR to the legacy public/ directory}
+        target: /srv/public
+        read_only: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Sin `ports:` a propósito.
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in the shell environment}
+    # Rollback: el Service del hostname puede apuntar a http://host.docker.internal:3001
+    # (Node directo) sin tocar contenedores.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      web:
+        condition: service_healthy

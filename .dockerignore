@@ -1,0 +1,14 @@
+# Solo entra al contexto lo que necesita `cargo build -p web`.
+target/
+.git/
+.superpowers/
+.env
+.env.*
+!.env.example
+*service-account*.json
+firebase-service-account*.json
+cookies.txt
+docs/
+tools/
+contrast/
+**/*.md
