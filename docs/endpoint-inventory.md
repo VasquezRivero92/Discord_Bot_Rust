@@ -8,8 +8,8 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 
 | origen | prefijo | llamadas | entradas (rutas expandidas) |
 |---|---|---|---|
-| index.js | - | 22 | 39 |
-| routes/api.js | /api/admin | 56 | 56 |
+| index.js | - | 23 | 61 |
+| routes/api.js | /api/admin | 57 | 58 |
 | routes/auth.js | /auth | 6 | 7 |
 | routes/cs2Api.js | /api/cs2 | 4 | 4 |
 | routes/lobby.js | /api/lobby | 48 | 49 |
@@ -29,6 +29,9 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | POST | /api/matchmaking/launch | requireSteamApiKey | index.js | 353 | - | no | proxy | Steam/matchmaking |
 | POST | /api/matchzy/event | none | index.js | 360 | ? | ? | 2 | Eventos MatchZy |
 | GET | /api/ping | none | index.js | 399 | - | no | 1 | Diagnostico: cookies/protocolo |
+| ALL | /api/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
+| ALL | /api/club/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
+| ALL | /api/leaderboard/points | none | index.js | 413 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); publica |
 | GET | /admin | none | index.js | 458 | ? | ? | ? |  |
 | GET | /admin/* | none | index.js | 462 | ? | ? | ? |  |
 | GET | /terms | none | index.js | 471 | ? | ? | ? |  |
@@ -40,7 +43,24 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | GET | /support | none | index.js | 481 | ? | ? | ? |  |
 | GET | /help | none | index.js | 481 | ? | ? | ? |  |
 | GET | /legal/support | none | index.js | 481 | ? | ? | ? |  |
-| GET | <publicSpaRoutes> | none | index.js | 508 | ? | ? | ? |  |
+| GET | / | none | index.js | 508 | ? | ? | ? |  |
+| GET | /tienda | none | index.js | 508 | ? | ? | ? |  |
+| GET | /tienda/* | none | index.js | 508 | ? | ? | ? |  |
+| GET | /productos | none | index.js | 508 | ? | ? | ? |  |
+| GET | /productos/* | none | index.js | 508 | ? | ? | ? |  |
+| GET | /contacto | none | index.js | 508 | ? | ? | ? |  |
+| GET | /terminos | none | index.js | 508 | ? | ? | ? |  |
+| GET | /terminos-y-condiciones | none | index.js | 508 | ? | ? | ? |  |
+| GET | /devoluciones | none | index.js | 508 | ? | ? | ? |  |
+| GET | /politica-de-devoluciones | none | index.js | 508 | ? | ? | ? |  |
+| GET | /reclamaciones | none | index.js | 508 | ? | ? | ? |  |
+| GET | /libro-de-reclamaciones | none | index.js | 508 | ? | ? | ? |  |
+| GET | /libro-de-reclamaciones/* | none | index.js | 508 | ? | ? | ? |  |
+| GET | /arena | none | index.js | 508 | ? | ? | ? |  |
+| GET | /draft | none | index.js | 508 | ? | ? | ? |  |
+| GET | /mixton | none | index.js | 508 | ? | ? | ? |  |
+| GET | /mixton/* | none | index.js | 508 | ? | ? | ? |  |
+| GET | /checkout | none | index.js | 508 | ? | ? | ? |  |
 | GET | /halloween | none | index.js | 516 | ? | ? | ? |  |
 | GET | /Halloween | none | index.js | 516 | ? | ? | ? |  |
 | GET | /halloween/ | none | index.js | 516 | ? | ? | ? |  |
@@ -57,6 +77,8 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | GET | /Halloween/user:id | none | index.js | 564 | ? | ? | ? |  |
 | GET | /halloween/User:id | none | index.js | 564 | ? | ? | ? |  |
 | GET | /Halloween/User:id | none | index.js | 564 | ? | ? | ? |  |
+| GET | /halloween/:id([1-8]) | none | index.js | 564 | ? | ? | ? |  |
+| GET | /Halloween/:id([1-8]) | none | index.js | 564 | ? | ? | ? |  |
 | GET | * | none | index.js | 577 | ? | ? | ? |  |
 
 ## routes/api.js
@@ -88,6 +110,8 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | POST | /api/admin/matches/:id/announce-mixton | requireAuth | routes/api.js | 1006 | faceit_active_matches, faceit_bot_logs | gateway? | proxy | Pasa client a helpers; verificar si requiere cache |
 | POST | /api/admin/matches/:id/cleanup | requireAuth | routes/api.js | 1065 | faceit_active_matches | REST | proxy | Fetch de canales/mensajes |
 | GET | /api/admin/leaderboard | requireAuth | routes/api.js | 1107 | guild_settings (config) | no | 1 | Faceit API |
+| ALL | /api/admin/points | requireAuth | routes/api.js | 1146 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); sin Firestore |
+| ALL | /api/admin/club/points | requireAuth | routes/api.js | 1146 | - | no | 1 | Faceit API (fetchLatestSeasonPoints); sin Firestore |
 | GET | /api/admin/stats/:nickname | requireAuth | routes/api.js | 1178 | faceit_users | no | 1 |  |
 | GET | /api/admin/settings | requireAuth | routes/api.js | 1225 | faceit_config (settings), guild_settings | no | 1 |  |
 | POST | /api/admin/settings | requireAuth | routes/api.js | 1263 | faceit_config, guild_settings, faceit_bot_logs | gateway? | proxy | Pasa client a helpers; verificar |

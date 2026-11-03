@@ -3,8 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERBS = 'get|post|put|patch|delete';
-const CALL_RE = new RegExp(String.raw`\b(?:router|app)\.(${VERBS})\(`, 'g');
+const VERBS = 'get|post|put|patch|delete|all';
 const NOT_MIDDLEWARE = new Set(['async', 'function']);
 
 function joinPath(prefix, p) {
@@ -12,50 +11,109 @@ function joinPath(prefix, p) {
   return p === '/' ? prefix : prefix + p;
 }
 
-export function parseRoutes(source, mountPrefix = '') {
+// Sustituye comentarios por espacios (conserva saltos de linea y posiciones),
+// respetando strings y template literals.
+export function stripComments(src) {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (c === '/' && n === '/') {
+      while (i < src.length && src[i] !== '\n') { out += ' '; i++; }
+    } else if (c === '/' && n === '*') {
+      const end = src.indexOf('*/', i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      for (; i < stop; i++) out += src[i] === '\n' ? '\n' : ' ';
+    } else if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c) { if (src[j] === '\\') j++; j++; }
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else { out += c; i++; }
+  }
+  return out;
+}
+
+// Lee un literal de string en src[i] (comilla). Devuelve [valor, indice siguiente].
+function readString(src, i) {
+  const q = src[i];
+  let j = i + 1;
+  while (j < src.length && src[j] !== q) { if (src[j] === '\\') j++; j++; }
+  return [src.slice(i + 1, j), j + 1];
+}
+
+// Lee un array literal de strings en src[i]=='[' con conciencia de comillas y profundidad.
+// Devuelve [strings, indice siguiente].
+function readStringArray(src, i) {
+  const items = [];
+  let depth = 0;
+  let j = i;
+  while (j < src.length) {
+    const c = src[j];
+    if (c === '"' || c === "'" || c === '`') {
+      const [v, next] = readString(src, j);
+      if (depth === 1) items.push(v);
+      j = next;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) return [items, j + 1]; }
+    j++;
+  }
+  return [items, j];
+}
+
+function resolveConstArray(src, name) {
+  const re = new RegExp(String.raw`\b(?:const|let|var)\s+${name}\s*=\s*\[`);
+  const m = re.exec(src);
+  if (!m) return null;
+  return readStringArray(src, m.index + m[0].length - 1)[0];
+}
+
+export function parseRoutes(rawSource, mountPrefix = '') {
+  const source = stripComments(rawSource);
+  const callRe = new RegExp(String.raw`\b(?:router|app)\.(${VERBS})\(`, 'g');
   const out = [];
-  CALL_RE.lastIndex = 0;
   let m;
-  while ((m = CALL_RE.exec(source))) {
+  while ((m = callRe.exec(source))) {
     const method = m[1].toUpperCase();
     const line = source.slice(0, m.index).split('\n').length;
     let i = m.index + m[0].length;
-    const rest = (k) => source.slice(k);
+    i += /^\s*/.exec(source.slice(i, i + 200))[0].length;
 
-    // Paths: array literal, string literal o identificador.
     let paths = [];
-    let ws = /^\s*/.exec(rest(i))[0].length;
-    i += ws;
+    let unresolved = null;
     if (source[i] === '[') {
-      const end = source.indexOf(']', i);
-      const body = source.slice(i + 1, end);
-      paths = [...body.matchAll(/(['"`])((?:\.|(?!\1).)*)\1/g)].map((x) => x[2]);
-      i = end + 1;
+      [paths, i] = readStringArray(source, i);
     } else if (/['"`]/.test(source[i])) {
-      const q = source[i];
-      const end = source.indexOf(q, i + 1);
-      paths = [source.slice(i + 1, end)];
-      i = end + 1;
+      let v;
+      [v, i] = readString(source, i);
+      paths = [v];
     } else {
-      const id = /^[A-Za-z_$][\w$.]*/.exec(rest(i));
+      const id = /^[A-Za-z_$][\w$]*/.exec(source.slice(i, i + 200));
       if (!id) continue;
-      paths = [`<${id[0]}>`];
       i += id[0].length;
+      const resolved = resolveConstArray(source, id[0]);
+      if (resolved) paths = resolved;
+      else { unresolved = id[0]; paths = [`!!UNRESOLVED:${id[0]}!!`]; }
     }
 
-    // Middlewares: identificadores (o llamadas) antes del handler.
     const mws = [];
     const MW_RE = /^\s*,\s*([A-Za-z_$][\w$.]*(?:\([^()]*\))?)\s*(?=,)/;
     for (;;) {
-      const mm = MW_RE.exec(rest(i));
+      const mm = MW_RE.exec(source.slice(i, i + 300));
       if (!mm) break;
-      const name = mm[1];
-      if (NOT_MIDDLEWARE.has(name)) break;
-      mws.push(name);
+      if (NOT_MIDDLEWARE.has(mm[1])) break;
+      mws.push(mm[1]);
       i += mm[0].length;
     }
     const auth = mws.length ? mws.join(', ') : 'none';
-    for (const p of paths) out.push({ method, path: joinPath(mountPrefix, p), auth, line });
+    for (const p of paths) {
+      const e = { method, path: unresolved ? p : joinPath(mountPrefix, p), auth, line };
+      if (unresolved) e.unresolved = unresolved;
+      out.push(e);
+    }
   }
   return out;
 }
@@ -99,6 +157,8 @@ export function buildDoc(legacyDir, manual = new Map()) {
     const calls = new Set(g.routes.map((r) => r.line)).size;
     lines.push(`| ${g.origin} | ${g.prefix ?? '-'} | ${calls} | ${g.routes.length} |`);
   }
+  const bad = groups.flatMap((g) => g.routes.filter((r) => r.unresolved).map((r) => `${g.origin}:${r.line} (${r.unresolved})`));
+  if (bad.length) lines.push('', '> **ADVERTENCIA: rutas con path no resuelto, el inventario esta INCOMPLETO:** ' + bad.join(', '));
   for (const g of groups) {
     lines.push('', `## ${g.origin}`, '', HEADER, SEP);
     for (const r of g.routes) {
