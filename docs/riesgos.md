@@ -201,3 +201,31 @@ la única cota de lo desactualizados que pueden estar los datos.
   que el índice que falte salga a la luz. `MatchHistoryRepo` reproduce el respaldo del legacy
   (barrido por `createdAt` y filtro en memoria) ante cualquier error salvo `QuotaExceeded`; ahí el
   índice sí consta en `firestore.indexes.json`. `claims`/`orders` no necesitan índices.
+- **Sin verificación en vivo.** `FirestoreClient::query`, `count` y `list_raw_docs`, y los
+  listeners de Firestore (watcher de `faceit_config/settings` y de ajustes por servidor), nunca se
+  han ejecutado aquí contra el emulador ni contra Firestore real: solo hay pruebas sin red (dobles
+  de los repositorios y construcción de las consultas). Los índices de arriba, el código que
+  devuelve Firestore ante un índice que falta y la agregación `COUNT` de `/stats` están sin
+  comprobar contra un servidor.
+- **Capa de entorno congelada al arrancar.** `effective_config_for_guild` toma la capa de entorno
+  de `Config` (`EnvDefaults`), leída una sola vez al arrancar. En Node, `POST /settings` reescribe
+  `process.env` en caliente, así que un consumidor futuro en Rust vería los valores anteriores
+  hasta reiniciar `web`. Hoy ninguna ruta montada lo usa (`GET /settings` sigue en Node por esto).
+- **Lectura entre servidores (heredada, decisión del dueño).** `resolveTargetGuildId` no comprueba
+  permisos: un `admin` de servidor puede leer los datos de **cualquier** servidor con `?guildId=` o
+  `x-guild-id`, y con `guildId` vacío lee el ámbito global. Incluye `/users/backup`, que devuelve el
+  documento completo de cada usuario (teléfono y saldo). `/users/backup` está abierto a cualquier
+  admin, como en el legacy. Rust lo replica por paridad; endurecerlo rompe la paridad y necesita
+  una decisión del dueño.
+- **400 que el legacy no tiene.** Rust responde 400 donde Express haría otra cosa:
+  `guildId` como array u objeto de `qs` (`{"error":"guildId inválido"}`); `limit` en forma no
+  soportada (`limit[x]=`, `limit[0]=`) y `status` como array u objeto (`limit inválido`,
+  `status inválido`; el legacy uniría el array o filtraría por él); y un `:code` de
+  `/claims/:code` con codificación `%` mal formada (`400 Bad Request` en texto plano; Express da
+  su 400 en HTML). Solo afecta a consultas fabricadas a mano: el panel nunca las envía.
+- **Solo HS256.** Rust solo acepta cookies firmadas con HS256; `jsonwebtoken` de Node acepta
+  también HS384 y HS512 con el mismo secreto. El legacy solo emite HS256, así que no afecta a
+  cookies reales.
+- **`auth_token` inválido con `admin_token` válido.** Rust deja pasar la petición con el
+  `admin_token`; Node responde 401. Solo afecta a la disponibilidad (ninguna vía de privilegio) y
+  está fijado por un test; la paridad estricta es un cambio pequeño si se quiere.

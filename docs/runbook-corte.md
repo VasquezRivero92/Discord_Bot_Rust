@@ -1,4 +1,4 @@
-# Runbook de corte: Rust como frente de entrada de machupeek.com (fase 1)
+# Runbook de corte: Rust como frente de entrada de machupeek.com (fases 1 y 2A)
 
 Al terminar este runbook, el túnel de Cloudflare entrega todo el tráfico de
 machupeek.com al binario Rust `web` (`:15633`). Rust contesta lo migrado y pasa
@@ -14,14 +14,20 @@ Precedencia dentro de `web::build_app` (gana la primera que coincide):
 
 1. Rutas migradas: `GET /api/ping`, `GET /api/products`, `GET /auth/discord`,
    `GET /auth/logout` y `GET /api/reclamaciones/:code`. Esta última solo existe
-   si Firestore está configurado (ver 3.3); si no, va a Node.
+   si Firestore está configurado (ver 3.3); si no, va a Node. Con Firestore
+   configurado se montan además las lecturas del panel de la fase 2A (ver 3.4):
+   `GET /api/admin/claims`, `/claims/:code`, `/orders`, `/logs`,
+   `/support-calls`, `/messages` y `/matches/history` (Tarea 7), y
+   `GET /api/admin/stats`, `/users/backup` y `/yape/transactions` (Tarea 8).
 2. Un método equivocado en esas rutas (p. ej. `POST /api/ping`, `POST /auth/discord`)
    va a Node, no a un 405 de axum (`method_not_allowed_fallback`).
 3. Archivos estáticos y rutas SPA (`/`, `/tienda`, `/terms`, `/admin/*`, `/halloween*`, ...),
    servidos desde `STATIC_DIR`, con las mismas cabeceras de caché que el legado.
 4. Todo lo demás pasa a Node por el proxy (HTTP y WebSocket). Eso incluye
    `/auth/discord/callback`, `/auth/steam*`, `/auth/demo-login`, `/health`,
-   `/api/admin/*`, `/api/lobby/*` (incluido el WebSocket `/api/lobby/mixton-ws`),
+   el resto de `/api/admin/*` (todas las escrituras y, entre las lecturas,
+   `/stats/:nickname`, `/matches/:id/demo` y `/settings`),
+   `/api/lobby/*` (incluido el WebSocket `/api/lobby/mixton-ws`),
    `/api/cs2/*`, `/webhook*`, `POST /api/reclamaciones` y `POST /api/checkout/purchase`.
 
 Por fuera de todo van las cabeceras de seguridad (helmet sin CSP), la
@@ -43,6 +49,24 @@ Rust y otra vez en Node.
 
 Si Node no responde, el proxy devuelve
 `502 {"error":"Servicio no disponible"}` y lo migrado sigue funcionando.
+
+El proxy tiene dos guardas de tiempo opcionales, **desactivadas por defecto**
+(sin ellas se comporta como en la fase 1). Ver 3.1:
+
+- `PROXY_FIRST_BYTE_TIMEOUT_SECS`: si la cabecera de respuesta de Node (estado y
+  cabeceras) no llega en ese plazo, Rust responde
+  `504 {"error":"Servicio no disponible"}`. El plazo cuenta desde que se envía la
+  petición, incluida la subida del cuerpo si Node lo lee antes de contestar. Una
+  vez llegada la cabecera, el cuerpo fluye sin límite: nunca se corta una
+  respuesta empezada. No se aplica a `/api/halloween/stream` (SSE; se compara
+  sin distinguir mayúsculas y con una `/` final opcional, como Express) ni a los
+  WebSocket. Es la única ruta de larga duración del legado: no hay más
+  `text/event-stream` ni esperas largas en `index.js`, `routes/*.js` y
+  `services/*.js`.
+- `WS_IDLE_TIMEOUT_SECS`: cierra un WebSocket proxificado (frame de cierre
+  1001 a ambos lados) tras ese tiempo sin ningún frame en ninguna dirección.
+  Los ping/pong y los cierres cuentan como actividad. Un socket activo no se
+  cierra nunca.
 
 Diferencias deliberadas con el legado:
 
@@ -91,7 +115,7 @@ legado: tiene secretos (Faceit, Yape, Steam...) que Rust no usa.
 
 | Variable | Valor en producción | Notas |
 |---|---|---|
-| `ADMIN_JWT_SECRET` | el mismo que Node | obligatorio; las cookies las firma Node |
+| `ADMIN_JWT_SECRET` | el mismo que Node, byte a byte | obligatorio; las cookies las firma Node. Ver abajo |
 | `BASE_URL` | `https://machupeek.com` | obligatorio. Se le quitan las `/` finales una sola vez en `Config`. Con `https` activa el modo producción (redirección HTTPS) |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_TOKEN`, `DISCORD_GUILD_ID` | los de Node | obligatorios. El `redirect_uri` de `/auth/discord` es `BASE_URL/auth/discord/callback`, y ese callback lo atiende Node |
 | `NODE_ENV` | `production` | con `CORS_ORIGINS` vacío, CORS acepta solo el origen de `BASE_URL` |
@@ -101,6 +125,8 @@ legado: tiene secretos (Faceit, Yape, Steam...) que Rust no usa.
 | `STATIC_DIR` | (lo fija compose: `/srv/public`) | |
 | `TRUST_CF_CONNECTING_IP` | `1` **solo si se cumple 3.2** | ver abajo |
 | `PROXY_APPEND_PEER_TO_XFF` | vacío (no) | ver abajo |
+| `PROXY_FIRST_BYTE_TIMEOUT_SECS` | vacío en el primer corte; después `90` | segundos enteros; vacío o `0` = sin tope. Ver abajo |
+| `WS_IDLE_TIMEOUT_SECS` | vacío en el primer corte; después `3600` | segundos enteros; vacío o `0` = nunca. Ver abajo |
 | `FIRESTORE_*`, `FIREBASE_SERVICE_ACCOUNT_PATH` | ver 3.3 | |
 
 **Secretos de Discord sin uso en esta fase.** `Config` exige `DISCORD_TOKEN`
@@ -108,6 +134,38 @@ legado: tiene secretos (Faceit, Yape, Steam...) que Rust no usa.
 montada en la fase 1 los use: el callback OAuth sigue en Node. Con eso, el token
 del bot vive también en un segundo contenedor. Es una limitación conocida.
 **Fase 2:** hacerlos opcionales hasta que una ruta los necesite.
+
+**`ADMIN_JWT_SECRET`.** Rust usa el valor tal cual, sin recortar: un espacio o
+un salto de línea al principio o al final forman parte del secreto y cambian la
+firma (solo se rechaza un valor vacío o que solo tenga espacios). Cópialo
+exactamente igual que en el `.env` de Node. Además, el legado
+(`config/index.js:12`) usa un secreto de desarrollo por defecto si la variable
+falta y `NODE_ENV` no es `production` (en producción falla al arrancar). Rust
+siempre exige la variable. Si Node arrancó con el secreto por defecto, las
+cookies que emite no valdrán en Rust: en el corte, define la variable en los
+dos con el mismo valor.
+
+**`PROXY_FIRST_BYTE_TIMEOUT_SECS` y `WS_IDLE_TIMEOUT_SECS`.** Solo aceptan
+dígitos (`120`); `+5`, `1.5`, `30s` o `-1` son un error de configuración
+(código 2), como los demás flags. `0` equivale a no definirlas. Valores de
+partida:
+
+- Primer corte: **vacías**, para no cambiar nada respecto a la fase 1.
+- `PROXY_FIRST_BYTE_TIMEOUT_SECS=90`. Cloudflare espera como mucho 100 s la
+  cabecera del origen (planes no Enterprise) y después devuelve su página 524;
+  con 90 s, el visitante recibe un 504 JSON y Rust libera la conexión antes. Un
+  valor mayor de 100 no cambia nada para quien llega por el túnel. Los valores
+  bajos cortan peticiones lentas legítimas: el arranque del servidor de CS2
+  enciende la instancia EC2 y espera el SSH hasta unos 45 s
+  (`services/awsEc2Service.js`, `cs2ServerManager.startServer`, llamado desde
+  `routes/lobby.js:4674`). No está comprobado si alguna respuesta HTTP espera a
+  ese arranque, así que no bajes de 60 sin medirlo.
+- `WS_IDLE_TIMEOUT_SECS=3600`. Ni el lobby (`routes/lobby.js`) ni el cliente
+  (`web_panel_src/src/App.tsx`) envían ping, así que el temporizador mide
+  silencio real: un lobby sin cambios no emite nada. El cliente se reconecta
+  5 s después de cualquier cierre (`socket.onclose`), así que cerrar un socket
+  inactivo solo cuesta una reconexión. Un valor corto provoca reconexiones
+  periódicas en lobbies tranquilos.
 
 **`TRUST_CF_CONNECTING_IP`.** Con `1`, el rate limit usa la cabecera
 `CF-Connecting-IP` como identidad del cliente. Si no, usa la entrada más a la
@@ -142,7 +200,8 @@ contenedor cloudflared. Por defecto el proxy reenvía `X-Forwarded-For` byte a b
 
 ### 3.3 Firestore (modo de credenciales explícito)
 
-Rust solo usa Firestore para `GET /api/reclamaciones/:code`. El modo se decide
+Rust usa Firestore para `GET /api/reclamaciones/:code` y para las lecturas del
+panel de la fase 2A (3.4). Sin Firestore, todas esas rutas siguen en Node. El modo se decide
 con `common::config::firestore_mode`. Se escribe en el log de arranque y nunca
 cae en las credenciales por defecto sin pedirlo:
 
@@ -154,8 +213,8 @@ cae en las credenciales por defecto sin pedirlo:
 | sí | no | no | `1`/`true`/`yes`/`on` | `Adc` (Application Default Credentials, solo si lo activas tú) |
 | sí | no | no | no | **error de arranque, código 2** |
 
-Recomendación para el primer corte: `Disabled`, con las reclamaciones todavía
-en Node. Así el corte no depende de Firestore. Para activar `KeyFile` en
+Recomendación para el primer corte: `Disabled`, con las reclamaciones y el
+panel todavía en Node. Así el corte no depende de Firestore. Para activar `KeyFile` en
 compose, monta la clave en solo lectura con un
 `docker-compose.override.yml` (no versionado):
 
@@ -176,6 +235,40 @@ Usa una cuenta de servicio con permisos de **solo lectura**. El contenedor corre
 como el usuario sin privilegios `10001` y ese usuario tiene que poder leer el
 archivo. Si la conexión falla, el binario sale con código 1 y un mensaje claro
 (el tope es de 30 s).
+
+### 3.4 Rutas de la fase 2A: activación, escrituras y rollback
+
+**Qué sirve Rust.** Solo con Firestore configurado (3.3): las diez lecturas
+`GET /api/admin/*` del punto 1 de la sección 1. Se montan todas o ninguna: no
+hay un interruptor por ruta. Siguen en Node, por el proxy, todas las escrituras
+del panel y las lecturas `/stats/:nickname` (API de Faceit),
+`/matches/:id/demo` (estado en memoria de Node y API de Faceit) y `/settings`
+(valores de `process.env` que `POST /settings` reescribe en caliente).
+
+**Las escrituras del panel tienen que pasar por Rust.** `/stats` tiene una caché
+de 60 s por servidor y `/yape/transactions` una de 30 s, como en el legado. Node
+vacía las suyas al escribir, pero Rust no lo ve. Por eso Rust vacía las suyas
+cuando Node contesta, a través del proxy, `POST /api/admin/users/:id/unlink`,
+`POST /api/admin/users/verify` (caché de `/stats`) y
+`POST /api/admin/yape/manual-approve` (caché de Yape). Si alguien escribe
+directamente en Node (`:3001`, sin pasar por Rust), las lecturas de Rust pueden
+quedar desactualizadas hasta 60 s (`/stats`) o 30 s (`/yape/transactions`).
+Los cambios que no hace el panel (p. ej. un usuario que se vincula por Discord)
+solo los cubre el TTL, igual que en Node.
+
+**Rollback por ruta.** No hay variable ni lista de rutas configurable: el
+reparto lo decide el código (`routes::admin::simple_reads::router` y
+`routes::admin::derived_reads::router`). Lo que no está montado cae al proxy.
+Opciones, de menor a mayor alcance:
+
+1. **Una ruta:** borra su línea `.route("/api/admin/...", get(...))` en el
+   router correspondiente, recompila y redespliega `web`
+   (`docker compose up -d --build web`). Esa ruta vuelve a Node; el resto sigue
+   en Rust.
+2. **Todas las rutas con Firestore:** vacía `FIRESTORE_PROJECT_ID` en el `.env`
+   de Rust y reinicia `web` (`docker compose up -d web`). Las diez lecturas del
+   panel y `GET /api/reclamaciones/:code` vuelven a Node, sin recompilar.
+3. **Todo:** rollback del túnel a Node (6.1).
 
 ## 4. Arranque
 
@@ -212,8 +305,9 @@ sigas. Aplica la rama de abandono de ese paso.
    docker compose logs --tail 30 web
    ```
    El banner de arranque muestra `port`, `legacy_url`, `static_dir`, `base_url`,
-   `production`, `trust_cf_connecting_ip`, `proxy_append_peer_to_xff` y
-   `firestore` (modo de credenciales). No muestra ningún secreto. Un `.env`
+   `production`, `trust_cf_connecting_ip`, `proxy_append_peer_to_xff`,
+   `proxy_first_byte_timeout_secs` y `ws_idle_timeout_secs` (`0` =
+   desactivado) y `firestore` (modo de credenciales). No muestra ningún secreto. Un `.env`
    inválido produce `configuration error: ...` y un bucle de reinicios con
    código 2.
    **Abandono:** `docker compose down`. El sitio no se ha tocado; corrige `.env`
@@ -315,6 +409,28 @@ Los casos actuales son solo GET y no escriben, pero la regla vale igual para los
 casos futuros. Salida 0 = sin diferencias. Las rutas no migradas comparan Node
 directo con Node a través del proxy Rust, lo que sirve para comprobar que el
 proxy es transparente.
+
+Los casos de `contrast/cases/admin.toml` necesitan el secreto de prueba
+(`CONTRAST_JWT_SECRET` o `--jwt-secret`) para firmar sus cookies. Sin él, la
+suite de administración no puede ejecutarse entera. Para que Rust sirva las
+lecturas del panel, los dos lados tienen que usar el mismo proyecto o emulador
+de Firestore. Algunos casos pueden fallar de forma intermitente sin que haya un
+error, porque cada lado tiene sus propias cachés y los datos cambian entre las
+dos lecturas:
+
+- `admin logs limit 3`: caché de 30 s en cada lado, y el bot escribe logs sin
+  parar.
+- `admin stats global` y `admin stats servidor inexistente`: caché de 60 s por
+  servidor en cada lado.
+- `admin yape transactions`: caché de 30 s en cada lado.
+- `admin messages` y los casos `admin matches history*`: Node los guarda en
+  caché (plantillas, 6 h; historial, 5 min; `database.js`) y Rust lee siempre
+  Firestore, así que difieren si los datos cambiaron dentro de ese plazo.
+- `admin users backup*`: sin caché, difieren si alguien se vincula entre las
+  dos lecturas.
+
+Ante una diferencia en esos casos, repite con `--only <nombre>` antes de darla
+por buena o por mala.
 
 ### 5.2 Modo de fallo: redirección HTTPS en bucle
 
@@ -453,6 +569,10 @@ al destino que anotaste en los requisitos previos, todo sin el mapeo
   etiqueta no se pudo verificar.
 - **Cierre de conexiones largas.** Al parar, los WebSocket y SSE abiertos se
   cortan a los 8 s y los clientes tienen que reconectar.
+- **Fase 2A.** Las escrituras directas a Node dejan desactualizadas las cachés
+  de Rust (3.4). Las diferencias conocidas con el legado (400 nuevos, solo
+  HS256, acceso entre servidores heredado...) están en `docs/riesgos.md`,
+  sección «Fase 2A».
 
 ## 8. Secretos
 

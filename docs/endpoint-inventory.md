@@ -72,7 +72,7 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | GET | /api/halloween/status | none | index.js | 528 | ? | ? | ? |  |
 | POST | /api/halloween/toggle | none | index.js | 537 | ? | ? | ? |  |
 | POST | /api/halloween/reset | none | index.js | 551 | ? | ? | ? |  |
-| GET | /api/halloween/stream | none | index.js | 560 | ? | ? | ? |  |
+| GET | /api/halloween/stream | none | index.js | 560 | ? | ? | ? | SSE (`addHalloweenSseClient`): exenta de `PROXY_FIRST_BYTE_TIMEOUT_SECS` (Tarea 9, `proxy::FIRST_BYTE_TIMEOUT_EXEMPT`); es la única respuesta de larga duración del legacy |
 | GET | /halloween/user:id | none | index.js | 564 | ? | ? | ? |  |
 | GET | /Halloween/user:id | none | index.js | 564 | ? | ? | ? |  |
 | GET | /halloween/User:id | none | index.js | 564 | ? | ? | ? |  |
