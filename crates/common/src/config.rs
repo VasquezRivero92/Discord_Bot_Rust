@@ -17,7 +17,7 @@ pub enum ConfigError {
     Invalid(&'static str, String),
     /// `FIRESTORE_PROJECT_ID` sin ninguna fuente de credenciales explícita.
     #[error(
-        "FIRESTORE_PROJECT_ID is set but no Firestore credential source is: set          FIRESTORE_EMULATOR_HOST, FIREBASE_SERVICE_ACCOUNT_PATH or FIRESTORE_USE_ADC=1          (Application Default Credentials are never used implicitly)"
+        "FIRESTORE_PROJECT_ID is set but no Firestore credential source is: set FIRESTORE_EMULATOR_HOST, FIREBASE_SERVICE_ACCOUNT_PATH or FIRESTORE_USE_ADC=1 (Application Default Credentials are never used implicitly)"
     )]
     NoFirestoreCredentials,
 }

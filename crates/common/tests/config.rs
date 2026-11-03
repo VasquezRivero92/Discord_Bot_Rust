@@ -338,6 +338,7 @@ fn firestore_project_without_credentials_is_an_error_never_implicit_adc() {
     ] {
         assert!(msg.contains(name), "{msg}");
     }
+    assert!(!msg.contains("  "), "{msg}");
 }
 
 #[test]
