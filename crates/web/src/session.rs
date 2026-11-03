@@ -338,14 +338,28 @@ pub enum SessionRejection {
     Forbidden,
 }
 
+impl SessionRejection {
+    /// Código HTTP del legacy (401 o 403).
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::NotAuthenticated | Self::InvalidToken => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+        }
+    }
+
+    /// Mensaje del legacy (`middleware/auth.js`), campo `error` del cuerpo.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotAuthenticated => MSG_NOT_AUTH,
+            Self::InvalidToken => MSG_BAD_TOKEN,
+            Self::Forbidden => MSG_FORBIDDEN,
+        }
+    }
+}
+
 impl IntoResponse for SessionRejection {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            Self::NotAuthenticated => (StatusCode::UNAUTHORIZED, MSG_NOT_AUTH),
-            Self::InvalidToken => (StatusCode::UNAUTHORIZED, MSG_BAD_TOKEN),
-            Self::Forbidden => (StatusCode::FORBIDDEN, MSG_FORBIDDEN),
-        };
-        (status, Json(json!({ "error": msg }))).into_response()
+        (self.status(), Json(json!({ "error": self.message() }))).into_response()
     }
 }
 

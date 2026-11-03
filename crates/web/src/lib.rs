@@ -45,7 +45,8 @@ pub struct AppDeps {
 ///
 /// 1. migrated routes: `GET /api/ping`, `GET /api/products`,
 ///    `GET /api/reclamaciones/:code` (only with a claims source),
-///    `GET /auth/discord`, `GET /auth/logout`;
+///    `GET /auth/discord`, `GET /auth/logout`, and the migrated
+///    `/api/admin/*` routes (`routes::admin::router`, none yet);
 /// 2. a wrong method on one of those paths (e.g. `POST /api/ping`) goes to
 ///    the proxy instead of axum's 405 (`method_not_allowed_fallback`);
 /// 3. static files and SPA routes (`static_files::routes_with_fallback`);
@@ -86,6 +87,14 @@ pub fn build_app(deps: AppDeps) -> Router {
         )));
     if let Some(claims) = deps.claims {
         migrated = migrated.merge(routes::public_api::claims_router(claims));
+    }
+    // `/api/admin/*` migradas (solo esas: el resto sigue en el proxy). Sin
+    // secreto válido (imposible con `Config::from_map`) no se monta nada.
+    match session::SessionState::from_config(cfg) {
+        Ok(session) => {
+            migrated = migrated.merge(routes::admin::router(routes::admin::AdminState { session }));
+        }
+        Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
     // the rate-limit layer so each such request is counted exactly once (by the

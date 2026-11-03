@@ -1,6 +1,7 @@
 //! Rutas migradas de solo lectura. Cada modulo expone un `router()` autocontenido (sin
 //! fallback propio) que el llamador (Tarea 17) fusiona con `Router::merge` junto al proxy.
 
+pub mod admin;
 pub mod auth;
 pub mod diagnostic;
 pub mod public_api;
