@@ -28,6 +28,9 @@ const WATCH_TARGET_ID: u32 = 1;
 /// Tamaño de página de `list_docs` (máximo que acepta Firestore por página: 300 es holgado).
 const LIST_PAGE_SIZE: usize = 300;
 
+/// Alias del resultado de la agregación de [`FirestoreClient::count`] (el de Node).
+const COUNT_ALIAS: &str = "count";
+
 /// Cambio en un documento de una colección observada; lleva el id del documento.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeEvent {
@@ -204,7 +207,18 @@ impl FirestoreClient {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, T)>, DataError> {
-        let docs: Vec<FirestoreDocument> = self
+        let docs = self.list_raw_docs(collection).await?;
+        docs.iter().map(decode_document).collect()
+    }
+
+    /// Lista todos los documentos de `collection` sin decodificar (para quien necesita los tipos
+    /// de Firestore, p. ej. distinguir un `Timestamp` de un texto). Mismo orden que
+    /// [`FirestoreClient::list_docs`] (por id de documento).
+    pub async fn list_raw_docs(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<FirestoreDocument>, DataError> {
+        Ok(self
             .db
             .fluent()
             .list()
@@ -213,8 +227,38 @@ impl FirestoreClient {
             .stream_all_with_errors()
             .await?
             .try_collect()
+            .await?)
+    }
+
+    /// `query.count().get()` de Node: número de documentos de `collection` que cumplen los
+    /// filtros de `q` (se ignoran su orden y su límite), con una agregación `COUNT` de Firestore
+    /// (una lectura por cada 1000 entradas de índice, sin leer los documentos).
+    pub async fn count(&self, collection: &str, q: Query) -> Result<u64, DataError> {
+        let params = query_params(
+            collection,
+            &Query {
+                order_by: None,
+                limit: None,
+                ..q
+            },
+        );
+        let mut select = self.db.fluent().select().from(collection);
+        if let Some(filter) = params.filter {
+            select = select.filter(move |_| Some(filter.clone()));
+        }
+        let rows = select
+            .aggregate(|a| a.fields([a.field(COUNT_ALIAS).count()]))
+            .query()
             .await?;
-        docs.iter().map(decode_document).collect()
+        let count = rows
+            .first()
+            .and_then(|row| row.fields.get(COUNT_ALIAS))
+            .and_then(|v| match v.value_type {
+                Some(ValueType::IntegerValue(n)) => u64::try_from(n).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Ok(count)
     }
 
     /// Consulta `collection` con los filtros, el orden y el límite de `q` y devuelve los
