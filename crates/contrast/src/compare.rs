@@ -215,10 +215,11 @@ fn compare_headers(node: &Observed, rust: &Observed, case: &Case) -> Option<(Str
                 Some(v) => format!("{side}: {}", truncate(&v.join(" | "), MAX_VALUE)),
                 None => format!("{side}: (absent)"),
             };
-            return Some((
-                format!("header {name}"),
-                vec![render("node", &a), render("rust", &b)],
-            ));
+            let mut lines = vec![render("node", &a), render("rust", &b)];
+            if name == "set-cookie" {
+                lines.extend(cookie_marker_diffs(a.as_deref(), b.as_deref()));
+            }
+            return Some((format!("header {name}"), lines));
         }
     }
     None
@@ -293,7 +294,9 @@ fn norm_directive(d: &str) -> String {
 fn norm_cookie(v: &str) -> String {
     let mut parts = v.split(';');
     let first = parts.next().unwrap_or("").trim();
-    let name = first.split_once('=').map_or(first, |(n, _)| n).trim();
+    let (name, value) = first.split_once('=').unwrap_or((first, ""));
+    let name = name.trim();
+    let mut has_expires = false;
     let mut attrs: Vec<String> = parts
         .filter_map(|a| {
             let a = a.trim();
@@ -302,7 +305,11 @@ fn norm_cookie(v: &str) -> String {
                 None => (a.to_ascii_lowercase(), None),
             };
             match (k.as_str(), val) {
-                ("", _) | ("expires", _) => None,
+                ("", _) => None,
+                ("expires", _) => {
+                    has_expires = true;
+                    None
+                }
                 ("path", Some(v)) => Some(format!("path={v}")),
                 ("max-age" | "samesite" | "domain", Some(v)) => {
                     Some(format!("{k}={}", v.to_ascii_lowercase()))
@@ -311,6 +318,58 @@ fn norm_cookie(v: &str) -> String {
             }
         })
         .collect();
+    // Marcadores gruesos: el valor y la fecha exacta no se comparan, pero una
+    // cookie borrada (valor vacio) o de sesion (sin expires) si se distingue.
+    attrs.push(
+        if value.trim().is_empty() {
+            "value=empty"
+        } else {
+            "value=nonempty"
+        }
+        .into(),
+    );
+    attrs.push(
+        if has_expires {
+            "expires=present"
+        } else {
+            "expires=absent"
+        }
+        .into(),
+    );
     attrs.sort();
     format!("{name}: {}", attrs.join(", "))
+}
+
+/// Explica por cookie que atributos/marcadores difieren
+/// (`auth_token: value=empty vs value=nonempty`).
+fn cookie_marker_diffs(a: Option<&[String]>, b: Option<&[String]>) -> Vec<String> {
+    let split = |c: &String| {
+        let (n, t) = c.split_once(": ").unwrap_or((c.as_str(), ""));
+        (
+            n.to_string(),
+            t.split(", ").map(str::to_string).collect::<Vec<_>>(),
+        )
+    };
+    let ma: std::collections::BTreeMap<_, _> = a.unwrap_or(&[]).iter().map(split).collect();
+    let mb: std::collections::BTreeMap<_, _> = b.unwrap_or(&[]).iter().map(split).collect();
+    let names: BTreeSet<&String> = ma.keys().chain(mb.keys()).collect();
+    let mut out = Vec::new();
+    for n in names {
+        match (ma.get(n), mb.get(n)) {
+            (Some(x), Some(y)) if x != y => {
+                let only = |l: &Vec<String>, o: &Vec<String>| {
+                    l.iter()
+                        .filter(|t| !o.contains(t))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                out.push(format!("{n}: {} vs {}", only(x, y), only(y, x)));
+            }
+            (Some(_), None) => out.push(format!("{n}: only in node")),
+            (None, Some(_)) => out.push(format!("{n}: only in rust")),
+            _ => {}
+        }
+    }
+    out
 }

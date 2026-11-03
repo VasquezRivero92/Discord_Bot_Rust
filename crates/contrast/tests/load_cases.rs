@@ -90,3 +90,29 @@ fn documented_example_parses() {
     assert!(jwt.is_admin);
     assert_eq!(cases[1].name, "minimo");
 }
+
+#[test]
+fn duplicate_name_in_same_file_rejected() {
+    let d = dir_with(&[(
+        "a.toml",
+        "[[case]]\nname='dup'\npath='/a'\n[[case]]\nname='other'\npath='/b'\n[[case]]\nname='dup'\npath='/c'\n",
+    )]);
+    let e = load_cases(d.path()).unwrap_err().to_string();
+    assert!(
+        e.contains("dup") && e.contains("a.toml") && e.contains("#1") && e.contains("#3"),
+        "{e}"
+    );
+}
+
+#[test]
+fn duplicate_name_across_files_rejected() {
+    let d = dir_with(&[
+        ("a.toml", "[[case]]\nname='dup'\npath='/a'\n"),
+        ("b.toml", "[[case]]\nname='dup'\npath='/b'\n"),
+    ]);
+    let e = load_cases(d.path()).unwrap_err().to_string();
+    assert!(
+        e.contains("dup") && e.contains("a.toml") && e.contains("b.toml"),
+        "{e}"
+    );
+}

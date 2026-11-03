@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use contrast::{load_cases, run_case, Ctx};
 
-const USAGE: &str = "usage: contrast --node <url> --rust <url> [--jwt-secret <secret>] [--only <substring>] <cases_dir>\n  the secret may also come from the CONTRAST_JWT_SECRET environment variable";
+const USAGE: &str = "usage: contrast --node <url> --rust <url> [--jwt-secret <secret>] [--only <substring>] <cases_dir>\n  `--flag=value` is not supported; the secret may also come from the CONTRAST_JWT_SECRET environment variable";
 
 struct Opts {
     node: String,
@@ -29,7 +29,11 @@ fn parse_args(args: Vec<String>, env_secret: Option<String>) -> Result<Opts, Str
             "--rust" => rust = Some(value("--rust")?),
             "--jwt-secret" => secret = Some(value("--jwt-secret")?),
             "--only" => only = Some(value("--only")?),
-            f if f.starts_with("--") => return Err(format!("unknown flag {f}")),
+            f if f.starts_with("--") => {
+                // Nunca se muestra la parte tras `=`: podria ser un secreto.
+                let name: String = f.split('=').next().unwrap_or("").chars().take(40).collect();
+                return Err(format!("unknown flag {name} (flags take their value as a separate argument; `--flag=value` is not supported)"));
+            }
             _ => {
                 if dir.replace(PathBuf::from(&a)).is_some() {
                     return Err("only one cases directory may be given".into());

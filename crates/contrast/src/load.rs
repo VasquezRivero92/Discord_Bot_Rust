@@ -18,6 +18,12 @@ pub enum LoadError {
     },
     #[error("{file}: {message}")]
     File { file: String, message: String },
+    #[error("duplicate case name '{case}': {first} and {second}")]
+    Duplicate {
+        case: String,
+        first: String,
+        second: String,
+    },
     #[error("{file}: case '{case}': {message}")]
     Case {
         file: String,
@@ -65,13 +71,24 @@ pub fn load_cases(dir: &Path) -> Result<Vec<Case>, LoadError> {
     files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     let mut cases = Vec::new();
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for path in files {
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let text = std::fs::read_to_string(&path).map_err(|e| io(&path, e))?;
-        cases.extend(parse_file(&file, &text)?);
+        for (i, case) in parse_file(&file, &text)?.into_iter().enumerate() {
+            let here = format!("{file} ([[case]] #{})", i + 1);
+            if let Some(first) = seen.insert(case.name.clone(), here.clone()) {
+                return Err(LoadError::Duplicate {
+                    case: case.name,
+                    first,
+                    second: here,
+                });
+            }
+            cases.push(case);
+        }
     }
     Ok(cases)
 }

@@ -443,3 +443,68 @@ async fn cli_exit_2_on_bad_usage() {
         assert_eq!(r.code, 2, "{args:?} -> {}", r.out);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_never_echoes_secrets() {
+    let node = serve(json_router(r#"{"a":1}"#)).await;
+    let rust = serve(json_router(r#"{"a":1}"#)).await;
+    let d = cases_dir("[[case]]\nname='a'\npath='/a'\n");
+    let dir = d.path().to_str().unwrap();
+    // forma `=`: flag desconocido, sin eco del valor
+    let r = cli(
+        s(&[
+            "--node",
+            &node,
+            "--rust",
+            &rust,
+            "--jwt-secret=hunter2",
+            dir,
+        ]),
+        vec![],
+    )
+    .await;
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(!r.out.contains("hunter2"), "{}", r.out);
+    assert!(r.out.contains("--jwt-secret"), "{}", r.out);
+    // camino feliz
+    let r = cli(
+        s(&[
+            "--node",
+            &node,
+            "--rust",
+            &rust,
+            "--jwt-secret",
+            "hunter2",
+            dir,
+        ]),
+        vec![],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.out);
+    assert!(!r.out.contains("hunter2"), "{}", r.out);
+    // URL invalida con secreto presente
+    let r = cli(
+        s(&[
+            "--node",
+            "ftp://x",
+            "--rust",
+            &rust,
+            "--jwt-secret",
+            "hunter2",
+            dir,
+        ]),
+        vec![],
+    )
+    .await;
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(!r.out.contains("hunter2"), "{}", r.out);
+    // flag desconocido larguisimo: nombre truncado, sin valor
+    let long = format!("--{}=hunter2", "x".repeat(100));
+    let r = cli(s(&["--node", &node, "--rust", &rust, &long, dir]), vec![]).await;
+    assert_eq!(r.code, 2);
+    assert!(
+        !r.out.contains("hunter2") && !r.out.contains(&"x".repeat(50)),
+        "{}",
+        r.out
+    );
+}

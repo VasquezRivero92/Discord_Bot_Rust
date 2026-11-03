@@ -266,3 +266,67 @@ fn long_values_are_truncated_in_report() {
     let d = compare(&json(&big_a), &json(&big_b), &case()).unwrap_err();
     assert!(d.to_string().len() < 1500, "{}", d.to_string().len());
 }
+
+#[test]
+fn cleared_cookie_differs_from_set_cookie() {
+    let set = obs(
+        200,
+        &[(
+            "set-cookie",
+            "auth_token=xyz; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+        )],
+        "",
+    );
+    let cleared = obs(
+        200,
+        &[(
+            "set-cookie",
+            "auth_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        )],
+        "",
+    );
+    let d = compare(&set, &cleared, &case()).unwrap_err().to_string();
+    assert!(
+        d.contains("auth_token: value=nonempty vs value=empty"),
+        "{d}"
+    );
+    assert!(!d.contains("xyz"), "{d}");
+}
+
+#[test]
+fn session_cookie_differs_from_persistent_cookie() {
+    let persistent = obs(
+        200,
+        &[(
+            "set-cookie",
+            "t=1; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+        )],
+        "",
+    );
+    let session = obs(200, &[("set-cookie", "t=2; Path=/")], "");
+    let d = compare(&persistent, &session, &case())
+        .unwrap_err()
+        .to_string();
+    assert!(d.contains("t: expires=present vs expires=absent"), "{d}");
+}
+
+#[test]
+fn different_values_and_expires_dates_still_equal() {
+    let a = obs(
+        200,
+        &[(
+            "set-cookie",
+            "t=abc; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+        )],
+        "",
+    );
+    let b = obs(
+        200,
+        &[(
+            "set-cookie",
+            "t=zzzzz; Path=/; Expires=Fri, 01 Jan 2027 00:00:00 GMT",
+        )],
+        "",
+    );
+    assert!(compare(&a, &b, &case()).is_ok());
+}
