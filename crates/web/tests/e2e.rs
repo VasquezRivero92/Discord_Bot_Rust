@@ -392,61 +392,81 @@ async fn security_headers_on_rust_responses() {
     assert!(res.headers().get("x-powered-by").is_none());
 }
 
-async fn hammer(f: &Front, headers: &[(&str, &str)], n: usize) -> Vec<u16> {
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut req = f.client.get(f.url("/api/ping"));
-        for (k, v) in headers {
+// ------------------------------------------------------------- rate limit
+//
+// GCRA: ráfaga de 100 y una plaza nueva cada 0,6 s. Las aserciones no dependen
+// del reloj: en un lote que tarda `t` segundos pasan como mucho
+// `100 + t/0,6 + 1` peticiones, y con el cubo lleno las 100 primeras siempre
+// pasan.
+
+/// Una petición del lote: ruta y cabeceras.
+type Req<'a> = (&'a str, &'a [(&'a str, &'a str)]);
+
+/// Envía `reqs` en orden lo más rápido posible; devuelve estados y duración.
+async fn burst(f: &Front, reqs: &[Req<'_>]) -> (Vec<u16>, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let mut out = Vec::with_capacity(reqs.len());
+    for (path, headers) in reqs {
+        let mut req = f.client.get(f.url(path));
+        for (k, v) in *headers {
             req = req.header(*k, *v);
         }
         out.push(req.send().await.unwrap().status().as_u16());
     }
-    out
+    (out, start.elapsed())
 }
 
-/// 100 peticiones pasan; poco después llega un 429 (el cubo GCRA repone una
-/// cada 0,6 s, por eso se admite un margen de unas pocas).
-async fn assert_limited(f: &Front, headers: &[(&str, &str)]) -> reqwest::Response {
-    let first = hammer(f, headers, 100).await;
-    assert!(first.iter().all(|s| *s == 200), "{first:?}");
-    for _ in 0..10 {
-        let mut req = f.client.get(f.url("/api/ping"));
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        let res = req.send().await.unwrap();
-        if res.status() == 429 {
-            return res;
-        }
-    }
-    panic!("no 429 after 110 requests");
+/// Máximo de peticiones admitidas en `elapsed` empezando con el cubo lleno.
+fn max_admitted(elapsed: std::time::Duration) -> usize {
+    100 + (elapsed.as_secs_f64() / 0.6).floor() as usize + 1
+}
+
+/// Comprueba que el lote comparte un solo cubo: las 100 primeras pasan y el
+/// total admitido no supera lo que permite el reloj; algunas reciben 429.
+fn assert_one_bucket(statuses: &[u16], elapsed: std::time::Duration) {
+    assert!(statuses.len() > 110);
+    assert!(
+        statuses[..100].iter().all(|s| *s == 200),
+        "{:?}",
+        &statuses[..100]
+    );
+    let ok = statuses.iter().filter(|s| **s == 200).count();
+    let limited = statuses.iter().filter(|s| **s == 429).count();
+    assert_eq!(ok + limited, statuses.len(), "{statuses:?}");
+    assert!(ok <= max_admitted(elapsed), "ok={ok} in {elapsed:?}");
+    assert!(limited >= 1, "{statuses:?}");
 }
 
 #[tokio::test]
 async fn rate_limit_keys_on_cf_connecting_ip_when_trusted() {
     let f = Front::start(true, &[("TRUST_CF_CONNECTING_IP", "1")]).await;
-    // XFF distinto en cada lote: la clave es CF-Connecting-IP.
-    let limited = assert_limited(
-        &f,
-        &[
-            ("cf-connecting-ip", "203.0.113.7"),
-            ("x-forwarded-for", "198.51.100.1"),
-        ],
-    )
-    .await;
-    assert_eq!(header(&limited, "x-content-type-options"), "nosniff");
-    assert!(!header(&limited, "retry-after").is_empty());
-    let other = hammer(
-        &f,
-        &[
-            ("cf-connecting-ip", "203.0.113.8"),
-            ("x-forwarded-for", "198.51.100.1"),
-        ],
-        1,
-    )
-    .await;
-    assert_eq!(other, [200]);
-    // El 429 también cubre lo proxificado y no llega a Node.
+    // Misma CF-Connecting-IP con XFF distintos, mezclando Rust y proxy: un cubo.
+    let a: &[(&str, &str)] = &[
+        ("cf-connecting-ip", "203.0.113.7"),
+        ("x-forwarded-for", "198.51.100.1"),
+    ];
+    let b: &[(&str, &str)] = &[
+        ("cf-connecting-ip", "203.0.113.7"),
+        ("x-forwarded-for", "198.51.100.2"),
+    ];
+    let reqs: Vec<Req> = (0..120)
+        .map(|i| match i % 3 {
+            0 => ("/api/ping", a),
+            1 => ("/api/ping", b),
+            _ => ("/health", a),
+        })
+        .collect();
+    let (statuses, elapsed) = burst(&f, &reqs).await;
+    assert_one_bucket(&statuses, elapsed);
+    // Los /health limitados no llegan a Node.
+    let health_ok = statuses
+        .iter()
+        .zip(&reqs)
+        .filter(|(s, (p, _))| **s == 200 && *p == "/health")
+        .count();
+    assert_eq!(f.legacy.seen().len(), health_ok);
+
+    // El 429 lleva cabeceras de seguridad y Retry-After.
     let res = f
         .client
         .get(f.url("/health"))
@@ -454,45 +474,99 @@ async fn rate_limit_keys_on_cf_connecting_ip_when_trusted() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 429);
-    assert_eq!(header(&res, "x-content-type-options"), "nosniff");
-    assert!(f.legacy.seen().is_empty());
+    if res.status() == 429 {
+        assert_eq!(header(&res, "x-content-type-options"), "nosniff");
+        assert!(!header(&res, "retry-after").is_empty());
+    }
+    // Otra CF-Connecting-IP: cubo nuevo (lleno), pasa seguro.
+    let (other, _) = burst(
+        &f,
+        &[(
+            "/api/ping",
+            &[
+                ("cf-connecting-ip", "203.0.113.8"),
+                ("x-forwarded-for", "198.51.100.1"),
+            ][..],
+        )],
+    )
+    .await;
+    assert_eq!(other, [200]);
 }
 
 #[tokio::test]
 async fn rate_limit_keys_on_rightmost_xff_when_cf_is_not_trusted() {
     let f = Front::start(true, &[]).await;
-    // CF-Connecting-IP se ignora (falsificable si el origen fuese alcanzable).
-    assert_limited(
-        &f,
-        &[
-            ("cf-connecting-ip", "203.0.113.7"),
-            ("x-forwarded-for", "10.0.0.1, 192.0.2.50"),
-        ],
-    )
-    .await;
-    // Misma entrada derecha con otra izquierda y otra CF: mismo cubo.
-    let same = hammer(
-        &f,
-        &[
-            ("cf-connecting-ip", "203.0.113.99"),
-            ("x-forwarded-for", "10.9.9.9, 192.0.2.50"),
-        ],
-        1,
-    )
-    .await;
-    assert_eq!(same, [429]);
+    // CF-Connecting-IP se ignora; misma entrada derecha con otra izquierda: un cubo.
+    let a: &[(&str, &str)] = &[
+        ("cf-connecting-ip", "203.0.113.7"),
+        ("x-forwarded-for", "10.0.0.1, 192.0.2.50"),
+    ];
+    let b: &[(&str, &str)] = &[
+        ("cf-connecting-ip", "203.0.113.99"),
+        ("x-forwarded-for", "10.9.9.9, 192.0.2.50"),
+    ];
+    let reqs: Vec<Req> = (0..120)
+        .map(|i| ("/api/ping", if i % 2 == 0 { a } else { b }))
+        .collect();
+    let (statuses, elapsed) = burst(&f, &reqs).await;
+    assert_one_bucket(&statuses, elapsed);
     // Otra entrada derecha: cubo nuevo.
-    let other = hammer(
+    let (other, _) = burst(
         &f,
-        &[
-            ("cf-connecting-ip", "203.0.113.7"),
-            ("x-forwarded-for", "192.0.2.50, 192.0.2.51"),
-        ],
-        1,
+        &[(
+            "/api/ping",
+            &[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-forwarded-for", "192.0.2.50, 192.0.2.51"),
+            ][..],
+        )],
     )
     .await;
     assert_eq!(other, [200]);
+}
+
+#[tokio::test]
+async fn static_files_and_spa_routes_are_exempt_from_the_rate_limit() {
+    let f = Front::start(true, &[]).await;
+    let key: &[(&str, &str)] = &[("x-forwarded-for", "192.0.2.10")];
+    let reqs: Vec<Req> = (0..150)
+        .map(|i| match i % 3 {
+            0 => ("/about.html", key),
+            1 => ("/terms", key),
+            _ => ("/tienda", key),
+        })
+        .collect();
+    let (statuses, _) = burst(&f, &reqs).await;
+    assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+    assert!(f.legacy.seen().is_empty(), "{:?}", f.legacy.seen());
+
+    // El mismo cliente sigue con el cubo entero para lo limitado, y el cubo es
+    // compartido entre rutas Rust y proxificadas: 60 /api/ping y luego /health.
+    let reqs: Vec<Req> = (0..120)
+        .map(|i| (if i < 60 { "/api/ping" } else { "/health" }, key))
+        .collect();
+    let (statuses, elapsed) = burst(&f, &reqs).await;
+    assert_one_bucket(&statuses, elapsed);
+    // Los 429 caen en /health (las 60 primeras eran /api/ping y pasaron): sin
+    // cubo compartido, las 60 de /health habrían pasado todas.
+    let health_ok = statuses[60..].iter().filter(|s| **s == 200).count();
+    assert!(health_ok < 60, "{statuses:?}");
+    assert_eq!(f.legacy.seen().len(), health_ok);
+
+    // Con el cubo agotado, los estáticos siguen sirviéndose.
+    let (statuses, _) = burst(&f, &[("/about.html", key), ("/terms", key)]).await;
+    assert_eq!(statuses, [200, 200]);
+}
+
+#[tokio::test]
+async fn requests_the_static_layer_passes_to_node_are_limited() {
+    let f = Front::start(true, &[]).await;
+    let key: &[(&str, &str)] = &[("x-forwarded-for", "192.0.2.20")];
+    let reqs: Vec<Req> = (0..120).map(|_| ("/nope.png", key)).collect();
+    let (statuses, elapsed) = burst(&f, &reqs).await;
+    assert_one_bucket(&statuses, elapsed);
+    let ok = statuses.iter().filter(|s| **s == 200).count();
+    assert_eq!(f.legacy.seen().len(), ok);
 }
 
 #[tokio::test]

@@ -15,6 +15,22 @@
 //!    permitido se rechaza aquí),
 //! 4. rate limit,
 //! 5. límite de cuerpo JSON.
+//!
+//! # Exención de estáticos (frente de entrada, `web::build_app`)
+//!
+//! En el legado `express.static` (index.js:156) corre ANTES de la redirección
+//! HTTPS (169) y del `globalLimiter` (188): los archivos de `public/` nunca
+//! consumían cuota. Por eso el rate limit es también una pieza aparte,
+//! [`RateLimit`]: se construye UNA vez por app (un único cubo por clave de
+//! cliente) y `build_app` lo aplica solo a las rutas migradas y al proxy, no a
+//! lo que contesta `static_files`. [`apply_except_rate_limit`] pone el resto de
+//! capas por fuera de todo. Desviación consciente: las rutas SPA/legales
+//! (`/`, `/tienda`, `/terms`, `/admin`, ...) en el legado eran `app.get`
+//! posteriores al limitador y sí consumían cuota; en Rust solo sirven HTML
+//! estático y quedan exentas igual que los archivos. Lo que `static_files` pasa
+//! al proxy (p. ej. un asset inexistente) sí cuenta.
+//!
+//! [`apply`] sigue siendo el todo-en-uno (con el límite para todo el router).
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -70,29 +86,63 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 
 struct Shared {
     production: bool,
-    trust_cf_connecting_ip: bool,
     cors_origins: Vec<String>,
+}
+
+struct LimiterState {
+    trust_cf_connecting_ip: bool,
     limiter: DefaultKeyedRateLimiter<IpAddr>,
     requests: AtomicU64,
 }
 
+/// Rate limit global (`rateLimit({ max: 100, windowMs: 60_000 })`). Cada valor
+/// es un limitador; sus clones comparten los cubos, así que aplicarlo a varias
+/// ramas de un router da un único cubo por clave de cliente.
+#[derive(Clone)]
+pub struct RateLimit {
+    state: Arc<LimiterState>,
+}
+
+impl RateLimit {
+    pub fn new(cfg: &Config) -> Self {
+        let quota = Quota::per_minute(
+            std::num::NonZeroU32::new(RATE_LIMIT_MAX).expect("rate limit is non-zero"),
+        );
+        Self {
+            state: Arc::new(LimiterState {
+                trust_cf_connecting_ip: cfg.trust_cf_connecting_ip,
+                limiter: DefaultKeyedRateLimiter::keyed(quota),
+                requests: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Limita todo `router` (rutas y fallback).
+    pub fn layer(&self, router: Router) -> Router {
+        router.layer(from_fn_with_state(self.state.clone(), rate_limit))
+    }
+}
+
 /// Añade al `router` el comportamiento transversal del legacy.
 pub fn apply(router: Router, cfg: &Config) -> Router {
-    let quota = Quota::per_minute(
-        std::num::NonZeroU32::new(RATE_LIMIT_MAX).expect("rate limit is non-zero"),
-    );
+    let limited = RateLimit::new(cfg).layer(router.layer(from_fn(body_limit)));
+    outer_layers(limited, cfg)
+}
+
+/// Todas las capas de [`apply`] salvo el rate limit, que el llamador aplica por
+/// ramas con un [`RateLimit`]. El límite de cuerpo JSON queda por fuera del rate
+/// limit, como `express.json` (index.js:147) antes del `globalLimiter` (188).
+pub fn apply_except_rate_limit(router: Router, cfg: &Config) -> Router {
+    outer_layers(router.layer(from_fn(body_limit)), cfg)
+}
+
+fn outer_layers(router: Router, cfg: &Config) -> Router {
     let shared = Arc::new(Shared {
         production: cfg.production,
-        trust_cf_connecting_ip: cfg.trust_cf_connecting_ip,
         cors_origins: cfg.cors_origins.clone(),
-        limiter: DefaultKeyedRateLimiter::keyed(quota),
-        requests: AtomicU64::new(0),
     });
-
     // La última capa añadida es la más externa.
     router
-        .layer(from_fn(body_limit))
-        .layer(from_fn_with_state(shared.clone(), rate_limit))
         .layer(from_fn_with_state(shared.clone(), cors))
         .layer(from_fn_with_state(shared, https_redirect))
         .layer(from_fn(security_headers))
@@ -265,7 +315,7 @@ fn client_key(req: &Request, trust_cf: bool) -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
-async fn rate_limit(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
+async fn rate_limit(State(shared): State<Arc<LimiterState>>, req: Request, next: Next) -> Response {
     let n = shared.requests.fetch_add(1, Ordering::Relaxed);
     if n % CLEANUP_EVERY == CLEANUP_EVERY - 1 {
         shared.limiter.retain_recent();

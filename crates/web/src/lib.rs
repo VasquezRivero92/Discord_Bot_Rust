@@ -54,18 +54,24 @@ pub struct AppDeps {
 ///    `/api/admin/*`, `/api/lobby/*` with its WebSocket, `/api/cs2/*`,
 ///    `/webhook*` and every POST of the public API).
 ///
-/// `middleware::apply` wraps all of it (outermost), so security headers, the
-/// HTTPS redirect, CORS, the rate limit and the JSON body limit apply to Rust
-/// and proxied responses alike. Serve it with
+/// Around all of it go the security headers, the HTTPS redirect, CORS and the
+/// JSON body limit (`middleware::apply_except_rate_limit`), for Rust and
+/// proxied responses alike. The rate limit is ONE `middleware::RateLimit`
+/// (one bucket per client key) applied to the migrated routes and to the proxy
+/// only: whatever `static_files` answers itself (files, SPA and legal entry
+/// routes) is exempt, like `express.static` running before `globalLimiter` in
+/// the legacy; what `static_files` hands to the proxy is limited. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`.
 pub fn build_app(deps: AppDeps) -> Router {
     let cfg = &deps.config;
+    let limit = middleware::RateLimit::new(cfg);
     let proxy = proxy::fallback_proxy(
         cfg.legacy_url.clone(),
         proxy::ProxyOptions {
             append_peer_to_xff: cfg.proxy_append_peer_to_xff,
         },
     );
+    let limited_proxy = limit.layer(proxy.clone());
 
     let mut migrated = routes::diagnostic::router()
         .merge(routes::public_api::products_router())
@@ -75,21 +81,22 @@ pub fn build_app(deps: AppDeps) -> Router {
     if let Some(claims) = deps.claims {
         migrated = migrated.merge(routes::public_api::claims_router(claims));
     }
+    // Wrong method on a migrated path -> Node instead of axum's 405. Set before
+    // the rate-limit layer so each such request is counted exactly once (by the
+    // layer), hence the un-limited proxy here.
+    let migrated = migrated.method_not_allowed_fallback(move |req: Request| {
+        let proxy = proxy.clone();
+        async move {
+            let res: Response = proxy.oneshot(req).await.unwrap_or_else(|e| match e {});
+            res
+        }
+    });
+    let migrated = limit.layer(migrated);
 
-    let to_legacy = proxy.clone();
-    let app = migrated
-        .merge(static_files::routes_with_fallback(
-            cfg.static_dir.clone(),
-            proxy,
-        ))
-        // Applies to the routes registered so far, so it goes after every merge.
-        .method_not_allowed_fallback(move |req: Request| {
-            let to_legacy = to_legacy.clone();
-            async move {
-                let res: Response = to_legacy.oneshot(req).await.unwrap_or_else(|e| match e {});
-                res
-            }
-        });
+    let app = migrated.merge(static_files::routes_with_fallback(
+        cfg.static_dir.clone(),
+        limited_proxy,
+    ));
 
-    middleware::apply(app, cfg)
+    middleware::apply_except_rate_limit(app, cfg)
 }
