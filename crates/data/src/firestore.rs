@@ -114,8 +114,10 @@ impl FirestoreClient {
     /// soltar el stream. Primero llega la instantánea inicial (un `Added` por documento
     /// existente) y luego los cambios. Las reconexiones las hace el crate por dentro (cada 5 s
     /// tras un fallo, reanudando con el resume token en memoria) y se señalan con
-    /// [`ChangeEvent::Reset`]. Solo se emite un `Err` si el listener se detiene por un error que
-    /// el crate no puede reintentar; tras él el stream termina.
+    /// [`ChangeEvent::Reset`]. Se emite un `Err` terminal (y el stream termina) si Firestore da
+    /// el target por terminado para siempre (p. ej. `PERMISSION_DENIED` por reglas) o si el bucle
+    /// del listener se detiene por un error que el crate no reintenta; quien consume debe volver a
+    /// llamar a `watch_collection`. Los errores reintentables nunca llegan al stream.
     pub fn watch_collection(
         &self,
         collection: &str,
@@ -148,25 +150,30 @@ async fn start_watch(
         .listen()
         .add_target(target.clone(), &mut listener)?;
 
-    let (tx, rx) = mpsc::unbounded_channel::<ChangeEvent>();
+    let (tx, rx) = mpsc::unbounded_channel::<Result<ChangeEvent, DataError>>();
     let state = Arc::new(Mutex::new(WatchState::new(WATCH_TARGET_ID as i32)));
     let control = listener.control_handle();
 
     listener
         .start(move |event| {
-            let (change, resync) = {
+            let (item, resync) = {
                 let mut state = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let change = state.on_event(event);
-                (change, state.take_resync_request())
+                match state.terminal_error(&event, control.has_target(&target)) {
+                    Some(err) => (Some(Err(err)), false),
+                    None => {
+                        let change = state.on_event(event);
+                        (change.map(Ok), state.take_resync_request())
+                    }
+                }
             };
             if resync {
                 control.resync_target(target.clone());
             }
-            if let Some(change) = change {
+            if let Some(item) = item {
                 // Si el receptor ya no existe, el stream se soltó y el listener se está cerrando.
-                let _ = tx.send(change);
+                let _ = tx.send(item);
             }
             futures::future::ready(Ok(()))
         })
@@ -177,7 +184,13 @@ async fn start_watch(
         |(listener, mut rx)| async move {
             let mut listener = listener?;
             match rx.recv().await {
-                Some(change) => Some((Ok(change), (Some(listener), rx))),
+                Some(Ok(change)) => Some((Ok(change), (Some(listener), rx))),
+                // Error terminal (target terminado por Firestore): se entrega y el stream
+                // termina; soltar `listener` aquí detiene su bucle.
+                Some(Err(err)) => {
+                    drop(listener);
+                    Some((Err(err), (None, rx)))
+                }
                 // El bucle del listener terminó (soltó el callback y con él el emisor):
                 // `shutdown` devuelve por qué, si fue por un error.
                 None => match listener.shutdown().await {
@@ -316,6 +329,37 @@ impl WatchState {
         }
     }
 
+    /// Error terminal si `event` es la baja definitiva de nuestro target.
+    ///
+    /// Firestore retira un target con un `REMOVE` que lleva `cause`. El crate decide si lo
+    /// vuelve a añadir (causa reintentable) o lo da por terminado para siempre
+    /// (`PERMISSION_DENIED`, `NOT_FOUND`, `UNIMPLEMENTED`, y `INVALID_ARGUMENT` /
+    /// `FAILED_PRECONDITION` si no se reanudó), y en ese caso lo des-registra **antes** de
+    /// llamar al callback. `target_registered` es esa respuesta (`has_target` del crate). Sin
+    /// esta señal el stream se quedaría parado para siempre sin error ni fin.
+    pub(crate) fn terminal_error(
+        &self,
+        event: &FirestoreListenEvent,
+        target_registered: bool,
+    ) -> Option<DataError> {
+        let FirestoreListenEvent::TargetChange(change) = event else {
+            return None;
+        };
+        if target_registered
+            || TargetChangeType::try_from(change.target_change_type).ok()
+                != Some(TargetChangeType::Remove)
+            || (!change.target_ids.is_empty() && !self.concerns_me(&change.target_ids))
+        {
+            return None;
+        }
+        let cause = change.cause.as_ref()?;
+        let code = firestore::gcloud_sdk::tonic::Code::from(cause.code);
+        Some(DataError::Firestore(format!(
+            "Firestore terminó el listener de la colección ({code:?}, código {}): {}",
+            cause.code, cause.message
+        )))
+    }
+
     /// Devuelve (y consume) si hay que resincronizar el target desde cero.
     pub(crate) fn take_resync_request(&mut self) -> bool {
         std::mem::take(&mut self.resync_requested)
@@ -329,7 +373,9 @@ mod tests {
         target_change::TargetChangeType, value::ValueType, ArrayValue, Document, DocumentChange,
         DocumentDelete, DocumentRemove, ExistenceFilter, MapValue, TargetChange, Value,
     };
+    use firestore::gcloud_sdk::google::rpc::Status as RpcStatus;
     use firestore::gcloud_sdk::prost_types::Timestamp;
+    use firestore::gcloud_sdk::tonic::Code;
     use serde::Deserialize;
     use std::collections::HashMap;
 
@@ -579,6 +625,70 @@ mod tests {
             state.on_event(changed("a")),
             Some(ChangeEvent::Added("a".into()))
         );
+    }
+
+    fn removed_with_cause(code: Code, message: &str) -> FirestoreListenEvent {
+        FirestoreListenEvent::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Remove as i32,
+            target_ids: vec![TARGET],
+            cause: Some(RpcStatus {
+                code: code as i32,
+                message: message.to_string(),
+                details: vec![],
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn remove_with_permanent_cause_is_terminal_error() {
+        let mut state = WatchState::new(TARGET);
+        let event = removed_with_cause(
+            Code::PermissionDenied,
+            "Missing or insufficient permissions.",
+        );
+        // El crate ya des-registró el target (fin definitivo) antes de llamar al callback.
+        let err = state
+            .terminal_error(&event, false)
+            .expect("un target terminado para siempre es un error terminal");
+        match err {
+            DataError::Firestore(msg) => {
+                assert!(msg.contains("PermissionDenied"), "{msg}");
+                assert!(
+                    msg.contains("Missing or insufficient permissions."),
+                    "{msg}"
+                );
+            }
+            other => panic!("se esperaba DataError::Firestore, llegó {other:?}"),
+        }
+        assert_eq!(state.on_event(event), None);
+    }
+
+    #[test]
+    fn remove_with_retryable_cause_is_silent_while_target_registered() {
+        let mut state = WatchState::new(TARGET);
+        let event = removed_with_cause(Code::Unavailable, "backend unavailable");
+        // El crate volverá a añadir el target (sigue registrado): el ADD posterior da Reset.
+        assert_eq!(state.terminal_error(&event, true), None);
+        assert_eq!(state.on_event(event), None);
+    }
+
+    #[test]
+    fn remove_without_cause_or_for_other_target_is_not_terminal() {
+        let state = WatchState::new(TARGET);
+        let ack = target_change(TargetChangeType::Remove);
+        assert_eq!(state.terminal_error(&ack, false), None);
+        let other = FirestoreListenEvent::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Remove as i32,
+            target_ids: vec![TARGET + 1],
+            cause: Some(RpcStatus {
+                code: Code::NotFound as i32,
+                message: "gone".into(),
+                details: vec![],
+            }),
+            ..Default::default()
+        });
+        assert_eq!(state.terminal_error(&other, false), None);
     }
 
     #[test]

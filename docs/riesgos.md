@@ -123,9 +123,24 @@ forma natural del API del listener (segundo `ADD`, `RESET`, filtro de existencia
 Tarea 11 la señal para invalidar la caché entera (`watcher_reconnect_invalidates_all`). Al
 reanudar con token, Firestore además envía los cambios perdidos como eventos normales.
 
-Solo se emite `Err` en el stream si el bucle del listener se detiene por un error que el crate
-no reintenta (petición inválida tras descartar tokens, parámetros inválidos, pánico); después el
-stream termina. Un error al abrir el listener se emite como único elemento.
+**Errores terminales.** Si Firestore retira el target con una causa que el crate considera
+definitiva (`PERMISSION_DENIED`, `NOT_FOUND`, `UNIMPLEMENTED`, y `INVALID_ARGUMENT` /
+`FAILED_PRECONDITION` cuando el target no se reanudó), el crate lo des-registra y deja el bucle
+esperando para siempre sin targets: sin más, el stream se quedaría parado sin error ni fin. Por
+eso, ante un `REMOVE` con `cause` de nuestro target que ya no está registrado
+(`has_target == false`), el stream emite un `Err(DataError::Firestore(..))` terminal con el
+código gRPC y el mensaje de la causa, y a continuación termina. Si el target sigue registrado, el
+crate lo volverá a añadir y el `ADD` siguiente produce `Reset`. También se emite un `Err`
+terminal si el bucle del listener se detiene por un error que el crate no reintenta (petición
+inválida tras descartar tokens, parámetros inválidos, pánico), y un error al abrir el listener se
+emite como único elemento. En todos los casos, quien consume debe volver a llamar a
+`watch_collection`.
+
+Fuera de esos casos, quien consume **no puede saber** que el listener está caído: los errores de
+escucha `UNAUTHENTICATED`, `UNAVAILABLE`, `RESOURCE_EXHAUSTED` y un `PERMISSION_DENIED`
+transitorio se reintentan cada 5 s para siempre y nunca llegan al stream (en particular,
+`QuotaExceeded` nunca aparece en el stream de `watch_collection`), así que el TTL de la caché es
+la única cota de lo desactualizados que pueden estar los datos.
 
 ## Preguntas abiertas para la Tarea 11
 
@@ -147,7 +162,12 @@ stream termina. Un error al abrir el listener se emite como único elemento.
    errores reintentables, incluido `RESOURCE_EXHAUSTED`; `QuotaExceeded` llega al llamador solo
    tras agotar esos reintentos. Si se quiere fallar antes, construir el `FirestoreDb` con
    `max_retries` propio y usar `FirestoreClient::from_db`.
-7. **Dobles de prueba**: no se ha introducido un trait sobre `FirestoreClient`. Para simular
+7. **`list_docs` falla entero con un solo documento legado malformado** (`DataError::Decode`
+   al primer documento que no encaja en el tipo). Si hay datos legados irregulares, puede hacer
+   falta una variante tolerante que omita (y registre) los documentos que no se decodifican.
+8. **Watcher terminado**: tras un `Err` terminal el stream acaba; la Tarea 11 debe reabrir el
+   watcher (con espera) e invalidar la caché de esa colección.
+9. **Dobles de prueba**: no se ha introducido un trait sobre `FirestoreClient`. Para simular
    errores realistas en un doble, `DataError::from(tonic::Status::...)` aplica el mismo mapeo que
    el cliente real. Si la Tarea 11 necesita intercambiar el cliente, el trait de repositorio es
    suyo.
