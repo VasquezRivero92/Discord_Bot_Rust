@@ -9,7 +9,7 @@ mod guild_settings;
 pub use crate::cache::TtlCache;
 pub use crate::claims::{Claim, ClaimsRepo, FirestoreClaimsRepo, InMemoryClaimsRepo};
 pub use crate::error::DataError;
-pub use crate::firestore::{document_id, ChangeEvent, FirestoreClient};
+pub use crate::firestore::{document_id, ChangeEvent, Dir, FirestoreClient, Op, Query, Value};
 pub use crate::guild_settings::{
     FirestoreGuildSettingsRepo, GuildSettings, GuildSettingsRepo, GuildSettingsSource,
     InMemoryGuildSettingsRepo, WatcherHandle, GUILD_SETTINGS_TTL,

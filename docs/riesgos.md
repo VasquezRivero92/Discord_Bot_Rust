@@ -171,3 +171,22 @@ la única cota de lo desactualizados que pueden estar los datos.
    errores realistas en un doble, `DataError::from(tonic::Status::...)` aplica el mismo mapeo que
    el cliente real. Si la Tarea 11 necesita intercambiar el cliente, el trait de repositorio es
    suyo.
+
+## Fase 2A
+
+- **Índices compuestos (requisito de despliegue; Rust nunca los crea).** `FirestoreClient::query`
+  con un filtro sobre un campo y `order_by` sobre *otro* necesita un índice compuesto en Firestore;
+  sin él responde `FAILED_PRECONDITION` (llega como `DataError::Firestore`). Combinaciones que usa
+  el legacy (`database.js`):
+  - `faceit_matches_history`: `guild_id ==` + `createdAt desc`. Está en
+    `firestore.indexes.json` del legacy, así que el índice ya se despliega.
+  - `faceit_bot_logs` (`getRecentLogs`) y `faceit_support_calls` (`getSupportCalls`): `guild_id ==`
+    + `createdAt desc` cuando se pasa `guildId`. **No constan** en `firestore.indexes.json`; no he
+    podido comprobar si existen en la consola de Firebase del proyecto real. Antes de portar esas
+    lecturas hay que confirmar que el índice (`guild_id` asc, `createdAt` desc) está desplegado, o
+    añadirlo al archivo de índices del legacy. Sin `guildId` solo ordenan por `createdAt` (índice
+    automático de un campo).
+  - `claims` y `orders` (`getClaims`/`getOrders`): solo filtro `status ==`, sin orden en Firestore
+    (el legacy ordena en memoria). No necesitan índice si el repositorio hace lo mismo.
+  - `faceit_users` (`mixton_ready ==` + `mixton_guild_id ==`): solo igualdades, índice ya listado en
+    `firestore.indexes.json`.

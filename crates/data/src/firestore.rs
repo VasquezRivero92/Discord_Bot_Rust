@@ -7,9 +7,13 @@
 
 use crate::error::DataError;
 use firestore::gcloud_sdk::google::firestore::v1::target_change::TargetChangeType;
+use firestore::gcloud_sdk::google::firestore::v1::{value::ValueType, Value as PbValue};
 use firestore::{
     FirestoreDb, FirestoreDbOptions, FirestoreDocument, FirestoreListenEvent, FirestoreListener,
-    FirestoreListenerTarget, FirestoreMemListenStateStorage,
+    FirestoreListenerTarget, FirestoreMemListenStateStorage, FirestoreQueryCollection,
+    FirestoreQueryDirection, FirestoreQueryFilter, FirestoreQueryFilterCompare,
+    FirestoreQueryFilterComposite, FirestoreQueryFilterCompositeOperator, FirestoreQueryOrder,
+    FirestoreQueryParams, FirestoreValue,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
@@ -45,6 +49,104 @@ pub enum ChangeEvent {
     /// simplemente no lo trae): quien cachee debe tratarlo como un `Reset` y además descartar
     /// todo lo que guarde (también copias viejas) de ids que no estén en la lista. Idempotente.
     Synced(Vec<String>),
+}
+
+/// Operador de comparación de un filtro de [`Query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Dirección de ordenación de [`Query::order_by`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Asc,
+    Desc,
+}
+
+/// Valor con el que se compara un campo en un filtro de [`Query`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    String(String),
+    Integer(i64),
+    Double(f64),
+    Bool(bool),
+}
+
+impl Value {
+    fn to_firestore(&self) -> FirestoreValue {
+        let value_type = match self {
+            Value::String(v) => ValueType::StringValue(v.clone()),
+            Value::Integer(v) => ValueType::IntegerValue(*v),
+            Value::Double(v) => ValueType::DoubleValue(*v),
+            Value::Bool(v) => ValueType::BooleanValue(*v),
+        };
+        FirestoreValue::from(PbValue {
+            value_type: Some(value_type),
+        })
+    }
+}
+
+/// Consulta estructurada sobre una colección: filtros (todos a la vez, AND), un orden y un
+/// límite. `Query::default()` equivale a listar la colección entera (sin orden).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Query {
+    /// Filtros `(campo, operador, valor)`; se combinan con AND.
+    pub filters: Vec<(String, Op, Value)>,
+    /// Un único criterio de orden `(campo, dirección)`.
+    pub order_by: Option<(String, Dir)>,
+    /// Número máximo de documentos a devolver.
+    pub limit: Option<u32>,
+}
+
+fn compare_filter(field: &str, op: Op, value: &Value) -> FirestoreQueryFilter {
+    let field = field.to_string();
+    let value = value.to_firestore();
+    FirestoreQueryFilter::Compare(Some(match op {
+        Op::Eq => FirestoreQueryFilterCompare::Equal(field, value),
+        Op::Ne => FirestoreQueryFilterCompare::NotEqual(field, value),
+        Op::Lt => FirestoreQueryFilterCompare::LessThan(field, value),
+        Op::Le => FirestoreQueryFilterCompare::LessThanOrEqual(field, value),
+        Op::Gt => FirestoreQueryFilterCompare::GreaterThan(field, value),
+        Op::Ge => FirestoreQueryFilterCompare::GreaterThanOrEqual(field, value),
+    }))
+}
+
+/// Traduce `q` a los parámetros de consulta del crate `firestore`. Pura (sin red).
+fn query_params(collection: &str, q: &Query) -> FirestoreQueryParams {
+    let mut filters: Vec<FirestoreQueryFilter> = q
+        .filters
+        .iter()
+        .map(|(field, op, value)| compare_filter(field, *op, value))
+        .collect();
+    let filter = match filters.len() {
+        0 => None,
+        1 => filters.pop(),
+        _ => Some(FirestoreQueryFilter::Composite(
+            FirestoreQueryFilterComposite {
+                for_all_filters: filters,
+                operator: FirestoreQueryFilterCompositeOperator::And,
+            },
+        )),
+    };
+    let order_by = q.order_by.as_ref().map(|(field, dir)| {
+        vec![FirestoreQueryOrder {
+            field_name: field.clone(),
+            direction: match dir {
+                Dir::Asc => FirestoreQueryDirection::Ascending,
+                Dir::Desc => FirestoreQueryDirection::Descending,
+            },
+        }]
+    });
+    FirestoreQueryParams::new(FirestoreQueryCollection::Single(collection.to_string()))
+        .opt_filter(filter)
+        .opt_order_by(order_by)
+        .opt_limit(q.limit)
 }
 
 /// Cliente Firestore de solo lectura. Barato de clonar (comparte la conexión).
@@ -112,6 +214,36 @@ impl FirestoreClient {
             .await?
             .try_collect()
             .await?;
+        docs.iter().map(decode_document).collect()
+    }
+
+    /// Consulta `collection` con los filtros, el orden y el límite de `q` y devuelve los
+    /// documentos como `(id, valor)`, decodificados igual que en [`FirestoreClient::list_docs`]
+    /// (un documento no decodificable hace fallar la llamada con [`DataError::Decode`]).
+    ///
+    /// **Índices:** Firestore resuelve con sus índices automáticos las consultas con filtros de un solo campo o con un
+    /// único campo ordenado, pero una consulta con un filtro sobre un campo y `order_by` sobre
+    /// *otro* campo (p. ej. `guild_id == x` ordenado por `createdAt`) necesita un índice
+    /// compuesto, y sin él Firestore responde `FAILED_PRECONDITION` (llega como
+    /// [`DataError::Firestore`]). Este cliente nunca crea índices; hay que desplegarlos aparte
+    /// (ver "Fase 2A" en `docs/riesgos.md`).
+    pub async fn query<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+        q: Query,
+    ) -> Result<Vec<(String, T)>, DataError> {
+        let params = query_params(collection, &q);
+        let mut select = self.db.fluent().select().from(collection);
+        if let Some(filter) = params.filter {
+            select = select.filter(move |_| Some(filter.clone()));
+        }
+        if let Some(orders) = params.order_by {
+            select = select.order(move |_| orders.clone());
+        }
+        if let Some(limit) = params.limit {
+            select = select.limit(limit);
+        }
+        let docs = select.query().await?;
         docs.iter().map(decode_document).collect()
     }
 
@@ -402,7 +534,7 @@ mod tests {
     use super::*;
     use firestore::gcloud_sdk::google::firestore::v1::{
         target_change::TargetChangeType, value::ValueType, ArrayValue, Document, DocumentChange,
-        DocumentDelete, DocumentRemove, ExistenceFilter, MapValue, TargetChange, Value,
+        DocumentDelete, DocumentRemove, ExistenceFilter, MapValue, TargetChange, Value as PbValue,
     };
     use firestore::gcloud_sdk::google::rpc::Status as RpcStatus;
     use firestore::gcloud_sdk::prost_types::Timestamp;
@@ -417,8 +549,8 @@ mod tests {
         format!("{ROOT}/{collection}/{id}")
     }
 
-    fn val(value_type: ValueType) -> Value {
-        Value {
+    fn val(value_type: ValueType) -> PbValue {
+        PbValue {
             value_type: Some(value_type),
         }
     }
@@ -818,6 +950,124 @@ mod tests {
         assert!(
             !state.take_resync_request(),
             "la petición se consume una vez"
+        );
+    }
+
+    // --- query: construcción de la consulta estructurada ------------------------------------
+
+    use firestore::gcloud_sdk::google::firestore::v1::{
+        structured_query::{composite_filter, field_filter, filter::FilterType, Direction},
+        StructuredQuery,
+    };
+
+    fn structured(collection: &str, q: &Query) -> StructuredQuery {
+        StructuredQuery::try_from(query_params(collection, q)).expect("consulta válida")
+    }
+
+    fn field_filter_of(filter: &structured_query::Filter) -> &structured_query::FieldFilter {
+        match filter.filter_type.as_ref().expect("filtro") {
+            FilterType::FieldFilter(f) => f,
+            other => panic!("se esperaba un filtro de campo, llegó {other:?}"),
+        }
+    }
+
+    use firestore::gcloud_sdk::google::firestore::v1::structured_query;
+
+    #[test]
+    fn query_builds_expected_structured_query() {
+        let q = Query {
+            filters: vec![
+                ("guild_id".into(), Op::Eq, Value::String("g1".into())),
+                ("level".into(), Op::Ge, Value::Integer(3)),
+            ],
+            order_by: Some(("createdAt".into(), Dir::Desc)),
+            limit: Some(50),
+        };
+        let sq = structured("faceit_bot_logs", &q);
+
+        assert_eq!(sq.from.len(), 1);
+        assert_eq!(sq.from[0].collection_id, "faceit_bot_logs");
+        assert!(!sq.from[0].all_descendants);
+        assert_eq!(sq.limit, Some(50));
+        assert_eq!(sq.order_by.len(), 1);
+        assert_eq!(
+            sq.order_by[0].field.as_ref().unwrap().field_path,
+            "createdAt"
+        );
+        assert_eq!(sq.order_by[0].direction, Direction::Descending as i32);
+
+        let filter = sq.r#where.expect("filtro");
+        let FilterType::CompositeFilter(composite) = filter.filter_type.expect("compuesto") else {
+            panic!("varios filtros deben ir en un AND");
+        };
+        assert_eq!(composite.op, composite_filter::Operator::And as i32);
+        assert_eq!(composite.filters.len(), 2);
+        let first = field_filter_of(&composite.filters[0]);
+        assert_eq!(first.field.as_ref().unwrap().field_path, "guild_id");
+        assert_eq!(first.op, field_filter::Operator::Equal as i32);
+        assert_eq!(
+            first.value.as_ref().unwrap().value_type,
+            Some(ValueType::StringValue("g1".into()))
+        );
+        let second = field_filter_of(&composite.filters[1]);
+        assert_eq!(second.field.as_ref().unwrap().field_path, "level");
+        assert_eq!(second.op, field_filter::Operator::GreaterThanOrEqual as i32);
+        assert_eq!(
+            second.value.as_ref().unwrap().value_type,
+            Some(ValueType::IntegerValue(3))
+        );
+    }
+
+    #[test]
+    fn query_single_filter_is_not_wrapped_in_composite() {
+        let q = Query {
+            filters: vec![("status".into(), Op::Eq, Value::String("pendiente".into()))],
+            ..Query::default()
+        };
+        let sq = structured("orders", &q);
+        let filter = sq.r#where.expect("filtro");
+        let f = field_filter_of(&filter);
+        assert_eq!(f.field.as_ref().unwrap().field_path, "status");
+        assert_eq!(f.op, field_filter::Operator::Equal as i32);
+    }
+
+    #[test]
+    fn query_default_has_no_filter_order_or_limit() {
+        let sq = structured("claims", &Query::default());
+        assert!(sq.r#where.is_none());
+        assert!(sq.order_by.is_empty());
+        assert_eq!(sq.limit, None);
+    }
+
+    #[test]
+    fn query_values_and_ops_map_to_firestore_types() {
+        let cases = [
+            (Op::Eq, field_filter::Operator::Equal),
+            (Op::Ne, field_filter::Operator::NotEqual),
+            (Op::Lt, field_filter::Operator::LessThan),
+            (Op::Le, field_filter::Operator::LessThanOrEqual),
+            (Op::Gt, field_filter::Operator::GreaterThan),
+            (Op::Ge, field_filter::Operator::GreaterThanOrEqual),
+        ];
+        for (op, expected) in cases {
+            let q = Query {
+                filters: vec![("f".into(), op, Value::Bool(true))],
+                order_by: Some(("f".into(), Dir::Asc)),
+                limit: None,
+            };
+            let sq = structured("c", &q);
+            let filter = sq.r#where.clone().expect("filtro");
+            let f = field_filter_of(&filter);
+            assert_eq!(f.op, expected as i32);
+            assert_eq!(
+                f.value.as_ref().unwrap().value_type,
+                Some(ValueType::BooleanValue(true))
+            );
+            assert_eq!(sq.order_by[0].direction, Direction::Ascending as i32);
+        }
+        assert_eq!(
+            Value::Double(1.5).to_firestore().value.value_type,
+            Some(ValueType::DoubleValue(1.5))
         );
     }
 }

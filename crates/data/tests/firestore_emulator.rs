@@ -16,7 +16,7 @@
 //!   nunca se conectan a Firestore de producción. El proyecto usado (`demo-machupeek`) lleva el
 //!   prefijo `demo-`, que el emulador reserva para proyectos sin credenciales reales.
 
-use data::{ChangeEvent, DataError, FirestoreClient};
+use data::{ChangeEvent, DataError, Dir, FirestoreClient, Op, Query, Value};
 use firestore::gcloud_sdk::tonic::Status;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -185,4 +185,59 @@ async fn watch_emits_modified_after_update() {
             break;
         }
     }
+}
+
+/// Requiere el emulador (ver la cabecera del archivo).
+#[tokio::test]
+#[ignore = "requiere FIRESTORE_EMULATOR_HOST con el emulador de Firestore en marcha"]
+async fn query_orders_and_limits() {
+    let client = emulator_client().await;
+    let collection = unique("query");
+    for (id, name, level) in [
+        ("a", "uno", 1),
+        ("b", "dos", 5),
+        ("c", "tres", 3),
+        ("d", "x", 9),
+    ] {
+        rest_upsert(
+            &collection,
+            id,
+            &format!(
+                r#"{{"name":{{"stringValue":"{name}"}},"level":{{"integerValue":"{level}"}},
+                    "active":{{"booleanValue":true}},
+                    "updatedAt":{{"timestampValue":"2026-11-02T10:00:00Z"}}}}"#
+            ),
+        )
+        .await;
+    }
+
+    // Filtro de rango + orden descendente + límite (un solo campo: sin índice compuesto).
+    let got: Vec<(String, Sample)> = client
+        .query(
+            &collection,
+            Query {
+                filters: vec![("level".into(), Op::Ge, Value::Integer(3))],
+                order_by: Some(("level".into(), Dir::Desc)),
+                limit: Some(2),
+            },
+        )
+        .await
+        .expect("query");
+    let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["d", "b"]);
+    assert_eq!(got[0].1.level, 9);
+
+    // Filtro de igualdad sin orden ni límite.
+    let named: Vec<(String, Sample)> = client
+        .query(
+            &collection,
+            Query {
+                filters: vec![("name".into(), Op::Eq, Value::String("tres".into()))],
+                ..Query::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].0, "c");
 }
