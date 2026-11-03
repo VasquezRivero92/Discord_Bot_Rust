@@ -137,6 +137,23 @@ where
         self.fresh.invalidate(key).await;
         self.stale.invalidate(key).await;
     }
+
+    /// Como [`TtlCache::invalidate_all`], y además descarta la copia vieja de toda clave para la
+    /// que `keep` es `false` (p. ej. claves que ya no existen en la fuente). Idempotente. Una
+    /// carga en curso no reescribe después una copia vieja descartada (la época cambia).
+    pub async fn invalidate_all_and_purge_stale_unless(&self, keep: impl Fn(&K) -> bool) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.fresh.invalidate_all();
+        let absent: Vec<Arc<K>> = self
+            .stale
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| !keep(key))
+            .collect();
+        for key in absent {
+            self.stale.invalidate(&*key).await;
+        }
+    }
 }
 
 /// Descarta `key` de `cache` si la época cambió desde `seen`. Se comprueba con
@@ -192,6 +209,8 @@ where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    /// La invalidación lanzada en una tarea aparte corre más tarde y puede descartar también una
+    /// entrada más nueva y válida de la misma clave escrita entretanto (solo cuesta una recarga).
     fn drop(&mut self) {
         if !self.changed() {
             return;

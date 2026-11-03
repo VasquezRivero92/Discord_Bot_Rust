@@ -35,12 +35,16 @@ pub enum ChangeEvent {
     /// Documento borrado o que ha dejado de pertenecer a la colección observada.
     Removed(String),
     /// La vista del stream ya no es fiable entera: el listener se reconectó, Firestore reinició
-    /// el target (`RESET`) o el filtro de existencia no cuadró. También se emite en el primer
-    /// `CURRENT` tras cada apertura o `RESET` (la instantánea ya está entera: lo cacheado antes
-    /// pudo borrarse sin evento). Quien cachee la colección debe invalidarla completa (puede
-    /// llegar varias veces seguidas: debe ser idempotente); los eventos posteriores vuelven a
-    /// describir el estado.
+    /// el target (`RESET`) o el filtro de existencia no cuadró. Quien cachee la colección debe
+    /// invalidarla completa (puede llegar varias veces seguidas: debe ser idempotente); los
+    /// eventos posteriores vuelven a describir el estado.
     Reset,
+    /// La instantánea de esta apertura ya es actual (primer `CURRENT` tras cada `ADD` o `RESET`
+    /// del target) y estos son **todos** los ids presentes en la colección, ordenados. Lo
+    /// cacheado entre la apertura y este punto pudo borrarse sin evento (la instantánea
+    /// simplemente no lo trae): quien cachee debe tratarlo como un `Reset` y además descartar
+    /// todo lo que guarde (también copias viejas) de ids que no estén en la lista. Idempotente.
+    Synced(Vec<String>),
 }
 
 /// Cliente Firestore de solo lectura. Barato de clonar (comparte la conexión).
@@ -115,7 +119,7 @@ impl FirestoreClient {
     ///
     /// El stream es perezoso: el listener se abre al pedir el primer elemento y se cierra al
     /// soltar el stream. Primero llega la instantánea inicial (un `Added` por documento
-    /// existente), cerrada por un [`ChangeEvent::Reset`] cuando es actual, y luego los cambios.
+    /// existente), cerrada por un [`ChangeEvent::Synced`] cuando es actual, y luego los cambios.
     /// Las reconexiones las hace el crate por dentro (cada 5 s tras un fallo, reanudando con el
     /// resume token en memoria) y se señalan con [`ChangeEvent::Reset`]. Se emite un `Err` terminal (y el stream termina) si Firestore da
     /// el target por terminado para siempre (p. ej. `PERMISSION_DENIED` por reglas) o si el bucle
@@ -240,7 +244,7 @@ pub(crate) struct WatchState {
     known: HashSet<String>,
     /// Se ha recibido ya el primer `ADD` del target (los siguientes son reconexiones).
     added_once: bool,
-    /// Falta el `CURRENT` de la apertura en curso: el próximo emite `Reset`. Se arma al crear el
+    /// Falta el `CURRENT` de la apertura en curso: el próximo emite `Synced`. Se arma al crear el
     /// estado, en cada `ADD` (también las reconexiones y la resincronización que pide el filtro
     /// de existencia, que quita y vuelve a añadir el target) y en cada `RESET` del target.
     awaiting_current: bool,
@@ -321,10 +325,12 @@ impl WatchState {
                 }
                 // `CURRENT` = la instantánea de esta apertura ya está entera. Lo cacheado entre la
                 // apertura y este punto pudo borrarse sin evento (la instantánea simplemente no
-                // lo trae), así que el primer `CURRENT` tras cada `ADD`/`RESET` emite `Reset`
-                // (un `CURRENT` repetido no). Así llega un `Reset` extra por apertura además del
-                // de la reconexión o del `RESET`; quien consume debe ser idempotente ante
-                // `Reset` repetidos.
+                // lo trae), así que el primer `CURRENT` tras cada `ADD`/`RESET` emite `Synced`
+                // con los ids presentes (`known` está completo en ese punto: tras un `RESET` o la
+                // resincronización se vació y se volvió a llenar; tras reanudar con token, los
+                // borrados intermedios llegan como eventos). Un `CURRENT` repetido no emite nada.
+                // Así llega un evento extra por apertura además del `Reset` de la reconexión o
+                // del `RESET`; quien consume debe ser idempotente.
                 match TargetChangeType::try_from(change.target_change_type).ok()? {
                     TargetChangeType::Add if self.added_once => {
                         self.awaiting_current = true;
@@ -342,7 +348,9 @@ impl WatchState {
                     }
                     TargetChangeType::Current if self.awaiting_current => {
                         self.awaiting_current = false;
-                        Some(ChangeEvent::Reset)
+                        let mut ids: Vec<String> = self.known.iter().cloned().collect();
+                        ids.sort();
+                        Some(ChangeEvent::Synced(ids))
                     }
                     TargetChangeType::NoChange
                     | TargetChangeType::Current
@@ -616,13 +624,19 @@ mod tests {
         assert_eq!(state.on_event(other), None);
     }
 
+    fn synced(ids: &[&str]) -> Option<ChangeEvent> {
+        Some(ChangeEvent::Synced(
+            ids.iter().map(|id| id.to_string()).collect(),
+        ))
+    }
+
     #[test]
     fn first_add_is_silent_and_later_adds_are_reset() {
         let mut state = WatchState::new(TARGET);
         assert_eq!(state.on_event(target_change(TargetChangeType::Add)), None);
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            Some(ChangeEvent::Reset)
+            synced(&[])
         );
         assert_eq!(
             state.on_event(target_change(TargetChangeType::NoChange)),
@@ -636,28 +650,36 @@ mod tests {
     }
 
     #[test]
-    fn first_current_of_each_opening_is_reset() {
+    fn first_current_of_each_opening_is_synced_with_known_ids() {
         let mut state = WatchState::new(TARGET);
         assert_eq!(state.on_event(target_change(TargetChangeType::Add)), None);
+        state.on_event(changed("b"));
         state.on_event(changed("a"));
-        // La instantánea inicial ya es actual: lo cacheado antes puede no estar en ella.
+        // La instantánea inicial ya es actual: lleva todos los ids presentes, ordenados.
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            Some(ChangeEvent::Reset)
+            synced(&["a", "b"])
         );
         // Un CURRENT repetido sin nueva apertura no vuelve a disparar.
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
             None
         );
-        // Reconexión del crate: ADD (Reset) y su CURRENT (otro Reset, como mucho uno extra).
+        // Reconexión del crate (reanuda con token: `known` sigue valiendo; el borrado llega
+        // como evento): ADD (Reset) y su CURRENT (Synced, uno extra).
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Add)),
             Some(ChangeEvent::Reset)
         );
+        let deleted = FirestoreListenEvent::DocumentDelete(DocumentDelete {
+            document: name("faceit_users", "b"),
+            removed_target_ids: vec![TARGET],
+            read_time: None,
+        });
+        state.on_event(deleted);
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            Some(ChangeEvent::Reset)
+            synced(&["a"])
         );
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
@@ -666,18 +688,21 @@ mod tests {
     }
 
     #[test]
-    fn current_after_target_reset_is_reset_once() {
+    fn current_after_target_reset_is_synced_once_with_resent_ids() {
         let mut state = WatchState::new(TARGET);
         state.on_event(target_change(TargetChangeType::Add));
+        state.on_event(changed("a"));
         state.on_event(target_change(TargetChangeType::Current));
         // RESET del target: Firestore reenvía el estado y vuelve a mandar CURRENT.
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Reset)),
             Some(ChangeEvent::Reset)
         );
+        state.on_event(changed("c"));
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            Some(ChangeEvent::Reset)
+            synced(&["c"]),
+            "lo no reenviado tras el RESET ya no está"
         );
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
@@ -697,7 +722,7 @@ mod tests {
         assert_eq!(state.on_event(other), None);
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            Some(ChangeEvent::Reset)
+            synced(&[])
         );
     }
 

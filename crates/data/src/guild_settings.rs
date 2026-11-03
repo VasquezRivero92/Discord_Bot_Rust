@@ -14,7 +14,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -345,8 +345,9 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
     /// `Added`/`Modified` invalidan la clave (conservan la copia vieja para la cuota); `Removed`
     /// la purga (entrada y copia vieja); `Reset` y cualquier error invalidan todo (`Reset` es
     /// idempotente y puede llegar varias veces). Al abrir (y reabrir) el stream se invalida todo,
-    /// y otra vez con el `Reset` que emite el listener cuando su instantánea inicial es actual
-    /// (cubre lo cacheado y borrado entre la apertura y ese momento). Cuando el stream termina
+    /// y otra vez con el `Synced` que emite el listener cuando su instantánea es actual, que
+    /// además purga la copia vieja de los servidores que no están en ella (cubre lo cacheado y
+    /// borrado entre la apertura y ese momento, que nunca recibe `Removed`). Cuando el stream termina
     /// (error o fin) se invalida todo y se reabre con espera exponencial (1 s, el doble cada vez,
     /// tope 60 s; vuelve a 1 s tras un stream que duró más de 60 s). El TTL sigue siendo la única
     /// cota si el listener cae sin avisar.
@@ -375,6 +376,14 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
                     // Borrado: se descarta también la copia vieja (no servirla ante cuota).
                     Ok(ChangeEvent::Removed(id)) => self.cache.purge(&id).await,
                     Ok(ChangeEvent::Reset) => self.cache.invalidate_all(),
+                    // Instantánea actual: lo que no está en ella se borró (quizá sin evento) y
+                    // tampoco se sirve su copia vieja ante cuota.
+                    Ok(ChangeEvent::Synced(ids)) => {
+                        let present: HashSet<String> = ids.into_iter().collect();
+                        self.cache
+                            .invalidate_all_and_purge_stale_unless(|id| present.contains(id))
+                            .await
+                    }
                     Err(_) => {
                         self.cache.invalidate_all();
                         break;
@@ -504,12 +513,16 @@ mod tests {
     /// `FirestoreClient::watch_collection` (sin red).
     struct RawSource {
         docs: Docs,
+        failure: Arc<Mutex<Option<DataError>>>,
         events: Mutex<Option<mpsc::UnboundedReceiver<FirestoreListenEvent>>>,
     }
 
     #[async_trait]
     impl GuildSettingsSource for RawSource {
         async fn fetch(&self, guild_id: &str) -> Result<Option<GuildSettings>, DataError> {
+            if let Some(err) = self.failure.lock().unwrap().clone() {
+                return Err(err);
+            }
             Ok(self.docs.lock().unwrap().get(guild_id).cloned())
         }
 
@@ -540,6 +553,26 @@ mod tests {
         })
     }
 
+    fn doc_changed(id: &str) -> FirestoreListenEvent {
+        FirestoreListenEvent::DocumentChange(
+            firestore::gcloud_sdk::google::firestore::v1::DocumentChange {
+                document: Some(Document {
+                    name: format!("projects/p/databases/(default)/documents/guild_settings/{id}"),
+                    ..Default::default()
+                }),
+                target_ids: vec![TARGET],
+                removed_target_ids: vec![],
+            },
+        )
+    }
+
+    fn admin(role: &str) -> GuildSettings {
+        GuildSettings {
+            admin_role_id: Some(role.into()),
+            ..Default::default()
+        }
+    }
+
     async fn settle() {
         for _ in 0..30 {
             tokio::task::yield_now().await;
@@ -548,7 +581,7 @@ mod tests {
 
     /// Ventana residual de la fase 1: un documento cacheado tras abrir el stream y borrado antes
     /// de que la instantánea inicial sea actual no llega como evento (la instantánea ya no lo
-    /// incluye). El `Reset` del primer `CURRENT` invalida la caché y la lectura recarga.
+    /// incluye). El `Synced` del primer `CURRENT` invalida la caché y la lectura recarga.
     #[tokio::test(start_paused = true)]
     async fn doc_deleted_before_initial_snapshot_is_not_served() {
         let docs: Docs = Arc::default();
@@ -562,6 +595,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let source = RawSource {
             docs: docs.clone(),
+            failure: Arc::default(),
             events: Mutex::new(Some(rx)),
         };
         let repo = Arc::new(FirestoreGuildSettingsRepo::new(
@@ -585,7 +619,52 @@ mod tests {
         assert_eq!(
             repo.get("g1").await.unwrap(),
             None,
-            "tras el Reset del CURRENT la lectura recarga y ve que no existe"
+            "tras el Synced del CURRENT la lectura recarga y ve que no existe"
+        );
+    }
+
+    /// Como el anterior, pero con la recarga fallando por cuota: el documento borrado en la
+    /// ventana (nunca llega su `Removed`) no debe servirse desde la copia vieja. El que sigue en
+    /// la instantánea conserva su copia vieja.
+    #[tokio::test(start_paused = true)]
+    async fn doc_deleted_before_initial_snapshot_is_not_served_under_quota() {
+        let docs: Docs = Arc::default();
+        docs.lock().unwrap().insert("g1".into(), admin("r1"));
+        docs.lock().unwrap().insert("g2".into(), admin("r2"));
+        let failure: Arc<Mutex<Option<DataError>>> = Arc::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let source = RawSource {
+            docs: docs.clone(),
+            failure: failure.clone(),
+            events: Mutex::new(Some(rx)),
+        };
+        let repo = Arc::new(FirestoreGuildSettingsRepo::new(
+            source,
+            Duration::from_secs(3600),
+        ));
+        let _watcher = repo.clone().spawn_watcher();
+        settle().await;
+        tx.send(target_change(TargetChangeType::Add)).unwrap();
+        settle().await;
+        assert_eq!(repo.get("g1").await.unwrap(), Some(admin("r1")));
+        assert_eq!(repo.get("g2").await.unwrap(), Some(admin("r2")));
+
+        // g1 se borra antes de la instantánea; la instantánea solo trae g2.
+        docs.lock().unwrap().remove("g1");
+        tx.send(doc_changed("g2")).unwrap();
+        tx.send(target_change(TargetChangeType::Current)).unwrap();
+        settle().await;
+
+        *failure.lock().unwrap() = Some(DataError::QuotaExceeded);
+        assert_eq!(
+            repo.get("g1").await,
+            Err(DataError::QuotaExceeded),
+            "la copia vieja del borrado en la ventana no se sirve"
+        );
+        assert_eq!(
+            repo.get("g2").await.unwrap(),
+            Some(admin("r2")),
+            "el que sigue existiendo conserva su copia vieja ante cuota"
         );
     }
 }
