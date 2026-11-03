@@ -1,0 +1,22 @@
+# Caso de ejemplo completamente anotado (ver contrast/cases/README.md).
+[[case]]
+name = "stats-con-sesion"          # obligatorio; identifica el caso en el informe
+method = "POST"                    # opcional, por defecto GET
+path = "/api/stats?x=1"            # obligatorio; empieza por '/'
+headers = { "x-test" = "1", "content-type" = "application/json" }
+body = '{"a":1}'                   # cuerpo crudo opcional
+expect_status = 200                # opcional; se exige en ambos lados
+ignore_fields = ["timestamp", "users.*.last_seen", "data.0.id"]
+ignore_headers = ["cache-control"]
+
+[case.cookie_jwt]                  # opcional; se firma con --jwt-secret
+user_id = "123"
+username = "tester"
+avatar = "abc"
+is_admin = true
+role = "admin"
+servidor = "s1"
+
+[[case]]
+name = "minimo"
+path = "/health"
