@@ -17,6 +17,11 @@
 //! * Directory requests without trailing slash redirect with 307 (tower-http), Express uses 301.
 //! * No ETag / If-None-Match: only Last-Modified / If-Modified-Since are supported.
 //! * The `assets` cache rule is matched on the URL path, Express matches the absolute file path.
+//! * In `web::build_app` this router sits inside the HTTPS redirect: in production a static
+//!   file requested over plain http gets a 301 to https, whereas the legacy served
+//!   `express.static` (156) before its redirect (169). Deliberate and harmless behind
+//!   Cloudflare, where everything arrives as https. It is exempt from the rate limit, though
+//!   (see `web::middleware`).
 
 use std::convert::Infallible;
 use std::path::PathBuf;

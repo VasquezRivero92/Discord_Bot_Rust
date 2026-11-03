@@ -60,7 +60,13 @@ pub struct AppDeps {
 /// (one bucket per client key) applied to the migrated routes and to the proxy
 /// only: whatever `static_files` answers itself (files, SPA and legal entry
 /// routes) is exempt, like `express.static` running before `globalLimiter` in
-/// the legacy; what `static_files` hands to the proxy is limited. Serve it with
+/// the legacy; what `static_files` hands to the proxy is limited.
+///
+/// Deliberate differences from the legacy: static files also go through the
+/// HTTPS redirect (the legacy served `express.static` before its redirect; no
+/// effect behind Cloudflare), and WebSocket upgrades now pass through CORS, the
+/// HTTPS redirect and the rate limit (the legacy `server.on('upgrade')`
+/// bypassed every Express middleware). See `docs/runbook-corte.md` §1. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`.
 pub fn build_app(deps: AppDeps) -> Router {
     let cfg = &deps.config;

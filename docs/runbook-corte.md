@@ -44,6 +44,28 @@ Rust y otra vez en Node.
 Si Node no responde, el proxy devuelve
 `502 {"error":"Servicio no disponible"}` y lo migrado sigue funcionando.
 
+Diferencias deliberadas con el legado:
+
+- **Estáticos por http en producción.** Rust redirige a https también los
+  archivos estáticos. En el legado, `express.static` (index.js:156) servía antes
+  de la redirección (169). Detrás de Cloudflare todo llega como https, así que
+  la diferencia no tiene efecto práctico.
+- **WebSocket.** Las actualizaciones a WebSocket (`/api/lobby/mixton-ws`) pasan
+  ahora por CORS, la redirección HTTPS y el rate limit de Rust. En el legado,
+  `server.on('upgrade')` (index.js:~601) no pasaba por ningún middleware de
+  Express. Esto tiene dos riesgos:
+  - Si `CORS_ORIGINS` está definido y no incluye el origen del propio sitio
+    (`https://machupeek.com`), el navegador recibe **403** al abrir el WebSocket
+    del lobby, porque envía `Origin` en el upgrade. Con `CORS_ORIGINS` vacío y
+    `NODE_ENV=production` se acepta el origen de `BASE_URL`.
+  - Cada upgrade cuenta como una petición en el rate limit, y con el cubo
+    agotado se rechaza con 429. Una vez abierta, la conexión no consume más
+    cuota.
+- **Proto con varias entradas.** `X-Forwarded-Proto` se interpreta como en
+  Express (`trust proxy 1`): cuenta la primera entrada, sin espacios. Rust la
+  compara sin distinguir mayúsculas (Express sí distingue; Cloudflare siempre
+  envía minúsculas).
+
 ## 2. Requisitos previos
 
 - Docker Desktop (Windows) o Docker Engine con compose v2, y el árbol
@@ -80,6 +102,12 @@ legado: tiene secretos (Faceit, Yape, Steam...) que Rust no usa.
 | `TRUST_CF_CONNECTING_IP` | `1` **solo si se cumple 3.2** | ver abajo |
 | `PROXY_APPEND_PEER_TO_XFF` | vacío (no) | ver abajo |
 | `FIRESTORE_*`, `FIREBASE_SERVICE_ACCOUNT_PATH` | ver 3.3 | |
+
+**Secretos de Discord sin uso en esta fase.** `Config` exige `DISCORD_TOKEN`
+(el token del bot de producción) y `DISCORD_CLIENT_SECRET` aunque ninguna ruta
+montada en la fase 1 los use: el callback OAuth sigue en Node. Con eso, el token
+del bot vive también en un segundo contenedor. Es una limitación conocida.
+**Fase 2:** hacerlos opcionales hasta que una ruta los necesite.
 
 **`TRUST_CF_CONNECTING_IP`.** Con `1`, el rate limit usa la cabecera
 `CF-Connecting-IP` como identidad del cliente. Si no, usa la entrada más a la
@@ -268,7 +296,7 @@ arranca con un `.env` de PRUEBA.
 | Node por el proxy | `curl -s https://machupeek.com/health` | JSON del legado con `discord` |
 | Login Discord de punta a punta | navegador: `https://machupeek.com/auth/discord` -> autorizar -> callback (Node, por el proxy) | vuelve al sitio con sesión; `/api/admin/me` responde con el usuario |
 | Página admin | `https://machupeek.com/admin` con un usuario admin | carga y sus llamadas `/api/admin/*` responden |
-| WebSocket del lobby | abrir `/mixton` y el chat del lobby | conecta (`/api/lobby/mixton-ws` tunelizado) y llegan mensajes |
+| WebSocket del lobby | abrir `/mixton` y el chat del lobby | conecta (`/api/lobby/mixton-ws` tunelizado) y llegan mensajes. Si falla con 403, revisa que `CORS_ORIGINS` incluya el origen del sitio; si falla con 429, es el rate limit (sección 1) |
 | Webhook | enviar un webhook de prueba desde Faceit (o esperar uno real) | llega a Node: `docker compose -f /d/Discord_Faceit/docker-compose.yml logs discord-faceit-bot` |
 | Logs Rust | `docker compose logs -f web` | sin errores; sin 502 continuos |
 | IP real en Node | logs de Node o rate limit de Node | IP del visitante, no la de un contenedor |
@@ -291,8 +319,10 @@ proxy es transparente.
 ### 5.2 Modo de fallo: redirección HTTPS en bucle
 
 En producción (`BASE_URL` con `https` o `NODE_ENV=production`), Rust responde
-`301 https://<host><ruta>` a toda petición que no traiga
-`X-Forwarded-Proto: https` (la primera entrada). cloudflared reenvía esa
+`301 https://<host><ruta>` a toda petición cuya **primera entrada** de
+`X-Forwarded-Proto` (separada por comas, sin espacios y sin distinguir
+mayúsculas) no sea `https`. Con `https, http` no redirige; con `http, https`,
+sí. `/api/ping` informa `protocol` y `secure` con la misma regla. cloudflared reenvía esa
 cabecera que pone Cloudflare. Si se pierde por el camino (un proxy intermedio,
 un Service mal configurado), el sitio entra en un bucle: todas las respuestas
 son 301 a la misma URL y el navegador termina con "demasiadas redirecciones".
@@ -409,6 +439,18 @@ al destino que anotaste en los requisitos previos, todo sin el mapeo
   limitan por separado. Lo que pasa por el proxy consume cuota en ambos. Lo
   que sirve `static_files` no consume cuota en ninguno; las rutas SPA y legales,
   que el legado sí limitaba, quedan exentas a propósito (ver sección 1).
+- **WebSocket por los middlewares de Rust.** CORS (403 si el origen del sitio
+  falta en `CORS_ORIGINS`) y rate limit (cada upgrade cuenta). En el legado no
+  pasaban por ningún middleware (ver sección 1).
+- **Secretos de Discord exigidos sin uso** (ver 3.1). Fase 2: hacerlos opcionales.
+- **Imagen de cloudflared sin fijar ni endurecer.** `docker-compose.yml` usa
+  `cloudflare/cloudflared:latest`, como el legado. Recomendación: fijar la
+  etiqueta estable vigente tras consultarla en el registro (Docker Hub
+  `cloudflare/cloudflared`). Añadir al servicio `tunnel` el mismo
+  endurecimiento que `web` (`read_only: true`, `cap_drop: [ALL]`,
+  `security_opt: [no-new-privileges:true]`) **solo después de probar** que el
+  túnel funciona así en un entorno de prueba. No se ha cambiado aquí porque la
+  etiqueta no se pudo verificar.
 - **Cierre de conexiones largas.** Al parar, los WebSocket y SSE abiertos se
   cortan a los 8 s y los clientes tienen que reconectar.
 
