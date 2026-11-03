@@ -37,6 +37,9 @@ pub struct AppDeps {
     /// Source for `GET /api/reclamaciones/:code`. `None` (Firestore disabled)
     /// leaves that route on the proxy: no failing handler is registered.
     pub claims: Option<Arc<dyn ClaimsRepo>>,
+    /// Sources for the migrated `/api/admin/*` reads (Task 7). `None`
+    /// (Firestore disabled) leaves those routes on the proxy.
+    pub admin: Option<routes::admin::AdminRepos>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -46,7 +49,9 @@ pub struct AppDeps {
 /// 1. migrated routes: `GET /api/ping`, `GET /api/products`,
 ///    `GET /api/reclamaciones/:code` (only with a claims source),
 ///    `GET /auth/discord`, `GET /auth/logout`, and the migrated
-///    `/api/admin/*` routes (`routes::admin::router`, none yet);
+///    `/api/admin/*` routes (`routes::admin::router`: the single-collection
+///    reads `claims`, `claims/:code`, `orders`, `logs`, `support-calls`,
+///    `messages` and `matches/history`, only with admin sources);
 /// 2. a wrong method on one of those paths (e.g. `POST /api/ping`) goes to
 ///    the proxy instead of axum's 405 (`method_not_allowed_fallback`);
 /// 3. static files and SPA routes (`static_files::routes_with_fallback`);
@@ -92,7 +97,10 @@ pub fn build_app(deps: AppDeps) -> Router {
     // secreto válido (imposible con `Config::from_map`) no se monta nada.
     match session::SessionState::from_config(cfg) {
         Ok(session) => {
-            migrated = migrated.merge(routes::admin::router(routes::admin::AdminState { session }));
+            migrated = migrated.merge(routes::admin::router(
+                routes::admin::AdminState { session },
+                deps.admin,
+            ));
         }
         Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
     }

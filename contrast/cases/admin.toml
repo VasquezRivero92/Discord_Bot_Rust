@@ -2,6 +2,10 @@
 # (`verifyAdminToken`, middleware/auth.js). En la Tarea 6 Rust aun no atiende ninguna
 # ruta de /api/admin (todas pasan por el proxy); estos casos fijan el contrato que las
 # rutas de las Tareas 7 y 8 deben conservar. Las tokens firmadas usan --jwt-secret.
+#
+# Tarea 7: lecturas de una coleccion (claims, claims/:code, orders, logs, support-calls,
+# messages, matches/history). Rust las atiende solo con Firestore configurado (el mismo
+# proyecto o emulador que Node). Sesion de prueba: global_admin sin servidor.
 
 [[case]]
 name = "admin claims sin cookie"
@@ -27,6 +31,220 @@ expect_status = 401
 [[case]]
 name = "admin claims con usuario sin permisos"
 path = "/api/admin/claims"
+expect_status = 403
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-usuario"
+is_admin = false
+role = "usuario"
+
+[[case]]
+name = "admin claims lista"
+path = "/api/admin/claims"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin claims por estado"
+path = "/api/admin/claims?status=PENDIENTE"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin claims estado vacio es null"
+path = "/api/admin/claims?status="
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin claims limit no numerico"
+path = "/api/admin/claims?limit=abc"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# slice(0, -1): todas menos la ultima
+[[case]]
+name = "admin claims limit negativo"
+path = "/api/admin/claims?limit=-1"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin claims limit 7x"
+path = "/api/admin/claims?limit=7x"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin claim inexistente"
+path = "/api/admin/claims/LR-0000-contraste"
+expect_status = 404
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin orders lista"
+path = "/api/admin/orders"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin orders limit 0"
+path = "/api/admin/orders?limit=0"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin orders por estado"
+path = "/api/admin/orders?status=COMPLETADA"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin support-calls"
+path = "/api/admin/support-calls"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin support-calls guildId vacio"
+path = "/api/admin/support-calls?guildId="
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin messages"
+path = "/api/admin/messages"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin matches history"
+path = "/api/admin/matches/history"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# safeLimit = max(-5, 1) = 1
+[[case]]
+name = "admin matches history limit negativo"
+path = "/api/admin/matches/history?limit=-5"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin matches history limit grande"
+path = "/api/admin/matches/history?limit=500"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# Firestore rechaza el limite negativo y getRecentLogs da []
+[[case]]
+name = "admin logs limit negativo"
+path = "/api/admin/logs?limit=-5"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# El bot escribe logs sin parar y cada lado tiene su cache de 30 s: puede diferir si entra un log entre las dos lecturas
+[[case]]
+name = "admin logs limit 3"
+path = "/api/admin/logs?limit=3"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# strict_true: `isAdmin` debe ser el booleano true; aqui no hay rol de admin.
+[[case]]
+name = "admin logs con usuario sin permisos"
+path = "/api/admin/logs"
 expect_status = 403
 
 [case.cookie_jwt]

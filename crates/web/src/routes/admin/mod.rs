@@ -15,12 +15,24 @@
 //!
 //! [`router`] solo define rutas ya migradas; todo lo demás bajo `/api/admin`
 //! (escrituras, rutas que dependen de Discord o del estado de Node, ...) no casa
-//! aquí y cae al proxy hacia Node. En esta tarea aún no hay ninguna ruta.
+//! aquí y cae al proxy hacia Node. Las lecturas de una colección
+//! ([`simple_reads`], Tarea 7) solo se montan con [`AdminRepos`], es decir, con
+//! Firestore configurado; sin él siguen en el proxy.
 
 pub mod auth;
+mod js;
+mod qs;
+pub mod simple_reads;
 pub mod target_guild;
 
+use std::sync::Arc;
+
 use axum::{extract::FromRef, Router};
+use data::{
+    ClaimsRepo, FirestoreClaimsRepo, FirestoreClient, FirestoreLogsRepo, FirestoreMatchHistoryRepo,
+    FirestoreMessagesRepo, FirestoreOrdersRepo, FirestoreSupportCallsRepo, LogsRepo,
+    MatchHistoryRepo, MessagesRepo, OrdersRepo, SupportCallsRepo,
+};
 
 use crate::session::SessionState;
 
@@ -39,13 +51,43 @@ impl FromRef<AdminState> for SessionState {
     }
 }
 
-/// Rutas migradas de `/api/admin/*` (rutas completas, sin `nest`), sin
-/// fallback propio: el llamador lo fusiona antes del proxy.
-pub fn router(state: AdminState) -> Router {
-    routes().with_state(state)
+/// Fuentes de datos de las rutas de administración migradas.
+#[derive(Clone)]
+pub struct AdminRepos {
+    pub claims: Arc<dyn ClaimsRepo>,
+    pub orders: Arc<dyn OrdersRepo>,
+    pub logs: Arc<dyn LogsRepo>,
+    pub support_calls: Arc<dyn SupportCallsRepo>,
+    pub match_history: Arc<dyn MatchHistoryRepo>,
+    pub messages: Arc<dyn MessagesRepo>,
 }
 
-/// Las rutas se añaden aquí a medida que se migran (Tareas 7 y 8).
+impl AdminRepos {
+    /// Todos los repos sobre una misma conexión a Firestore.
+    pub fn firestore(client: &FirestoreClient) -> Self {
+        Self {
+            claims: Arc::new(FirestoreClaimsRepo::new(client.clone())),
+            orders: Arc::new(FirestoreOrdersRepo::new(client.clone())),
+            logs: Arc::new(FirestoreLogsRepo::new(client.clone())),
+            support_calls: Arc::new(FirestoreSupportCallsRepo::new(client.clone())),
+            match_history: Arc::new(FirestoreMatchHistoryRepo::new(client.clone())),
+            messages: Arc::new(FirestoreMessagesRepo::new(client.clone())),
+        }
+    }
+}
+
+/// Rutas migradas de `/api/admin/*` (rutas completas, sin `nest`), sin
+/// fallback propio: el llamador lo fusiona antes del proxy. Sin `repos`
+/// (Firestore desactivado) no se monta ninguna lectura.
+pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
+    let mut router = routes().with_state(state.clone());
+    if let Some(repos) = repos {
+        router = router.merge(simple_reads::router(state.session, repos));
+    }
+    router
+}
+
+/// Rutas que solo necesitan la sesión (ninguna todavía; Tarea 8).
 fn routes() -> Router<AdminState> {
     Router::new()
 }

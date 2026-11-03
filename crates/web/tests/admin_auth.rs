@@ -470,6 +470,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
     let front = serve(build_app(AppDeps {
         config: Config::from_map(&vars).unwrap(),
         claims: None,
+        admin: None,
     }))
     .await;
 

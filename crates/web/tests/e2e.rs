@@ -151,6 +151,7 @@ impl Front {
         let addr = serve(build_app(AppDeps {
             config: cfg,
             claims,
+            admin: None,
         }))
         .await;
         Front {
@@ -316,6 +317,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
     let addr = serve(build_app(AppDeps {
         config: cfg,
         claims: None,
+        admin: None,
     }))
     .await;
     let c = client();

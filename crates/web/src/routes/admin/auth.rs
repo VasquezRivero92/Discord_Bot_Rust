@@ -47,6 +47,10 @@ pub enum AdminError {
     /// 400: `guildId` no representable como una sola cadena (ver
     /// [`super::resolve_target_guild_id`]).
     InvalidGuildId,
+    /// 400 (nuevo, sin equivalente en el legacy): un parámetro de la query que
+    /// Express convertiría en un array u objeto que Rust no reproduce; el
+    /// mensaje nombra el parámetro (p. ej. `limit inválido`).
+    InvalidQuery(&'static str),
 }
 
 impl AdminError {
@@ -54,7 +58,7 @@ impl AdminError {
         match self {
             Self::Session(r) => r.status(),
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::InvalidGuildId => StatusCode::BAD_REQUEST,
+            Self::InvalidGuildId | Self::InvalidQuery(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -63,6 +67,7 @@ impl AdminError {
             Self::Session(r) => r.message(),
             Self::Forbidden(m) => m,
             Self::InvalidGuildId => MSG_INVALID_GUILD_ID,
+            Self::InvalidQuery(m) => m,
         }
     }
 }

@@ -117,25 +117,25 @@ Generado por `node tools/inventory.mjs <ruta-legacy>`. Las columnas `colecciones
 | POST | /api/admin/settings | requireAuth | routes/api.js | 1263 | faceit_config, guild_settings, faceit_bot_logs | gateway? | proxy | Pasa client a helpers; verificar |
 | POST | /api/admin/features/:key | requireAuth | routes/api.js | 1376 | guild_settings, faceit_config, faceit_bot_logs | gateway? | proxy | Usa client; verificar |
 | POST | /api/admin/features-batch | requireAuth | routes/api.js | 1431 | guild_settings, faceit_config, faceit_bot_logs | no | proxy |  |
-| GET | /api/admin/matches/history | requireAuth | routes/api.js | 1486 | faceit_matches_history | no | 1 |  |
+| GET | /api/admin/matches/history | requireAuth | routes/api.js | 1486 | faceit_matches_history | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ history }`; `parseInt(limit)` o `20` si es falsy y `safeLimit` 1..50 de `getMatchHistory`; servidor objetivo; error de lectura -> `{ history: [] }`. Sin la caché de 5 min de `database.js` (la invalidan escrituras de Node que Rust no ve). Solo con Firestore configurado |
 | DELETE | /api/admin/matches/history/:id | requireAuth | routes/api.js | 1505 | faceit_matches_history, faceit_bot_logs | no | proxy |  |
 | GET | /api/admin/matches/:id/demo | requireAuth | routes/api.js | 1521 | faceit_active_matches | no | 1 |  |
 | GET | /api/admin/matches/:id/stats | requireAuth | routes/api.js | 1552 | - | no | 1 | Proxy a Faceit API (open.faceit.com) |
 | POST | /api/admin/simulate-webhook | requireAuth | routes/api.js | 1575 | - | ? | proxy | Invoca handleFaceitWebhook(payload, client, db); solo global_admin |
-| GET | /api/admin/logs | requireAuth | routes/api.js | 1596 | faceit_bot_logs | no | 1 |  |
+| GET | /api/admin/logs | requireAuth | routes/api.js | 1596 | faceit_bot_logs | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ logs }`; caché de 30 s por `"{guild o global}:{limit}"` en la ruta (también guarda el `[]` de un error); `parseInt(limit)` o `50` si es falsy; límite negativo -> `[]`. Solo con Firestore configurado |
 | POST | /api/admin/panel/refresh | requireAuth | routes/api.js | 1617 | faceit_config | gateway? | proxy | updateLivePanel(client, channelId): edita mensaje del panel; candidato a fase 3 (bot-only) |
 | GET | /api/admin/status | requireAuth | routes/api.js | 1641 | - | gateway? | 1 | client.readyAt + guilds.fetch; estado del bot |
 | POST | /api/admin/broadcast | requireAuth | routes/api.js | 1659 | faceit_users, faceit_bot_logs | REST | proxy | Envia DMs/mensajes |
-| GET | /api/admin/support-calls | requireAuth | routes/api.js | 1731 | faceit_support_calls | no | 1 |  |
+| GET | /api/admin/support-calls | requireAuth | routes/api.js | 1731 | faceit_support_calls | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ calls }`, 50 fijas, servidor objetivo; error de lectura -> `{ calls: [] }`. Solo con Firestore configurado |
 | POST | /api/admin/support-calls/:id/resolve | requireAuth | routes/api.js | 1742 | faceit_support_calls, faceit_bot_logs | gateway? | proxy | guilds.cache.get con fallback fetch; envia DM y alerta |
-| GET | /api/admin/messages | requireAuth | routes/api.js | 1825 | faceit_config (messages) | no | 1 |  |
+| GET | /api/admin/messages | requireAuth | routes/api.js | 1825 | faceit_config (messages) | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ templates }`; sin documento, las de por defecto; error -> últimas leídas o las de por defecto. Sin la caché de 6 h (la invalida `POST /messages`, que sigue en Node). Solo con Firestore configurado |
 | POST | /api/admin/messages | requireAuth | routes/api.js | 1835 | faceit_config (messages), faceit_bot_logs | no | proxy |  |
 | GET | /api/admin/guilds | requireAuth | routes/api.js | 1851 | - | gateway? | proxy | client.guilds.cache (gateway), memberCount/iconURL no reproducibles por REST de forma exacta; fallback a DISCORD_GUILD_ID; REST: GET /users/@me/guilds |
-| GET | /api/admin/claims | requireAuth | routes/api.js | 1880 | claims | no | 1 |  |
-| GET | /api/admin/claims/:code | requireAuth | routes/api.js | 1892 | claims | no | 1 |  |
+| GET | /api/admin/claims | requireAuth | routes/api.js | 1880 | claims | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ claims }`; `status` o `null` si es falsy, `parseInt(limit, 10)` o `100` si es falsy y `slice(0, limit)` (negativo quita los últimos); error -> `{ claims: [] }`. Solo con Firestore configurado |
+| GET | /api/admin/claims/:code | requireAuth | routes/api.js | 1892 | claims | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ claim }`; inexistente o error de lectura -> 404 `Reclamación no encontrada`. Solo con Firestore configurado |
 | POST | /api/admin/claims/:code/respond | requireAuth | routes/api.js | 1905 | claims, faceit_bot_logs | no | proxy |  |
 | DELETE | /api/admin/claims/:code | requireAuth | routes/api.js | 1939 | claims | no | proxy |  |
-| GET | /api/admin/orders | requireAuth | routes/api.js | 1956 | orders | no | 1 |  |
+| GET | /api/admin/orders | requireAuth | routes/api.js | 1956 | orders | no | 1 | migrado (Tarea 7, `routes::admin::simple_reads`): `{ orders }`; como `/claims`; error -> `{ orders: [] }`. Solo con Firestore configurado |
 | POST | /api/admin/orders/:id/status | requireAuth | routes/api.js | 1968 | orders, faceit_bot_logs | no | proxy |  |
 | GET | /api/admin/yape/transactions | requireAuth | routes/api.js | 1989 | yape_transacciones, yape_operations, yape_audit_logs | no | 1 |  |
 | POST | /api/admin/yape/manual-approve | requireAuth | routes/api.js | 2024 | yape_operations, yape_audit_logs, faceit_users, faceit_bot_logs | no | proxy | Transaccion Firestore |
