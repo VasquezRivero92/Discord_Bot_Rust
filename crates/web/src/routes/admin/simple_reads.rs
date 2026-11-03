@@ -30,7 +30,6 @@
 //! Firestore (logs), `slice(0, limit)` (claims, orders) o el `safeLimit` de
 //! `getMatchHistory` (historial).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +47,7 @@ use tokio::time::Instant;
 
 use super::js::{self, Radix};
 use super::qs::{percent_decode_strict, query_param, QsParam};
+use super::route_cache::RouteCache;
 use super::{resolve_target_guild_id, AdminContext, AdminError, AdminRepos};
 use crate::routes::json_response;
 use crate::session::SessionState;
@@ -55,7 +55,7 @@ use crate::session::SessionState;
 /// `BOT_LOGS_TTL` (`routes/api.js:307`).
 pub const BOT_LOGS_TTL: Duration = Duration::from_secs(30);
 /// Tope de claves de la caché de logs (el `Map` del legacy no tiene tope).
-pub const LOGS_CACHE_MAX_KEYS: usize = 1000;
+pub const LOGS_CACHE_MAX_KEYS: usize = super::route_cache::ROUTE_CACHE_MAX_KEYS;
 /// `db.getSupportCalls(50, ...)` (`routes/api.js:1734`).
 const SUPPORT_CALLS_LIMIT: u32 = 50;
 
@@ -73,7 +73,7 @@ const MSG_HISTORY: &str = "Error al obtener el historial de partidas";
 pub(crate) struct ReadsState {
     session: SessionState,
     repos: AdminRepos,
-    logs_cache: Arc<LogsCache>,
+    logs_cache: Arc<RouteCache>,
     /// Últimas plantillas leídas con éxito (el `messageTemplatesCache` al que
     /// el legacy recurre ante un error).
     last_templates: Arc<Mutex<Option<Value>>>,
@@ -98,7 +98,7 @@ pub(crate) fn router(session: SessionState, repos: AdminRepos) -> Router {
         .with_state(ReadsState {
             session,
             repos,
-            logs_cache: Arc::default(),
+            logs_cache: Arc::new(RouteCache::new(BOT_LOGS_TTL)),
             last_templates: Arc::default(),
         })
 }
@@ -411,37 +411,6 @@ impl<S: Send + Sync> FromRequestParts<S> for ClaimCode {
     }
 }
 
-/// La caché de `/logs` del legacy (`botLogsCache`): cada clave guarda la lista
-/// y el instante en que **empezó** la petición que la leyó; vale mientras
-/// `now - instante < 30 s`. Sin carga única por clave (el legacy tampoco la
-/// tiene). Con [`LOGS_CACHE_MAX_KEYS`] claves, al meter una nueva se purgan
-/// las caducadas y, si siguen sin caber, se vacía.
-#[derive(Default)]
-pub(crate) struct LogsCache {
-    entries: Mutex<HashMap<String, (Instant, Arc<Value>)>>,
-}
-
-impl LogsCache {
-    fn get(&self, key: &str, now: Instant) -> Option<Arc<Value>> {
-        let entries = self.entries.lock().expect("mutex envenenado");
-        entries
-            .get(key)
-            .filter(|(at, _)| now.saturating_duration_since(*at) < BOT_LOGS_TTL)
-            .map(|(_, logs)| logs.clone())
-    }
-
-    fn insert(&self, key: String, at: Instant, logs: Arc<Value>) {
-        let mut entries = self.entries.lock().expect("mutex envenenado");
-        if entries.len() >= LOGS_CACHE_MAX_KEYS && !entries.contains_key(&key) {
-            entries.retain(|_, (t, _)| at.saturating_duration_since(*t) < BOT_LOGS_TTL);
-            if entries.len() >= LOGS_CACHE_MAX_KEYS {
-                entries.clear();
-            }
-        }
-        entries.insert(key, (at, logs));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,20 +497,5 @@ mod tests {
             status_param("status=a&status=b"),
             Err(AdminError::InvalidQuery("status inválido"))
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cache_entry_expires_after_ttl_and_is_bounded() {
-        let c = LogsCache::default();
-        let t0 = Instant::now();
-        c.insert("global:50".into(), t0, Arc::new(json!([1])));
-        assert!(c
-            .get("global:50", t0 + Duration::from_millis(29_999))
-            .is_some());
-        assert!(c.get("global:50", t0 + BOT_LOGS_TTL).is_none());
-        for i in 0..LOGS_CACHE_MAX_KEYS {
-            c.insert(format!("k{i}"), t0, Arc::new(json!([])));
-        }
-        assert!(c.entries.lock().unwrap().len() <= LOGS_CACHE_MAX_KEYS);
     }
 }

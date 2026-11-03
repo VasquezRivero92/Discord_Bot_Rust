@@ -19,12 +19,13 @@ use axum::{
 use common::config::Config;
 use data::{
     default_message_templates, DataError, FakeLogsRepo, FakeMatchHistoryRepo, FakeMessagesRepo,
-    FakeOrdersRepo, FakeSupportCallsRepo, InMemoryClaimsRepo, LogEntry, LogsRepo,
+    FakeOrdersRepo, FakeSupportCallsRepo, FirestoreAdminDocsRepo, InMemoryClaimsRepo,
+    InMemoryGlobalSettingsRepo, InMemoryNodeDocs, LogEntry, LogsRepo,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
-use web::routes::admin::{router, AdminRepos, AdminState};
+use web::routes::admin::{router, AdminCaches, AdminRepos, AdminState};
 use web::session::{new_claims, sign, SessionClaims, SessionState};
 use web::{build_app, AppDeps};
 
@@ -108,6 +109,12 @@ impl Fakes {
             support_calls: self.calls.clone(),
             match_history: self.history.clone(),
             messages: self.messages.clone(),
+            global_settings: Arc::new(InMemoryGlobalSettingsRepo::new()),
+            docs: Arc::new(FirestoreAdminDocsRepo::new(Arc::new(
+                InMemoryNodeDocs::new(),
+            ))),
+            caches: AdminCaches::default(),
+            watchers: Vec::new(),
         }
     }
 
@@ -743,7 +750,7 @@ async fn reads_mount_only_with_firestore() {
             ("DELETE", "/api/admin/claims/LR-2026-000001"),
             ("POST", "/api/admin/messages"),
             ("GET", "/api/admin/claims/LR-1/extra"),
-            ("GET", "/api/admin/stats"),
+            ("GET", "/api/admin/settings"),
         ] {
             let res = client
                 .request(method.parse().unwrap(), format!("http://{front}{path}"))

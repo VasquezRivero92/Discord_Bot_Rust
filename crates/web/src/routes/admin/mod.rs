@@ -16,12 +16,15 @@
 //! [`router`] solo define rutas ya migradas; todo lo demás bajo `/api/admin`
 //! (escrituras, rutas que dependen de Discord o del estado de Node, ...) no casa
 //! aquí y cae al proxy hacia Node. Las lecturas de una colección
-//! ([`simple_reads`], Tarea 7) solo se montan con [`AdminRepos`], es decir, con
-//! Firestore configurado; sin él siguen en el proxy.
+//! ([`simple_reads`], Tarea 7) y las derivadas ([`derived_reads`], Tarea 8) solo
+//! se montan con [`AdminRepos`], es decir, con Firestore configurado; sin él
+//! siguen en el proxy.
 
 pub mod auth;
+pub mod derived_reads;
 mod js;
 mod qs;
+mod route_cache;
 pub mod simple_reads;
 pub mod target_guild;
 
@@ -29,14 +32,17 @@ use std::sync::Arc;
 
 use axum::{extract::FromRef, Router};
 use data::{
-    ClaimsRepo, FirestoreClaimsRepo, FirestoreClient, FirestoreLogsRepo, FirestoreMatchHistoryRepo,
-    FirestoreMessagesRepo, FirestoreOrdersRepo, FirestoreSupportCallsRepo, LogsRepo,
-    MatchHistoryRepo, MessagesRepo, OrdersRepo, SupportCallsRepo,
+    AdminDocsRepo, ClaimsRepo, FirestoreAdminDocsRepo, FirestoreClaimsRepo, FirestoreClient,
+    FirestoreGlobalSettingsRepo, FirestoreLogsRepo, FirestoreMatchHistoryRepo,
+    FirestoreMessagesRepo, FirestoreOrdersRepo, FirestoreSupportCallsRepo, GlobalSettingsRepo,
+    LogsRepo, MatchHistoryRepo, MessagesRepo, OrdersRepo, SupportCallsRepo, WatcherHandle,
+    GLOBAL_SETTINGS_TTL,
 };
 
 use crate::session::SessionState;
 
 pub use auth::{AdminContext, AdminError};
+pub use derived_reads::{invalidate_after_legacy_writes, AdminCaches};
 pub use target_guild::{ensure_manages_guild, resolve_target_guild_id};
 
 /// Estado de las rutas de administración.
@@ -51,7 +57,8 @@ impl FromRef<AdminState> for SessionState {
     }
 }
 
-/// Fuentes de datos de las rutas de administración migradas.
+/// Fuentes de datos de las rutas de administración migradas, y las cachés
+/// que deben compartir con la capa [`invalidate_after_legacy_writes`].
 #[derive(Clone)]
 pub struct AdminRepos {
     pub claims: Arc<dyn ClaimsRepo>,
@@ -60,11 +67,26 @@ pub struct AdminRepos {
     pub support_calls: Arc<dyn SupportCallsRepo>,
     pub match_history: Arc<dyn MatchHistoryRepo>,
     pub messages: Arc<dyn MessagesRepo>,
+    /// `getSettings()` (para `features` de `/stats`).
+    pub global_settings: Arc<dyn GlobalSettingsRepo>,
+    /// Documentos completos: `/stats`, `/users/backup`, `/yape/transactions`.
+    pub docs: Arc<dyn AdminDocsRepo>,
+    /// Cachés de `/stats` y `/yape/transactions`.
+    pub caches: AdminCaches,
+    /// Tareas que deben vivir tanto como los repos (watcher de los ajustes
+    /// globales); soltar el último clon las detiene.
+    pub watchers: Vec<Arc<WatcherHandle>>,
 }
 
 impl AdminRepos {
-    /// Todos los repos sobre una misma conexión a Firestore.
+    /// Todos los repos sobre una misma conexión a Firestore. Lanza el watcher
+    /// de `faceit_config/settings` (necesita un runtime de tokio).
     pub fn firestore(client: &FirestoreClient) -> Self {
+        let global = Arc::new(FirestoreGlobalSettingsRepo::from_client(
+            client.clone(),
+            GLOBAL_SETTINGS_TTL,
+        ));
+        let watcher = Arc::new(global.clone().spawn_watcher());
         Self {
             claims: Arc::new(FirestoreClaimsRepo::new(client.clone())),
             orders: Arc::new(FirestoreOrdersRepo::new(client.clone())),
@@ -72,6 +94,10 @@ impl AdminRepos {
             support_calls: Arc::new(FirestoreSupportCallsRepo::new(client.clone())),
             match_history: Arc::new(FirestoreMatchHistoryRepo::new(client.clone())),
             messages: Arc::new(FirestoreMessagesRepo::new(client.clone())),
+            global_settings: global,
+            docs: Arc::new(FirestoreAdminDocsRepo::new(client.clone())),
+            caches: AdminCaches::default(),
+            watchers: vec![watcher],
         }
     }
 }
@@ -82,7 +108,9 @@ impl AdminRepos {
 pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
     let mut router = routes().with_state(state.clone());
     if let Some(repos) = repos {
-        router = router.merge(simple_reads::router(state.session, repos));
+        router = router
+            .merge(simple_reads::router(state.session.clone(), repos.clone()))
+            .merge(derived_reads::router(state.session, repos));
     }
     router
 }

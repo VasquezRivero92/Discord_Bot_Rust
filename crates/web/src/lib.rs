@@ -37,7 +37,7 @@ pub struct AppDeps {
     /// Source for `GET /api/reclamaciones/:code`. `None` (Firestore disabled)
     /// leaves that route on the proxy: no failing handler is registered.
     pub claims: Option<Arc<dyn ClaimsRepo>>,
-    /// Sources for the migrated `/api/admin/*` reads (Task 7). `None`
+    /// Sources for the migrated `/api/admin/*` reads (Tasks 7 and 8). `None`
     /// (Firestore disabled) leaves those routes on the proxy.
     pub admin: Option<routes::admin::AdminRepos>,
 }
@@ -51,7 +51,8 @@ pub struct AppDeps {
 ///    `GET /auth/discord`, `GET /auth/logout`, and the migrated
 ///    `/api/admin/*` routes (`routes::admin::router`: the single-collection
 ///    reads `claims`, `claims/:code`, `orders`, `logs`, `support-calls`,
-///    `messages` and `matches/history`, only with admin sources);
+///    `messages` and `matches/history`, and the derived reads `stats`,
+///    `users/backup` and `yape/transactions`, only with admin sources);
 /// 2. a wrong method on one of those paths (e.g. `POST /api/ping`) goes to
 ///    the proxy instead of axum's 405 (`method_not_allowed_fallback`);
 /// 3. static files and SPA routes (`static_files::routes_with_fallback`);
@@ -85,6 +86,9 @@ pub fn build_app(deps: AppDeps) -> Router {
     );
     let limited_proxy = limit.layer(proxy.clone());
 
+    // Node's panel writes (still proxied) clear the caches of the migrated
+    // reads, like the legacy `invalidateAdminUsersCache`/`invalidateYapeCache`.
+    let admin_caches = deps.admin.as_ref().map(|a| a.caches.clone());
     let mut migrated = routes::diagnostic::router()
         .merge(routes::public_api::products_router())
         .merge(routes::auth::router(routes::auth::AuthState::from_config(
@@ -120,6 +124,13 @@ pub fn build_app(deps: AppDeps) -> Router {
         cfg.static_dir.clone(),
         limited_proxy,
     ));
+    let app = match admin_caches {
+        Some(caches) => app.layer(axum::middleware::from_fn_with_state(
+            caches,
+            routes::admin::invalidate_after_legacy_writes,
+        )),
+        None => app,
+    };
 
     middleware::apply_except_rate_limit(app, cfg)
 }

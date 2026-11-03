@@ -252,3 +252,112 @@ user_id = "1"
 username = "contraste-usuario"
 is_admin = false
 role = "usuario"
+
+# Tarea 8: lecturas derivadas (stats, users/backup, yape/transactions). Rust las atiende solo
+# con Firestore configurado. /settings, /stats/:nickname y /matches/:id/demo siguen en Node
+# (API de Faceit / estado de Node): sus casos comparan Node con Node a traves del proxy.
+
+# Cada lado tiene su statsCache de 60 s (por servidor): puede diferir si un usuario se vincula
+# por Discord o cambian los ajustes entre las dos lecturas.
+[[case]]
+name = "admin stats global"
+path = "/api/admin/stats"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+# Mismo aviso de cache (clave por servidor).
+[[case]]
+name = "admin stats servidor inexistente"
+path = "/api/admin/stats?guildId=contraste-sin-servidor"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin stats sin cookie"
+path = "/api/admin/stats"
+expect_status = 401
+
+[[case]]
+name = "admin stats con usuario sin permisos"
+path = "/api/admin/stats"
+expect_status = 403
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-usuario"
+is_admin = false
+role = "usuario"
+
+# Sin cache en ninguno de los dos lados; puede diferir si se vincula alguien entre las lecturas.
+[[case]]
+name = "admin users backup servidor inexistente"
+path = "/api/admin/users/backup?guildId=contraste-sin-servidor"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin users backup global"
+path = "/api/admin/users/backup"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin users backup sin cookie"
+path = "/api/admin/users/backup"
+expect_status = 401
+
+# Cada lado tiene su cache de 30 s: puede diferir si entra un pago Yape entre las dos lecturas.
+[[case]]
+name = "admin yape transactions"
+path = "/api/admin/yape/transactions"
+expect_status = 200
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin"
+is_admin = false
+role = "global_admin"
+
+[[case]]
+name = "admin yape transactions con usuario sin permisos"
+path = "/api/admin/yape/transactions"
+expect_status = 403
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-usuario"
+is_admin = false
+role = "usuario"
+
+# En el proxy (Node en los dos lados): 403 de global_admin del legacy.
+[[case]]
+name = "admin settings con admin de servidor"
+path = "/api/admin/settings"
+expect_status = 403
+
+[case.cookie_jwt]
+user_id = "1"
+username = "contraste-admin-servidor"
+is_admin = false
+role = "admin"
+servidor = "contraste-sin-servidor"
