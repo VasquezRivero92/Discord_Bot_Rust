@@ -3,6 +3,8 @@
 use moka::future::Cache;
 use std::future::Future;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Caché asíncrona con TTL sobre `moka`.
@@ -13,11 +15,16 @@ use std::time::Duration;
 ///   con éxito de cada clave en un mapa acotado que no caduca. Si una recarga falla con un error
 ///   que el llamador considera tolerable (p. ej. cuota agotada), se puede servir esa copia con
 ///   [`TtlCache::get_or_load_stale_on`].
+/// - **Época global**: `invalidate`, `invalidate_all` y `purge` incrementan un contador. Si cambia
+///   mientras una carga está en curso, el llamador recibe su valor pero la entrada no se queda en
+///   caché (la siguiente lectura recarga), y la copia vieja tampoco se escribe (así una carga que
+///   corrió contra un `purge` no la resucita; es conservador también para `invalidate`).
 /// - [`TtlCache::invalidate`] e [`TtlCache::invalidate_all`] solo descartan la entrada fresca
 ///   (fuerzan una recarga) y **conservan** la copia vieja; [`TtlCache::purge`] descarta ambas.
 pub struct TtlCache<K, V> {
     fresh: Cache<K, V>,
     stale: Cache<K, V>,
+    epoch: Arc<AtomicU64>,
 }
 
 impl<K, V> TtlCache<K, V>
@@ -33,6 +40,7 @@ where
                 .time_to_live(ttl)
                 .build(),
             stale: Cache::builder().max_capacity(max_capacity).build(),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -62,13 +70,24 @@ where
     {
         let stale = self.stale.clone();
         let stale_key = key.clone();
+        let epoch = self.epoch.clone();
+        let seen = self.epoch.load(Ordering::SeqCst);
         let init = async move {
+            let started = epoch.load(Ordering::SeqCst);
             let value = loader().await?;
-            stale.insert(stale_key, value.clone()).await;
+            if epoch.load(Ordering::SeqCst) == started {
+                stale.insert(stale_key, value.clone()).await;
+            }
             Ok(value)
         };
         match self.fresh.try_get_with(key.clone(), init).await {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                if self.epoch.load(Ordering::SeqCst) != seen {
+                    // Hubo una invalidación durante la carga: no dejar el valor cacheado.
+                    self.fresh.invalidate(&key).await;
+                }
+                Ok(value)
+            }
             Err(err) => {
                 if is_stale_ok(&err) {
                     if let Some(old) = self.stale.get(&key).await {
@@ -82,16 +101,19 @@ where
 
     /// Descarta la entrada fresca de `key` (la próxima lectura recarga); conserva la copia vieja.
     pub async fn invalidate(&self, key: &K) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.fresh.invalidate(key).await;
     }
 
     /// Descarta todas las entradas frescas (idempotente); conserva las copias viejas.
     pub fn invalidate_all(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.fresh.invalidate_all();
     }
 
     /// Descarta la entrada fresca y la copia vieja de `key`.
     pub async fn purge(&self, key: &K) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.fresh.invalidate(key).await;
         self.stale.invalidate(key).await;
     }

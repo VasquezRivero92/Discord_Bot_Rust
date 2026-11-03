@@ -425,3 +425,125 @@ fn guild_settings_roundtrip_keeps_unknown_fields() {
     assert_eq!(back["otro"], true);
     assert!(back.get("hubRoleId").is_none());
 }
+
+#[derive(Clone, Copy)]
+enum Inval {
+    Key,
+    All,
+    Purge,
+    Nothing,
+}
+
+async fn invalidation_during_load(kind: Inval) -> usize {
+    let gate = Arc::new(Semaphore::new(0));
+    let src = FakeSource::gated(gate.clone());
+    src.put("g1", "r");
+    let repo = repo(&src, LONG);
+    let first = {
+        let repo = repo.clone();
+        tokio::spawn(async move { repo.get("g1").await })
+    };
+    settle().await;
+    assert_eq!(src.fetches(), 1, "la carga está retenida");
+    match kind {
+        Inval::Key => repo.invalidate("g1").await,
+        Inval::All => repo.invalidate_all(),
+        Inval::Purge => repo.purge("g1").await,
+        Inval::Nothing => {}
+    }
+    gate.add_permits(100);
+    assert_eq!(first.await.unwrap().unwrap(), Some(settings("r")));
+    repo.get("g1").await.unwrap();
+    src.fetches()
+}
+
+#[tokio::test]
+async fn invalidate_during_load_forces_reload() {
+    assert_eq!(invalidation_during_load(Inval::Key).await, 2);
+}
+
+#[tokio::test]
+async fn invalidate_all_during_load_forces_reload() {
+    assert_eq!(invalidation_during_load(Inval::All).await, 2);
+}
+
+#[tokio::test]
+async fn purge_during_load_forces_reload() {
+    assert_eq!(invalidation_during_load(Inval::Purge).await, 2);
+}
+
+#[tokio::test]
+async fn no_invalidation_during_load_still_caches() {
+    assert_eq!(invalidation_during_load(Inval::Nothing).await, 1);
+}
+
+#[tokio::test]
+async fn purge_during_load_does_not_resurrect_stale_copy() {
+    let gate = Arc::new(Semaphore::new(0));
+    let src = FakeSource::gated(gate.clone());
+    src.put("g1", "r");
+    let repo = repo(&src, LONG);
+    let first = {
+        let repo = repo.clone();
+        tokio::spawn(async move { repo.get("g1").await })
+    };
+    settle().await;
+    repo.purge("g1").await;
+    gate.add_permits(100);
+    first.await.unwrap().unwrap();
+    src.fail_with(Some(DataError::QuotaExceeded));
+    assert_eq!(repo.get("g1").await, Err(DataError::QuotaExceeded));
+}
+
+#[tokio::test(start_paused = true)]
+async fn deletion_during_backoff_gap_is_seen_after_reopen() {
+    let src = FakeSource::new();
+    src.put("g1", "r");
+    let tx = src.queue_stream();
+    let repo = repo(&src, LONG);
+    let _w = repo.clone().spawn_watcher();
+    settle().await;
+    drop(tx); // el stream termina; espera 1 s
+    settle().await;
+    assert_eq!(repo.get("g1").await.unwrap(), Some(settings("r")));
+    src.docs.lock().unwrap().remove("g1");
+    assert_eq!(
+        repo.get("g1").await.unwrap(),
+        Some(settings("r")),
+        "aún cacheado"
+    );
+    let _tx2 = src.queue_stream();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(src.watch_calls(), 2);
+    assert_eq!(repo.get("g1").await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_then_quota_never_serves_old_settings() {
+    let src = FakeSource::new();
+    src.put("g1", "r");
+    let tx = src.queue_stream();
+    let repo = repo(&src, LONG);
+    let _w = repo.clone().spawn_watcher();
+    settle().await;
+    repo.get("g1").await.unwrap();
+    tx.send(Ok(ChangeEvent::Removed("g1".into()))).unwrap();
+    settle().await;
+    src.fail_with(Some(DataError::QuotaExceeded));
+    assert_eq!(repo.get("g1").await, Err(DataError::QuotaExceeded));
+}
+
+#[tokio::test(start_paused = true)]
+async fn modified_then_quota_still_serves_stale_copy() {
+    let src = FakeSource::new();
+    src.put("g1", "r");
+    let tx = src.queue_stream();
+    let repo = repo(&src, LONG);
+    let _w = repo.clone().spawn_watcher();
+    settle().await;
+    repo.get("g1").await.unwrap();
+    tx.send(Ok(ChangeEvent::Modified("g1".into()))).unwrap();
+    settle().await;
+    src.fail_with(Some(DataError::QuotaExceeded));
+    assert_eq!(repo.get("g1").await.unwrap(), Some(settings("r")));
+}

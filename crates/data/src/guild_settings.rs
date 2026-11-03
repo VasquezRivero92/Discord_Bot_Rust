@@ -325,6 +325,11 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
         self.cache.invalidate(&guild_id.to_string()).await;
     }
 
+    /// Descarta la entrada y la copia vieja de un servidor (p. ej. si se borró).
+    pub async fn purge(&self, guild_id: &str) {
+        self.cache.purge(&guild_id.to_string()).await;
+    }
+
     /// Descarta todas las entradas.
     pub fn invalidate_all(&self) {
         self.cache.invalidate_all();
@@ -356,11 +361,15 @@ impl<S: GuildSettingsSource> FirestoreGuildSettingsRepo<S> {
             first = false;
             let opened = Instant::now();
             let mut stream = self.source.watch();
+            // Al (re)abrir también se invalida todo: un borrado durante la espera no emite evento.
+            self.cache.invalidate_all();
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(ChangeEvent::Added(id))
-                    | Ok(ChangeEvent::Modified(id))
-                    | Ok(ChangeEvent::Removed(id)) => self.invalidate(&id).await,
+                    Ok(ChangeEvent::Added(id)) | Ok(ChangeEvent::Modified(id)) => {
+                        self.invalidate(&id).await
+                    }
+                    // Borrado: se descarta también la copia vieja (no servirla ante cuota).
+                    Ok(ChangeEvent::Removed(id)) => self.cache.purge(&id).await,
                     Ok(ChangeEvent::Reset) => self.cache.invalidate_all(),
                     Err(_) => {
                         self.cache.invalidate_all();
