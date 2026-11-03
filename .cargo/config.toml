@@ -1,0 +1,5 @@
+# aws-lc-sys (jsonwebtoken/rustls backend) on Windows x86_64 needs NASM; use its
+# prebuilt objects when NASM is absent. No effect when NASM is installed or on
+# other platforms. Needed for `cargo test -p web` (no feature unification with rustls).
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"

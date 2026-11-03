@@ -142,27 +142,9 @@ pub fn new_claims(
     }
 }
 
-/// Instala el proveedor criptográfico de `jsonwebtoken` (RustCrypto).
-///
-/// Imprescindible: en el workspace otra dependencia (`google-cloud-auth`, vía
-/// `firestore`) activa además `aws_lc_rs`; con las dos funciones activas
-/// `jsonwebtoken` no elige proveedor y entra en pánico al firmar/verificar.
-/// Es idempotente; si otro código ya instaló uno, se respeta (HS256 funciona
-/// con ambos). `main` debería llamarla al arrancar; `sign`/`verify` también.
-pub fn init_crypto() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // Err = ya había uno instalado: válido, se mantiene.
-        let _ = jsonwebtoken::crypto::CryptoProvider::install_default(
-            &jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER,
-        );
-    });
-}
-
 /// Firma `claims` con HS256. El llamador fija `exp` (y `iat` en `extra` si
 /// quiere imitar a Node).
 pub fn sign(claims: &SessionClaims, secret: &[u8]) -> Result<String, SessionError> {
-    init_crypto();
     Ok(jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         claims,
@@ -175,7 +157,6 @@ pub fn verify(token: &str, secret: &[u8]) -> Result<SessionClaims, SessionError>
     if token.len() > MAX_TOKEN_LEN {
         return Err(SessionError::TooLarge);
     }
-    init_crypto();
     let mut v = Validation::new(Algorithm::HS256);
     v.algorithms = vec![Algorithm::HS256];
     v.leeway = 0;
