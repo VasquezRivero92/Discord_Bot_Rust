@@ -9,6 +9,7 @@
 use crate::cache::TtlCache;
 use crate::error::DataError;
 use crate::firestore::{ChangeEvent, FirestoreClient};
+use crate::source::{from_json, strip_synthetic, DocSource};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -258,10 +259,22 @@ pub trait GuildSettingsSource: Send + Sync + 'static {
     fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>>;
 }
 
+/// Decodifica un documento de `guild_settings` ya en JSON, quitando antes los campos sintéticos
+/// del crate `firestore` (`_firestore_*`: si no, acabarían en [`GuildSettings::extra`] y en el
+/// JSON, con la ruta completa del proyecto en `_firestore_full_id`).
+pub(crate) fn decode_settings(id: &str, doc: Value) -> Result<GuildSettings, DataError> {
+    from_json(id, strip_synthetic(doc))
+}
+
 #[async_trait]
 impl GuildSettingsSource for FirestoreClient {
     async fn fetch(&self, guild_id: &str) -> Result<Option<GuildSettings>, DataError> {
-        self.get_doc(COLLECTION, guild_id).await
+        // Por `DocSource` (que ya quita los sintéticos) y `decode_settings` (que los vuelve a
+        // quitar): ninguna lectura llega a `GuildSettings` con `_firestore_*`.
+        DocSource::get(self, COLLECTION, guild_id)
+            .await?
+            .map(|doc| decode_settings(guild_id, doc))
+            .transpose()
     }
 
     fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>> {
@@ -496,6 +509,46 @@ mod tests {
         assert_eq!(s.games_per_match, Some(3));
         assert!(s.updated_at.unwrap().starts_with("2026-11-02T10:00:00"));
         assert_eq!(s.extra["customFlag"], Value::Bool(true));
+    }
+
+    /// Ningún campo sintético del crate (`_firestore_id`, `_firestore_full_id` con la ruta del
+    /// proyecto, ...) llega al `extra` de los ajustes ni a su JSON.
+    #[test]
+    fn guild_settings_never_expose_firestore_synthetic_fields() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "adminRoleId".into(),
+            val(ValueType::StringValue("9".into())),
+        );
+        let doc = Document {
+            name: "projects/secret-project/databases/(default)/documents/guild_settings/g1".into(),
+            fields,
+            create_time: Some(Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            update_time: Some(Timestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+        };
+        let (id, raw): (String, Value) = decode_document(&doc).expect("decodifica");
+        assert!(
+            raw.get("_firestore_full_id").is_some(),
+            "el crate los añade"
+        );
+        let settings = decode_settings(&id, raw).expect("decodifica");
+        assert!(
+            settings.extra.keys().all(|k| !k.starts_with("_firestore")),
+            "{:?}",
+            settings.extra
+        );
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !json.contains("_firestore") && !json.contains("secret-project"),
+            "{json}"
+        );
+        assert_eq!(json, r#"{"adminRoleId":"9"}"#);
     }
 
     // --- Repo + traducción real del listener (WatchState) -------------------------------------
