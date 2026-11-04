@@ -37,14 +37,34 @@ const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host")
 const WS_IDLE_CLOSE_CODE: u16 = 1001;
 const WS_IDLE_CLOSE_REASON: &str = "idle timeout";
 
-/// Paths exempt from [`ProxyOptions::first_byte_timeout`]: long-lived
-/// responses (SSE / long polls) of the legacy. Audited in the legacy
-/// (`index.js`, `routes/*.js`, `services/*.js`): the only `text/event-stream`
-/// is `GET /api/halloween/stream` (`index.js:560`, `addHalloweenSseClient`);
-/// there are no long polls. Matched like an Express app route (case-insensitive,
-/// one optional trailing slash), on the raw path and for every method.
-/// WebSocket upgrades never use the first-byte timeout (see `ws_idle_timeout`).
-const FIRST_BYTE_TIMEOUT_EXEMPT: &[&str] = &["/api/halloween/stream"];
+/// Routes exempt from [`ProxyOptions::first_byte_timeout`], as
+/// `(mount, route)` of Express (`app.use(mount, router)` + `router.verb(route)`;
+/// `""` = app route). Audited in the legacy handlers (`index.js`,
+/// `routes/*.js`, `webhooks/*.js`): the streaming response, and every handler
+/// that awaits the CS2 server or the EC2 machine before answering.
+///
+/// Matched on the path only, for every method: each path has a single verb in
+/// the legacy (the one in the comment), and exempting another method only
+/// keeps the behavior of the proxy without the guard. WebSocket upgrades never
+/// use the first-byte timeout (see `ws_idle_timeout`).
+const FIRST_BYTE_TIMEOUT_EXEMPT: &[(&str, &str)] = &[
+    // GET, index.js:560: SSE (`addHalloweenSseClient`), open indefinitely.
+    ("", "/api/halloween/stream"),
+    // POST, index.js:360: MatchZy webhook, awaits `resolveMixtonMatchEnd`
+    // (`stopServer` and `stopEc2Instance`).
+    ("", "/api/matchzy/event"),
+    // POST, routes/lobby.js:4730: in steam mode awaits `launchMatchInternal`
+    // -> `cs2ServerManager.startServer` -> `ensureEc2InstanceRunning` (EC2
+    // waiters of up to 120 s each and the SSH wait) on a cold start.
+    ("/api/lobby", "/mixton-create-match"),
+    // POST, routes/lobby.js:4968: awaits `resolveMixtonMatchEnd`.
+    ("/api/lobby", "/tournament-report-winner"),
+    // POST, routes/api.js:1065: awaits `cs2ServerManager.stopServer`.
+    ("/api/admin", "/matches/:id/cleanup"),
+    // POST, routes/cs2Api.js:120 and :206: await `resolveMixtonMatchEnd`.
+    ("/api/cs2", "/match-finish"),
+    ("/api/cs2", "/match-cancel"),
+];
 
 /// Behavior switches for the proxy.
 #[derive(Debug, Clone, Copy, Default)]
@@ -73,10 +93,47 @@ pub struct ProxyOptions {
 
 /// Whether `path` is one of [`FIRST_BYTE_TIMEOUT_EXEMPT`].
 fn first_byte_exempt(path: &str) -> bool {
-    let path = path.strip_suffix('/').unwrap_or(path);
     FIRST_BYTE_TIMEOUT_EXEMPT
         .iter()
-        .any(|p| p.eq_ignore_ascii_case(path))
+        .any(|&(mount, route)| express_route_matches(mount, route, path))
+}
+
+/// Express 4 matching on the raw (undecoded) path: case-insensitive, one
+/// optional trailing slash, `:param` = one non-empty segment. Under a mount
+/// the router swallows one extra `/` after the mount path (`trim_prefix`), so
+/// `/api/lobby//x` reaches `/x`; two extra slashes do not.
+fn express_route_matches(mount: &str, route: &str, path: &str) -> bool {
+    let rest = if mount.is_empty() {
+        path
+    } else {
+        let Some(head) = path.get(..mount.len()) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case(mount) {
+            return false;
+        }
+        let rest = &path[mount.len()..];
+        match rest.strip_prefix('/') {
+            Some(after) if after.starts_with('/') => after,
+            Some(_) => rest,
+            None => return false,
+        }
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let mut got = rest.split('/');
+    let mut want = route.split('/');
+    loop {
+        match (got.next(), want.next()) {
+            (None, None) => return true,
+            (Some(g), Some(w)) if w.starts_with(':') => {
+                if g.is_empty() {
+                    return false;
+                }
+            }
+            (Some(g), Some(w)) if g.eq_ignore_ascii_case(w) => {}
+            _ => return false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -558,7 +615,9 @@ mod tests {
 
     #[test]
     fn every_exempt_path_is_exempt_like_an_express_route() {
-        for path in FIRST_BYTE_TIMEOUT_EXEMPT {
+        for (mount, route) in FIRST_BYTE_TIMEOUT_EXEMPT {
+            let path = format!("{mount}{}", route.replace(":id", "abc"));
+            let path = path.as_str();
             assert!(first_byte_exempt(path), "{path}");
             assert!(first_byte_exempt(&format!("{path}/")), "{path}/");
             assert!(first_byte_exempt(&path.to_uppercase()), "{path} upper");
@@ -569,9 +628,74 @@ mod tests {
         }
     }
 
+    /// Asserts the Express-like variants of a router-mounted route: exact,
+    /// uppercase, one trailing slash, one extra slash after the mount; and the
+    /// non-matching ones (two trailing slashes, two extra slashes, a suffix).
+    fn assert_mounted_exempt(mount: &str, route: &str) {
+        let path = format!("{mount}{route}");
+        assert!(first_byte_exempt(&path), "{path}");
+        assert!(first_byte_exempt(&path.to_uppercase()), "{path} upper");
+        assert!(first_byte_exempt(&format!("{path}/")), "{path}/");
+        assert!(
+            first_byte_exempt(&format!("{mount}/{route}")),
+            "{mount}/{route}"
+        );
+        assert!(!first_byte_exempt(&format!("{path}//")), "{path}//");
+        assert!(
+            !first_byte_exempt(&format!("{mount}//{route}")),
+            "{mount}//{route}"
+        );
+        assert!(!first_byte_exempt(&format!("{path}x")), "{path}x");
+        assert!(!first_byte_exempt(&format!("{path}/x")), "{path}/x");
+        assert!(!first_byte_exempt(&format!("/{path}")), "/{path}");
+    }
+
     #[test]
-    fn halloween_stream_is_the_exempt_route() {
-        assert_eq!(FIRST_BYTE_TIMEOUT_EXEMPT, &["/api/halloween/stream"]);
+    fn lobby_mixton_create_match_is_exempt() {
+        // POST, routes/lobby.js:4730: steam mode awaits the EC2/CS2 start.
+        assert_mounted_exempt("/api/lobby", "/mixton-create-match");
+    }
+
+    #[test]
+    fn lobby_tournament_report_winner_is_exempt() {
+        // POST, routes/lobby.js:4968: awaits resolveMixtonMatchEnd (stopServer).
+        assert_mounted_exempt("/api/lobby", "/tournament-report-winner");
+    }
+
+    #[test]
+    fn admin_match_cleanup_is_exempt() {
+        // POST, routes/api.js:1065: awaits cs2ServerManager.stopServer.
+        assert_mounted_exempt("/api/admin", "/matches/abc-123/cleanup");
+        assert!(first_byte_exempt("/api/admin/matches/a%2Fb/cleanup"));
+        assert!(!first_byte_exempt("/api/admin/matches//cleanup"));
+        assert!(!first_byte_exempt("/api/admin/matches/a/b/cleanup"));
+    }
+
+    #[test]
+    fn cs2_match_finish_is_exempt() {
+        // POST, routes/cs2Api.js:120: awaits resolveMixtonMatchEnd.
+        assert_mounted_exempt("/api/cs2", "/match-finish");
+    }
+
+    #[test]
+    fn cs2_match_cancel_is_exempt() {
+        // POST, routes/cs2Api.js:206: awaits resolveMixtonMatchEnd.
+        assert_mounted_exempt("/api/cs2", "/match-cancel");
+    }
+
+    #[test]
+    fn matchzy_event_is_exempt() {
+        // POST, index.js:360 (app route, no mount): awaits resolveMixtonMatchEnd.
+        assert!(first_byte_exempt("/api/matchzy/event"));
+        assert!(first_byte_exempt("/API/MatchZy/Event/"));
+        assert!(!first_byte_exempt("/api/matchzy//event"));
+        assert!(!first_byte_exempt("/api//matchzy/event"));
+        assert!(!first_byte_exempt("/api/matchzy/event//"));
+    }
+
+    #[test]
+    fn halloween_stream_is_exempt() {
+        assert!(FIRST_BYTE_TIMEOUT_EXEMPT.contains(&("", "/api/halloween/stream")));
         assert!(first_byte_exempt("/API/Halloween/Stream"));
         assert!(!first_byte_exempt("/api/halloween/status"));
         assert!(!first_byte_exempt("/api/halloween/%73tream"));
