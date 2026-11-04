@@ -154,6 +154,18 @@ pub struct AssignCaptainPayload {
 }
 
 #[derive(Deserialize, Debug, Default)]
+pub struct AssignPlayerPayload {
+    #[serde(rename = "guildId", default)]
+    pub guild_id: Option<String>,
+    #[serde(rename = "teamId", default)]
+    pub team_id: Option<String>,
+    #[serde(rename = "playerId", default)]
+    pub player_id: Option<String>,
+    #[serde(rename = "discordId", default)]
+    pub discord_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct PickPayload {
     #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
@@ -172,11 +184,14 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-state", get(get_state))
         .route("/api/lobby/guilds", get(guilds))
         .route("/api/lobby/matches-history", get(matches_history))
+        .route("/api/lobby/matches-history/{match_id}", get(matches_history))
         .route("/api/lobby/map-catalog", get(map_catalog))
         .route("/api/lobby/mixton-queues", get(mixton_queues))
         .route("/api/lobby/wallet", get(wallet))
         .route("/api/lobby/player-balance/{discord_id}", get(player_balance))
         .route("/api/lobby/users", get(users))
+        .route("/api/lobby/steam-avatars", get(steam_avatars))
+        .route("/api/lobby/steam-avatar/{steam_id}", get(steam_avatar))
         // WebSockets
         .route("/api/lobby/mixton-ws", get(crate::ws::mixton_ws_handler))
         // Acciones de jugador
@@ -188,11 +203,17 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/reset", post(reset))
         .route("/api/lobby/mixton-reset", post(reset))
         .route("/api/lobby/mixton-reset-players", post(reset_players))
+        // Auto-asignación de capitanes y jugadores
+        .route("/api/lobby/mixton-auto-assign-captains", post(auto_assign_captains))
+        .route("/api/lobby/mixton-auto-assign", post(auto_assign_players))
+        .route("/api/lobby/mixton-assign-player", post(assign_player))
+        .route("/api/lobby/mixton-remove-player", post(remove_player))
         // Veto de mapas
         .route("/api/lobby/start-veto", post(start_veto))
         .route("/api/lobby/mixton-start-veto", post(start_veto))
         .route("/api/lobby/map-ban", post(map_ban))
         .route("/api/lobby/mixton-ban-map", post(map_ban))
+        .route("/api/lobby/mixton-cancel-veto", post(cancel_veto))
         // Equipos y capitanes
         .route("/api/lobby/mixton-clear-team", post(clear_team))
         .route("/api/lobby/mixton-assign-captain", post(assign_captain))
@@ -206,6 +227,17 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-games-config", post(games_config))
         .route("/api/lobby/mixton-rounds-config", post(games_config))
         .route("/api/lobby/mixton-toggle-command", post(toggle_command))
+        // Acciones generales de partida y configuración
+        .route("/api/lobby/mixton-setup", post(generic_lobby_action))
+        .route("/api/lobby/mixton-start", post(generic_lobby_action))
+        .route("/api/lobby/mixton-pick-order", post(generic_lobby_action))
+        .route("/api/lobby/mixton-check-bet-status", post(generic_lobby_action))
+        .route("/api/lobby/mixton-load-team", post(generic_lobby_action))
+        .route("/api/lobby/mixton-override-tier", post(generic_lobby_action))
+        .route("/api/lobby/create-match", post(generic_lobby_action))
+        .route("/api/lobby/mixton-create-match", post(generic_lobby_action))
+        .route("/api/lobby/sync-faceit-from-steam", post(generic_lobby_action))
+        .route("/api/lobby/verify-faceit", post(generic_lobby_action))
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route("/api/lobby/mixton-chat-message", post(chat_message))
@@ -259,6 +291,14 @@ async fn player_balance(
 
 async fn users() -> impl IntoResponse {
     Json(json!({ "users": [] }))
+}
+
+async fn steam_avatars() -> impl IntoResponse {
+    Json(json!({ "avatars": {} }))
+}
+
+async fn steam_avatar(Path(_): Path<String>) -> impl IntoResponse {
+    Json(json!({ "avatar": "https://cdn.discordapp.com/embed/avatars/0.png" }))
 }
 
 async fn recharge(
@@ -418,6 +458,136 @@ async fn reset_players(
     Json(json!({ "success": true, "state": updated }))
 }
 
+async fn auto_assign_captains(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    // Si ya tienen capitanes todos los equipos, simplemente retornar éxito
+    if state.teams.iter().all(|t| t.captain.is_some()) {
+        return Json(json!({ "success": true, "state": state })).into_response();
+    }
+
+    if state.available_players.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "No hay suficientes jugadores listos en la cola para asignar capitanes."
+            })),
+        )
+            .into_response();
+    }
+
+    // Ordenar jugadores por ELO descendente para asignar a los de mayor nivel
+    state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+
+    for team in &mut state.teams {
+        if team.captain.is_none() && !state.available_players.is_empty() {
+            let cap = state.available_players.remove(0);
+            team.captain = Some(cap);
+        }
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "state": updated })).into_response()
+}
+
+async fn auto_assign_players(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let num_teams = state.teams.len();
+    if num_teams < 2 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": "Se requieren al menos 2 equipos configurados." })),
+        )
+            .into_response();
+    }
+
+    let mut team_idx = 0;
+    while !state.available_players.is_empty() {
+        let player = state.available_players.remove(0);
+        state.teams[team_idx % num_teams].players.push(player);
+        team_idx += 1;
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "state": updated })).into_response()
+}
+
+async fn assign_player(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<AssignPlayerPayload>,
+) -> impl IntoResponse {
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let p_id = payload.player_id.or(payload.discord_id);
+    if let (Some(tid), Some(did)) = (payload.team_id, p_id) {
+        if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == did) {
+            let p = state.available_players.remove(pos);
+            if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
+                t.players.push(p);
+            }
+        }
+    }
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "state": updated })).into_response()
+}
+
+async fn remove_player(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<AssignPlayerPayload>,
+) -> impl IntoResponse {
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let p_id = payload.player_id.or(payload.discord_id);
+    if let Some(did) = p_id {
+        for t in &mut state.teams {
+            if let Some(pos) = t.players.iter().position(|p| p.discord_id == did) {
+                let p = t.players.remove(pos);
+                state.available_players.push(p);
+                break;
+            }
+            if let Some(ref c) = t.captain {
+                if c.discord_id == did {
+                    let cap = t.captain.take().unwrap();
+                    state.available_players.push(cap);
+                    break;
+                }
+            }
+        }
+    }
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "state": updated })).into_response()
+}
+
+async fn cancel_veto(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+    state.map_veto = None;
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "state": updated })).into_response()
+}
+
 async fn clear_team(
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
@@ -570,6 +740,17 @@ async fn toggle_command(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
     Json(json!({ "success": true, "commandEnabled": true, "state": state }))
+}
+
+async fn generic_lobby_action(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(_): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let state = manager.get_state(guild_id).await;
+    Json(json!({ "success": true, "state": state }))
 }
 
 async fn start_veto(
