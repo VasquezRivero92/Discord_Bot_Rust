@@ -183,8 +183,6 @@ async fn base_url_trailing_slashes_are_stripped_like_the_legacy() {
 #[tokio::test]
 async fn standalone_router_does_not_handle_proxied_auth_routes() {
     for uri in [
-        "/auth/discord/callback",
-        "/auth/discord/callback?code=abc",
         "/auth/steam",
         "/auth/demo-login",
     ] {
@@ -709,11 +707,6 @@ async fn auth_routes_compose_with_proxy_callback_and_steam_reach_legacy() {
 
     // Estas llegan al legacy.
     for (method, path_q, path) in [
-        (
-            reqwest::Method::GET,
-            "/auth/discord/callback?code=x&state=/",
-            "/auth/discord/callback",
-        ),
         (reqwest::Method::GET, "/auth/steam", "/auth/steam"),
         (
             reqwest::Method::GET,
@@ -739,7 +732,7 @@ async fn auth_routes_compose_with_proxy_callback_and_steam_reach_legacy() {
             "{path_q}"
         );
     }
-    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(seen.lock().unwrap().len(), 3);
 
     // Estas las contesta Rust y el legacy no ve nada.
     let res = client
@@ -764,7 +757,7 @@ async fn auth_routes_compose_with_proxy_callback_and_steam_reach_legacy() {
 
     assert_eq!(
         seen.lock().unwrap().len(),
-        4,
+        3,
         "el legacy no debe ver /auth/discord ni /auth/logout"
     );
 }

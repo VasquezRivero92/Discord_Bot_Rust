@@ -78,7 +78,6 @@ pub fn router(state: LobbyApiState) -> Router {
     Router::new()
         .route("/api/lobby/state", get(get_state))
         .route("/api/lobby/mixton-state", get(get_state))
-        .route("/api/lobby/me", get(lobby_me))
         .route("/api/lobby/matches-history", get(matches_history))
         .route("/api/lobby/map-catalog", get(map_catalog))
         .route("/api/lobby/mixton-queues", get(mixton_queues))
@@ -99,10 +98,6 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-chat-message", post(chat_message))
         .route("/api/lobby/mixton-chat-send", post(chat_message))
         .with_state(state.manager)
-}
-
-async fn lobby_me() -> impl IntoResponse {
-    Json(json!({ "user": null }))
 }
 
 async fn matches_history() -> impl IntoResponse {

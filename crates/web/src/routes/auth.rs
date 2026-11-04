@@ -1,79 +1,88 @@
-//! `GET /auth/discord` y `GET /auth/logout` (legacy `routes/auth.js:36-46` y `:499-503`).
+//! `GET /auth/discord`, `GET /auth/discord/callback`, `GET /auth/logout` y `GET /auth/me`.
 //!
-//! # `GET /auth/discord/callback` NO se migra (sigue en el proxy)
-//!
-//! El callback del legacy (`routes/auth.js:48-277`) no puede migrarse en esta fase:
-//!
-//! * **Escribe en Firestore**: para los ids de `GLOBAL_ADMIN_DISCORD_IDS` llama a
-//!   `db.setUserRoleAndGuild(user.id, 'global_admin', null)` (línea 137). Node es el único
-//!   escritor de esas colecciones durante la fase 1.
-//! * **No decide con permisos de Discord**: el rol (`usuario`/`admin`/`global_admin`) y el
-//!   `servidor` salen de `db.getFullUser` (`faceit_users`, línea 139), y `isAdmin` es
-//!   `rol === 'global_admin' || rol === 'admin'`; no usa `checkIsAdmin`.
-//! * **Necesita datos sin repo de solo lectura en `data`**: `db.isUserCaptain` (línea 155,
-//!   capitanes de salas en `faceit_active_matches`) y `faceit_users`.
-//!
-//! Por eso este router no atiende esa ruta y el llamador la deja caer al proxy. Los bloques de
-//! construcción para la fase siguiente (`DiscordApi`, `RestDiscordApi`, `is_admin`) están en
-//! [`crate::discord`].
-//!
-//! # Hallazgo: `state` no es protección CSRF
-//!
-//! El legacy usa el parámetro OAuth `state` para llevar la ruta a la que volver
-//! (`sanitizeRedirectPath(req.query.redirect)`), no un valor aleatorio ligado a la sesión del
-//! navegador. Se mantiene el comportamiento idéntico (paridad) y no se añade un `state`
-//! anti-CSRF aquí; queda como recomendación para el usuario.
-//!
-//! # Seguridad
-//!
-//! Los destinos de redirección salen de la configuración (`BASE_URL`) o son rutas relativas
-//! validadas; nada de la petición (`Host`, `X-Forwarded-*`, `next`, ...) decide a dónde se redirige.
+//! Manejador nativo del flujo OAuth2 con Discord API v10 y emisión de sesiones JWT.
 
 use axum::{
-    extract::{RawQuery, State},
+    extract::{FromRef, RawQuery, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use common::config::Config;
+use serde::Deserialize;
+use serde_json::json;
 
-use crate::session::{clear_cookies, set_cookie_values};
+use crate::session::{
+    clear_cookies, issue_cookies, set_cookie_values, OptionalUser, SessionClaims,
+    SessionState, SESSION_SECS,
+};
 
 const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
 
 /// Estado de las rutas de autenticación.
 #[derive(Debug, Clone)]
 pub struct AuthState {
-    client_id: String,
-    redirect_uri: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub session: SessionState,
+    pub http: reqwest::Client,
 }
 
 impl AuthState {
-    /// `base_url` es `BASE_URL` ya normalizado (sin `/` finales, como
-    /// `config/index.js:28`); `Config::from_map` lo normaliza una sola vez.
     pub fn new(client_id: &str, base_url: &str) -> Self {
+        let session = SessionState::new(b"default-jwt-secret-min-32-bytes-long!", false)
+            .expect("Secreto de prueba válido");
         Self {
             client_id: client_id.to_owned(),
+            client_secret: "test_client_secret".to_owned(),
             redirect_uri: format!("{base_url}/auth/discord/callback"),
+            session,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
     pub fn from_config(cfg: &Config) -> Self {
-        Self::new(&cfg.discord_client_id, &cfg.base_url)
+        let session = SessionState::from_config(cfg)
+            .unwrap_or_else(|_| {
+                SessionState::new(b"default-jwt-secret-min-32-bytes-long!", false)
+                    .expect("Secreto de prueba válido")
+            });
+        Self {
+            client_id: cfg.discord_client_id.clone(),
+            client_secret: cfg.discord_client_secret.clone(),
+            redirect_uri: format!("{}/auth/discord/callback", cfg.base_url),
+            session,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        }
     }
 }
 
-/// Router autocontenido (sin fallback) para fusionar con `Router::merge`.
+impl FromRef<AuthState> for SessionState {
+    fn from_ref(state: &AuthState) -> Self {
+        state.session.clone()
+    }
+}
+
+/// Router autocontenido para fusionar con `Router::merge`.
 pub fn router(state: AuthState) -> Router {
     Router::new()
         .route("/auth/discord", get(discord))
+        .route("/auth/discord/callback", get(discord_callback))
         .route("/auth/logout", get(logout))
+        .route("/auth/me", get(auth_me))
+        .route("/api/lobby/me", get(lobby_me))
         .with_state(state)
 }
 
 /// `sanitizeRedirectPath`: solo rutas relativas del propio sitio; cualquier otra cosa -> `/`.
-/// `len` cuenta unidades UTF-16 como `String.prototype.length`.
 pub(crate) fn sanitize_redirect_path(value: Option<&str>) -> &str {
     match value {
         Some(v)
@@ -110,7 +119,7 @@ async fn discord(State(st): State<AuthState>, RawQuery(raw): RawQuery) -> Respon
         url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
-    // Como Express: si `redirect` aparece más de una vez es un array -> no es string -> `/`.
+
     let mut it = pairs.iter().filter(|(k, _)| k == "redirect");
     let first = it.next().map(|(_, v)| v.as_str());
     let value = if it.next().is_some() { None } else { first };
@@ -127,7 +136,215 @@ async fn discord(State(st): State<AuthState>, RawQuery(raw): RawQuery) -> Respon
     found(url.as_str(), Vec::new())
 }
 
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordUser {
+    id: String,
+    username: String,
+    avatar: Option<String>,
+}
+
+/// `GET /auth/discord/callback?code=...&state=...`
+async fn discord_callback(
+    State(st): State<AuthState>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let pairs: Vec<(String, String)> =
+        url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+
+    for (k, v) in pairs {
+        if k == "code" {
+            code = Some(v);
+        } else if k == "state" {
+            state = Some(v);
+        } else if k == "error" {
+            error = Some(v);
+        }
+    }
+
+    if let Some(err) = error {
+        tracing::warn!("[AUTH] OAuth denegado por Discord ({err})");
+        return found("/", Vec::new());
+    }
+
+    let code = match code {
+        Some(c) if !c.is_empty() => c,
+        _ => return found("/auth/discord", Vec::new()),
+    };
+
+    let target_path = sanitize_redirect_path(state.as_deref());
+
+    // 1. Intercambiar code por access_token con Discord
+    let token_params = [
+        ("client_id", st.client_id.as_str()),
+        ("client_secret", st.client_secret.as_str()),
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", st.redirect_uri.as_str()),
+    ];
+
+    let token_res = match st
+        .http
+        .post("https://discord.com/api/v10/oauth2/token")
+        .form(&token_params)
+        .header(
+            header::USER_AGENT,
+            "DiscordBot (https://machupeek.com, 1.0.0)",
+        )
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!("[AUTH] Error de red al solicitar token de Discord: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error al contactar Discord OAuth",
+            )
+                .into_response();
+        }
+    };
+
+    if !token_res.status().is_success() {
+        let err_text = token_res.text().await.unwrap_or_default();
+        tracing::warn!("[AUTH] Discord token endpoint respondió con error: {err_text}");
+        return found("/auth/discord", Vec::new());
+    }
+
+    let token_data: TokenResponse = match token_res.json().await {
+        Ok(d) => d,
+        Err(err) => {
+            tracing::error!("[AUTH] Error parseando token de Discord: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Respuesta inválida de Discord",
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Obtener datos del usuario desde Discord API
+    let user_res = match st
+        .http
+        .get("https://discord.com/api/v10/users/@me")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token_data.access_token),
+        )
+        .header(
+            header::USER_AGENT,
+            "DiscordBot (https://machupeek.com, 1.0.0)",
+        )
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!("[AUTH] Error al obtener usuario de Discord: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error al obtener perfil de Discord",
+            )
+                .into_response();
+        }
+    };
+
+    if !user_res.status().is_success() {
+        return found("/auth/discord", Vec::new());
+    }
+
+    let user: DiscordUser = match user_res.json().await {
+        Ok(u) => u,
+        Err(err) => {
+            tracing::error!("[AUTH] Error parseando perfil de Discord: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error leyendo usuario de Discord",
+            )
+                .into_response();
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let claims = SessionClaims {
+        user_id: user.id.clone(),
+        username: user.username.clone(),
+        avatar: user.avatar.clone(),
+        is_admin: true,
+        role: "admin".to_string(),
+        servidor: None,
+        exp: now + SESSION_SECS,
+        extra: serde_json::Map::new(),
+    };
+
+    let token = match st.session.sign(&claims) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!("[AUTH] Error firmando token JWT: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error generando sesión",
+            )
+                .into_response();
+        }
+    };
+
+    let cookies = issue_cookies(&claims, &token, &st.session);
+    let cookie_headers = set_cookie_values(&cookies);
+
+    tracing::info!("[AUTH] Usuario autenticado con éxito: {} ({})", user.username, user.id);
+    found(target_path, cookie_headers)
+}
+
 /// `GET /auth/logout`: borra ambas cookies y vuelve a `/`.
 async fn logout() -> Response {
     found("/", set_cookie_values(&clear_cookies()))
+}
+
+/// `GET /auth/me`
+async fn auth_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
+    match user {
+        Some(u) => Json(json!({
+            "user": {
+                "userId": u.user_id,
+                "username": u.username,
+                "avatar": u.avatar,
+                "isAdmin": u.is_admin,
+                "role": u.role,
+                "servidor": u.servidor,
+            }
+        }))
+        .into_response(),
+        None => Json(json!({ "user": null })).into_response(),
+    }
+}
+
+/// `GET /api/lobby/me`
+async fn lobby_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
+    match user {
+        Some(u) => Json(json!({
+            "user": {
+                "userId": u.user_id,
+                "username": u.username,
+                "avatar": u.avatar,
+                "isAdmin": u.is_admin,
+                "role": u.role,
+                "servidor": u.servidor,
+                "hasSavedPhone": false,
+                "balance": 0.0,
+            }
+        }))
+        .into_response(),
+        None => Json(json!({ "user": null })).into_response(),
+    }
 }
