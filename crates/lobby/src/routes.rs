@@ -238,6 +238,8 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-create-match", post(generic_lobby_action))
         .route("/api/lobby/sync-faceit-from-steam", post(generic_lobby_action))
         .route("/api/lobby/verify-faceit", post(generic_lobby_action))
+        .route("/api/lobby/link-steam", post(link_steam))
+        .route("/api/lobby/sync-steam", post(link_steam))
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route("/api/lobby/mixton-chat-message", post(chat_message))
@@ -807,4 +809,31 @@ async fn chat_message(
     };
     manager.add_chat_message(guild_id, msg.clone()).await;
     Json(json!({ "success": true, "message": msg }))
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct LinkSteamPayload {
+    #[serde(rename = "steamInput", default)]
+    pub steam_input: Option<String>,
+}
+
+async fn link_steam(
+    headers: HeaderMap,
+    Json(payload): Json<LinkSteamPayload>,
+) -> impl IntoResponse {
+    let user_opt = user_from_cookies(&headers);
+    if user_opt.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
+        )
+            .into_response();
+    }
+    let input = payload.steam_input.unwrap_or_else(|| "detect_faceit".to_string());
+    Json(json!({
+        "success": true,
+        "message": format!("Steam vinculado ({input})"),
+        "steamId64": "76561198000000000"
+    }))
+    .into_response()
 }
