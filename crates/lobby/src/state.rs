@@ -180,13 +180,56 @@ pub struct LobbyTeam {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MapVetoState {
-    pub active_maps: Vec<MapInfo>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub completed: bool,
+    #[serde(rename = "teamIdA", default)]
+    pub team_id_a: Option<String>,
+    #[serde(rename = "teamIdB", default)]
+    pub team_id_b: Option<String>,
+    #[serde(rename = "gamesPerMatch", default = "default_one")]
+    pub games_per_match: u32,
+    #[serde(rename = "vetoMode", default = "default_bo1")]
+    pub veto_mode: String,
+    #[serde(rename = "actionType", default = "default_ban")]
+    pub action_type: String,
+    #[serde(rename = "currentBanIndex", default)]
+    pub current_ban_index: usize,
+    #[serde(rename = "bannedMaps", default)]
     pub banned_maps: Vec<String>,
+    #[serde(rename = "pickedMaps", default)]
     pub picked_maps: Vec<String>,
-    pub turn: String, // "team_1" o "team_2"
-    pub current_step: String, // "ban" o "pick"
+    #[serde(rename = "banHistory", default)]
+    pub ban_history: Vec<serde_json::Value>,
+    #[serde(rename = "chosenMap", default)]
+    pub chosen_map: Option<String>,
+    #[serde(rename = "banSequence", default)]
+    pub ban_sequence: Vec<String>,
+    #[serde(default)]
+    pub turn: String,
+    #[serde(rename = "currentStep", default = "default_ban")]
+    pub current_step: String,
+    #[serde(rename = "active_maps", default)]
+    pub active_maps: Vec<MapInfo>,
+    #[serde(rename = "final_chosen_map", default)]
     pub final_chosen_map: Option<String>,
+    #[serde(rename = "betAmount", default)]
+    pub bet_amount: f64,
+    #[serde(rename = "queueId", default = "default_queue")]
+    pub queue_id: String,
+    #[serde(rename = "matchMode", default = "default_steam")]
+    pub match_mode: String,
+    #[serde(rename = "startedAt", default)]
+    pub started_at: Option<i64>,
 }
+
+fn default_true() -> bool { true }
+fn default_one() -> u32 { 1 }
+fn default_bo1() -> String { "bo1".to_string() }
+fn default_ban() -> String { "ban".to_string() }
+fn default_queue() -> String { "auto".to_string() }
+fn default_steam() -> String { "steam".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -271,6 +314,63 @@ impl LobbyState {
         for p in &mut self.available_players {
             p.ensure_discord_user();
         }
+    }
+
+    pub fn auto_start_veto_if_ready(&mut self) {
+        if self.teams.len() < 2 {
+            return;
+        }
+        let team_a = &self.teams[0];
+        let team_b = &self.teams[1];
+        let both_complete = team_a.captain.is_some()
+            && team_a.players.len() >= 4
+            && team_b.captain.is_some()
+            && team_b.players.len() >= 4;
+
+        if !both_complete {
+            return;
+        }
+
+        if let Some(ref veto) = self.map_veto {
+            if veto.active || veto.completed {
+                return;
+            }
+        }
+
+        let team_a_id = team_a.id.clone();
+        let team_b_id = team_b.id.clone();
+        let ban_sequence = vec![
+            team_a_id.clone(),
+            team_b_id.clone(),
+            team_a_id.clone(),
+            team_b_id.clone(),
+            team_a_id.clone(),
+            team_b_id.clone(),
+        ];
+
+        self.map_veto = Some(MapVetoState {
+            active: true,
+            completed: false,
+            team_id_a: Some(team_a_id.clone()),
+            team_id_b: Some(team_b_id.clone()),
+            games_per_match: self.games_per_match,
+            veto_mode: "bo1".to_string(),
+            action_type: "ban".to_string(),
+            current_ban_index: 0,
+            banned_maps: Vec::new(),
+            picked_maps: Vec::new(),
+            ban_history: Vec::new(),
+            chosen_map: None,
+            ban_sequence,
+            turn: team_a_id,
+            current_step: "ban".to_string(),
+            active_maps: default_catalog().into_iter().filter(|m| m.active).collect(),
+            final_chosen_map: None,
+            bet_amount: self.effective_bet_amount,
+            queue_id: "auto".to_string(),
+            match_mode: "steam".to_string(),
+            started_at: Some(Utc::now().timestamp_millis()),
+        });
     }
 }
 
@@ -499,12 +599,27 @@ impl LobbyManager {
         let active_maps: Vec<MapInfo> = catalog.into_iter().filter(|m| m.active).collect();
 
         let veto = MapVetoState {
-            active_maps,
+            active: true,
+            completed: false,
+            team_id_a: Some("team_1".into()),
+            team_id_b: Some("team_2".into()),
+            games_per_match: 1,
+            veto_mode: "bo1".into(),
+            action_type: "ban".into(),
+            current_ban_index: 0,
             banned_maps: Vec::new(),
             picked_maps: Vec::new(),
+            ban_history: Vec::new(),
+            chosen_map: None,
+            ban_sequence: vec!["team_1".into(), "team_2".into(), "team_1".into(), "team_2".into(), "team_1".into(), "team_2".into()],
             turn: "team_1".into(),
             current_step: "ban".into(),
+            active_maps,
             final_chosen_map: None,
+            bet_amount: 0.0,
+            queue_id: "auto".into(),
+            match_mode: "steam".into(),
+            started_at: Some(Utc::now().timestamp_millis()),
         };
 
         state.map_veto = Some(veto.clone());
@@ -533,7 +648,11 @@ impl LobbyManager {
 
         // Si solo queda 1 mapa, ese es el mapa final
         if veto.active_maps.len() == 1 {
-            veto.final_chosen_map = Some(veto.active_maps[0].id.clone());
+            let chosen = veto.active_maps[0].id.clone();
+            veto.active = false;
+            veto.completed = true;
+            veto.chosen_map = Some(chosen.clone());
+            veto.final_chosen_map = Some(chosen);
             info!("[Lobby] Veto completado. Mapa elegido: {:?}", veto.final_chosen_map);
         } else {
             // Alternar turno

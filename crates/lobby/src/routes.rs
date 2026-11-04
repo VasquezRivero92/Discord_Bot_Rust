@@ -2,6 +2,7 @@
 
 use crate::maps::default_catalog;
 use crate::state::{
+    LobbyTeam, MapVetoState,
     format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
     LobbyManager, Player,
 };
@@ -16,6 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use chrono::Utc;
 use std::sync::Arc;
 
 pub struct LobbyApiState {
@@ -153,6 +155,8 @@ pub struct AssignCaptainPayload {
     pub guild_id: Option<String>,
     #[serde(rename = "teamId", default)]
     pub team_id: Option<String>,
+    #[serde(rename = "discordId", default)]
+    pub discord_id: Option<String>,
     pub player: Option<Player>,
 }
 
@@ -231,14 +235,14 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-rounds-config", post(games_config))
         .route("/api/lobby/mixton-toggle-command", post(toggle_command))
         // Acciones generales de partida y configuración
-        .route("/api/lobby/mixton-setup", post(generic_lobby_action))
-        .route("/api/lobby/mixton-start", post(generic_lobby_action))
-        .route("/api/lobby/mixton-pick-order", post(generic_lobby_action))
+        .route("/api/lobby/mixton-setup", post(mixton_setup))
+        .route("/api/lobby/mixton-start", post(mixton_start))
+        .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
         .route("/api/lobby/mixton-check-bet-status", post(generic_lobby_action))
         .route("/api/lobby/mixton-load-team", post(generic_lobby_action))
         .route("/api/lobby/mixton-override-tier", post(generic_lobby_action))
-        .route("/api/lobby/create-match", post(generic_lobby_action))
-        .route("/api/lobby/mixton-create-match", post(generic_lobby_action))
+        .route("/api/lobby/create-match", post(mixton_create_match))
+        .route("/api/lobby/mixton-create-match", post(mixton_create_match))
         .route("/api/lobby/sync-faceit-from-steam", post(generic_lobby_action))
         .route("/api/lobby/verify-faceit", post(generic_lobby_action))
         .route("/api/lobby/link-steam", post(link_steam))
@@ -500,32 +504,17 @@ async fn auto_assign_captains(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    // Si ya tienen capitanes todos los equipos, simplemente retornar éxito
-    if state.teams.iter().all(|t| t.captain.is_some()) {
-        return Json(json!({ "success": true, "state": state })).into_response();
-    }
-
-    if state.available_players.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "success": false,
-                "error": "No hay suficientes jugadores listos en la cola para asignar capitanes."
-            })),
-        )
-            .into_response();
-    }
-
-    // Ordenar jugadores por ELO descendente para asignar a los de mayor nivel
     state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
 
     for team in &mut state.teams {
         if team.captain.is_none() && !state.available_players.is_empty() {
-            let cap = state.available_players.remove(0);
+            let mut cap = state.available_players.remove(0);
+            cap.ensure_discord_user();
             team.captain = Some(cap);
         }
     }
 
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
@@ -539,8 +528,7 @@ async fn auto_assign_players(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    let num_teams = state.teams.len();
-    if num_teams < 2 {
+    if state.teams.len() < 2 {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "error": "Se requieren al menos 2 equipos configurados." })),
@@ -548,13 +536,60 @@ async fn auto_assign_players(
             .into_response();
     }
 
-    let mut team_idx = 0;
-    while !state.available_players.is_empty() {
-        let player = state.available_players.remove(0);
-        state.teams[team_idx % num_teams].players.push(player);
-        team_idx += 1;
+    // Auto-asignar capitanes si faltan
+    for team in &mut state.teams {
+        if team.captain.is_none() && !state.available_players.is_empty() {
+            state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+            let mut cap = state.available_players.remove(0);
+            cap.ensure_discord_user();
+            team.captain = Some(cap);
+        }
     }
 
+    // Ordenar disponibles por ELO desc
+    state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+
+    while !state.available_players.is_empty() {
+        let incomplete_indices: Vec<usize> = state
+            .teams
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.players.len() < 4)
+            .map(|(i, _)| i)
+            .collect();
+
+        if incomplete_indices.is_empty() {
+            break;
+        }
+
+        let mut best_team_idx = incomplete_indices[0];
+        let mut min_elo = u64::MAX;
+
+        for &idx in &incomplete_indices {
+            let t = &state.teams[idx];
+            let cap_elo = t.captain.as_ref().map(|c| c.faceit_elo as u64).unwrap_or(1000);
+            let players_elo: u64 = t.players.iter().map(|p| p.faceit_elo as u64).sum();
+            let total = cap_elo + players_elo;
+            if total < min_elo {
+                min_elo = total;
+                best_team_idx = idx;
+            }
+        }
+
+        let mut player = state.available_players.remove(0);
+        player.ensure_discord_user();
+        state.teams[best_team_idx].players.push(player);
+    }
+
+    let all_done = state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+    if all_done {
+        state.draft_finished = true;
+        state.draft_started = false;
+        state.current_pick_index = 0;
+        state.auto_start_veto_if_ready();
+    }
+
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
@@ -571,13 +606,51 @@ async fn assign_player(
 
     let p_id = payload.player_id.or(payload.discord_id);
     if let (Some(tid), Some(did)) = (payload.team_id, p_id) {
-        if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == did) {
-            let p = state.available_players.remove(pos);
-            if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
-                t.players.push(p);
+        let mut player = if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == did) {
+            state.available_players.remove(pos)
+        } else {
+            let mut found = None;
+            for other in &mut state.teams {
+                if let Some(pos) = other.players.iter().position(|p| p.discord_id == did) {
+                    found = Some(other.players.remove(pos));
+                    break;
+                }
+                if let Some(ref c) = other.captain {
+                    if c.discord_id == did {
+                        found = other.captain.take();
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| Player {
+                discord_id: did.clone(),
+                nickname: "Jugador".to_string(),
+                faceit_nickname: Some("Jugador".to_string()),
+                faceit_elo: 1000,
+                ready: true,
+                tier: "C".to_string(),
+                ..Default::default()
+            })
+        };
+        player.ensure_discord_user();
+
+        if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
+            if t.players.len() < 4 {
+                t.players.push(player);
+            } else {
+                state.available_players.push(player);
             }
         }
+
+        let all_done = state.teams.len() >= 2 && state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+        if all_done {
+            state.draft_finished = true;
+            state.draft_started = false;
+            state.auto_start_veto_if_ready();
+        }
     }
+
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
@@ -594,34 +667,40 @@ async fn remove_player(
 
     let p_id = payload.player_id.or(payload.discord_id);
     if let Some(did) = p_id {
-        for t in &mut state.teams {
-            if let Some(pos) = t.players.iter().position(|p| p.discord_id == did) {
-                let p = t.players.remove(pos);
-                state.available_players.push(p);
-                break;
+        if let Some(ref tid) = payload.team_id {
+            // Quitar del equipo especificado y reinsertar en disponibles
+            for t in &mut state.teams {
+                if t.id == *tid {
+                    if let Some(pos) = t.players.iter().position(|p| p.discord_id == did) {
+                        let mut p = t.players.remove(pos);
+                        p.ensure_discord_user();
+                        state.available_players.push(p);
+                    }
+                    if let Some(ref c) = t.captain {
+                        if c.discord_id == did {
+                            let mut cap = t.captain.take().unwrap();
+                            cap.ensure_discord_user();
+                            state.available_players.push(cap);
+                        }
+                    }
+                }
             }
-            if let Some(ref c) = t.captain {
-                if c.discord_id == did {
-                    let cap = t.captain.take().unwrap();
-                    state.available_players.push(cap);
-                    break;
+            state.draft_finished = false;
+        } else {
+            // Quitar de la cola de disponibles por completo (botón 'x' en lista de tiers)
+            state.available_players.retain(|p| p.discord_id != did);
+            for t in &mut state.teams {
+                t.players.retain(|p| p.discord_id != did);
+                if let Some(ref c) = t.captain {
+                    if c.discord_id == did {
+                        t.captain = None;
+                    }
                 }
             }
         }
     }
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
-}
 
-async fn cancel_veto(
-    RawQuery(raw): RawQuery,
-    State(manager): State<Arc<LobbyManager>>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-    let mut state = manager.get_state(guild_id).await;
-    state.map_veto = None;
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
@@ -637,15 +716,32 @@ async fn clear_team(
     let mut state = manager.get_state(guild_id).await;
     if let Some(tid) = payload.team_id {
         if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
-            t.players.clear();
+            for mut p in t.players.drain(..) {
+                p.ensure_discord_user();
+                state.available_players.push(p);
+            }
+            if let Some(mut cap) = t.captain.take() {
+                cap.ensure_discord_user();
+                state.available_players.push(cap);
+            }
         }
     } else {
         for t in &mut state.teams {
-            t.players.clear();
+            for mut p in t.players.drain(..) {
+                p.ensure_discord_user();
+                state.available_players.push(p);
+            }
+            if let Some(mut cap) = t.captain.take() {
+                cap.ensure_discord_user();
+                state.available_players.push(cap);
+            }
         }
     }
+    state.draft_finished = false;
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn assign_captain(
@@ -656,13 +752,52 @@ async fn assign_captain(
     let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
-    if let (Some(tid), Some(player)) = (payload.team_id, payload.player) {
-        if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
-            t.captain = Some(player);
+
+    if let Some(ref tid) = payload.team_id {
+        match payload.discord_id {
+            Some(ref did) if !did.is_empty() => {
+                let mut player = if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == *did) {
+                    state.available_players.remove(pos)
+                } else if let Some(ref p) = payload.player {
+                    p.clone()
+                } else {
+                    let mut found = None;
+                    for other in &mut state.teams {
+                        if let Some(pos) = other.players.iter().position(|p| p.discord_id == *did) {
+                            found = Some(other.players.remove(pos));
+                            break;
+                        }
+                    }
+                    found.unwrap_or_else(|| Player {
+                        discord_id: did.clone(),
+                        nickname: "Capitán".to_string(),
+                        faceit_nickname: Some("Capitán".to_string()),
+                        faceit_elo: 1000,
+                        ready: true,
+                        tier: "C".to_string(),
+                        ..Default::default()
+                    })
+                };
+                player.ensure_discord_user();
+                if let Some(t) = state.teams.iter_mut().find(|t| t.id == *tid) {
+                    t.captain = Some(player);
+                }
+            }
+            _ => {
+                if let Some(t) = state.teams.iter_mut().find(|t| t.id == *tid) {
+                    if let Some(mut cap) = t.captain.take() {
+                        cap.ensure_discord_user();
+                        state.available_players.push(cap);
+                    }
+                }
+            }
         }
     }
+
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn pick_player(
@@ -674,16 +809,40 @@ async fn pick_player(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let p_id = payload.player_id.or(payload.discord_id);
     let mut state = manager.get_state(guild_id).await;
-    if let (Some(tid), Some(pid)) = (payload.team_id, p_id) {
+
+    if let Some(pid) = p_id {
         if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == pid) {
-            let player = state.available_players.remove(pos);
-            if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
+            let mut player = state.available_players.remove(pos);
+            player.ensure_discord_user();
+
+            let target_team_id = payload.team_id.unwrap_or_else(|| {
+                if !state.pick_order.is_empty() {
+                    state.pick_order[state.current_pick_index % state.pick_order.len()].clone()
+                } else if !state.teams.is_empty() {
+                    state.teams[0].id.clone()
+                } else {
+                    "team_1".to_string()
+                }
+            });
+
+            if let Some(t) = state.teams.iter_mut().find(|t| t.id == target_team_id) {
                 t.players.push(player);
             }
+            state.current_pick_index += 1;
+        }
+
+        let all_done = state.teams.len() >= 2 && state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+        if all_done {
+            state.draft_finished = true;
+            state.draft_started = false;
+            state.auto_start_veto_if_ready();
         }
     }
+
+    state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn captain_proposal(
@@ -694,21 +853,45 @@ async fn captain_proposal(
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
-    state.captain_a_proposal = payload.get("proposal").cloned();
-    state.bet_agreed = true;
+
+    if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
+        let bet = payload.get("betAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if team_id.contains("1") || team_id.to_lowercase().contains('a') {
+            state.captain_a_proposal = Some(json!(bet));
+        } else {
+            state.captain_b_proposal = Some(json!(bet));
+        }
+        state.bet_agreed = true;
+        state.agreed_bet_amount = Some(bet);
+        state.effective_bet_amount = bet;
+    }
+
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn captain_ready(
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
-    Json(_): Json<serde_json::Value>,
+    Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-    let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state }))
+    let mut state = manager.get_state(guild_id).await;
+
+    if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
+        let is_ready = payload.get("isReady").and_then(|v| v.as_bool()).unwrap_or(true);
+        if team_id.contains("1") || team_id.to_lowercase().contains('a') {
+            state.captain_a_ready = is_ready;
+        } else {
+            state.captain_b_ready = is_ready;
+        }
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn force_roulette(
@@ -717,8 +900,20 @@ async fn force_roulette(
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-    let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state }))
+    let mut state = manager.get_state(guild_id).await;
+
+    if !state.teams.is_empty() {
+        let winner = &state.teams[0];
+        state.roulette_spinning = true;
+        state.roulette_winner_team_id = Some(winner.id.clone());
+        state.roulette_winner_name = Some(winner.name.clone());
+        state.roulette_started_at = Some(Utc::now().timestamp_millis());
+        state.bet_agreed = true;
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn tournament_config(
@@ -729,6 +924,7 @@ async fn tournament_config(
     let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
+
     if let Some(mode) = payload.lobby_mode {
         state.lobby_mode = mode;
     }
@@ -740,8 +936,10 @@ async fn tournament_config(
         state.tournament = None;
         state.map_veto = None;
     }
+
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn tournament_report_winner(
@@ -752,7 +950,8 @@ async fn tournament_report_winner(
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state }))
+    let available_players = partition_available_players(&state);
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
 }
 
 async fn games_config(
@@ -763,12 +962,15 @@ async fn games_config(
     let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
+
     if let Some(games) = payload.games_per_match.or(payload.rounds_per_game) {
         state.games_per_match = games;
         state.rounds_per_game = games;
     }
+
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn toggle_command(
@@ -778,7 +980,141 @@ async fn toggle_command(
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "commandEnabled": true, "state": state }))
+    let available_players = partition_available_players(&state);
+    Json(json!({ "success": true, "commandEnabled": true, "state": state, "availablePlayers": available_players })).into_response()
+}
+
+async fn mixton_setup(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let num_teams = payload.get("numTeams").and_then(|v| v.as_u64()).unwrap_or(2).clamp(2, 8) as usize;
+
+    while state.teams.len() < num_teams {
+        let idx = state.teams.len() + 1;
+        state.teams.push(LobbyTeam {
+            id: format!("team_{idx}"),
+            name: format!("Equipo {idx}"),
+            tag: format!("EQ{idx}"),
+            captain: None,
+            players: Vec::new(),
+        });
+    }
+
+    while state.teams.len() > num_teams {
+        if let Some(t) = state.teams.pop() {
+            if let Some(mut c) = t.captain {
+                c.ensure_discord_user();
+                state.available_players.push(c);
+            }
+            for mut p in t.players {
+                p.ensure_discord_user();
+                state.available_players.push(p);
+            }
+        }
+    }
+
+    state.draft_started = false;
+    state.draft_finished = false;
+    state.map_veto = None;
+    state.current_pick_index = 0;
+    state.sanitize();
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+}
+
+async fn mixton_start(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
+        state.pick_order = orders.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+    }
+    state.draft_started = true;
+    state.draft_finished = false;
+    state.current_pick_index = 0;
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+}
+
+async fn mixton_pick_order(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
+        state.pick_order = orders.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+}
+
+async fn mixton_create_match(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let match_id = format!("match_{}", chrono::Utc::now().timestamp_millis());
+
+    let team_a_id = payload.get("teamIdA").and_then(|v| v.as_str()).unwrap_or("team_1");
+    let team_b_id = payload.get("teamIdB").and_then(|v| v.as_str()).unwrap_or("team_2");
+
+    for t in &mut state.teams {
+        if t.id == team_a_id || t.id == team_b_id {
+            t.captain = None;
+            t.players.clear();
+        }
+    }
+
+    state.draft_started = false;
+    state.draft_finished = false;
+    state.current_pick_index = 0;
+    state.map_veto = None;
+    state.roulette_spinning = false;
+    state.roulette_winner_team_id = None;
+    state.roulette_winner_name = None;
+    state.bet_agreed = false;
+    state.captain_a_ready = false;
+    state.captain_b_ready = false;
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+
+    Json(json!({
+        "success": true,
+        "matchId": match_id,
+        "faceitHubUrl": serde_json::Value::Null,
+        "assignedQueue": "CS2 5v5 Oficial",
+        "gamesPerMatch": 1,
+        "roundsPerGame": 1,
+        "state": updated,
+        "availablePlayers": available_players
+    }))
+    .into_response()
 }
 
 async fn generic_lobby_action(
@@ -795,26 +1131,128 @@ async fn generic_lobby_action(
 async fn start_veto(
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-    let veto = manager.start_map_veto(guild_id).await;
-    Json(json!({ "success": veto.is_some(), "veto": veto }))
+    let mut state = manager.get_state(guild_id).await;
+
+    let team_a_id = payload.get("teamIdA").and_then(|v| v.as_str()).unwrap_or("team_1").to_string();
+    let team_b_id = payload.get("teamIdB").and_then(|v| v.as_str()).unwrap_or("team_2").to_string();
+    let bet = payload.get("betAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let ban_sequence = vec![
+        team_a_id.clone(),
+        team_b_id.clone(),
+        team_a_id.clone(),
+        team_b_id.clone(),
+        team_a_id.clone(),
+        team_b_id.clone(),
+    ];
+
+    let veto = MapVetoState {
+        active: true,
+        completed: false,
+        team_id_a: Some(team_a_id.clone()),
+        team_id_b: Some(team_b_id.clone()),
+        games_per_match: state.games_per_match,
+        veto_mode: "bo1".to_string(),
+        action_type: "ban".to_string(),
+        current_ban_index: 0,
+        banned_maps: Vec::new(),
+        picked_maps: Vec::new(),
+        ban_history: Vec::new(),
+        chosen_map: None,
+        ban_sequence,
+        turn: team_a_id,
+        current_step: "ban".to_string(),
+        active_maps: default_catalog().into_iter().filter(|m| m.active).collect(),
+        final_chosen_map: None,
+        bet_amount: bet,
+        queue_id: "auto".to_string(),
+        match_mode: "steam".to_string(),
+        started_at: Some(chrono::Utc::now().timestamp_millis()),
+    };
+
+    state.map_veto = Some(veto);
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({
+        "success": true,
+        "state": updated,
+        "mapVeto": updated.map_veto,
+        "availablePlayers": available_players
+    }))
+    .into_response()
 }
 
 async fn map_ban(
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
-    Json(payload): Json<MapActionPayload>,
+    Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
-    match manager.ban_map(guild_id, &payload.team_id, &payload.map_id).await {
-        Ok(state) => Json(json!({ "success": true, "state": state })).into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "error": err })),
-        )
-            .into_response(),
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let map_id = payload.get("mapId").and_then(|v| v.as_str()).unwrap_or("");
+    if map_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Debes indicar el mapa a banear." }))).into_response();
     }
+
+    if let Some(ref mut veto) = state.map_veto {
+        if !veto.banned_maps.contains(&map_id.to_string()) {
+            veto.banned_maps.push(map_id.to_string());
+            veto.ban_history.push(json!({
+                "mapId": map_id,
+                "teamId": veto.turn,
+                "timestamp": chrono::Utc::now().timestamp_millis()
+            }));
+            veto.current_ban_index += 1;
+
+            veto.active_maps.retain(|m| m.id != map_id);
+
+            if veto.active_maps.len() == 1 {
+                let chosen = veto.active_maps[0].id.clone();
+                veto.active = false;
+                veto.completed = true;
+                veto.chosen_map = Some(chosen.clone());
+                veto.final_chosen_map = Some(chosen);
+            } else if let Some(team_a) = &veto.team_id_a {
+                if let Some(team_b) = &veto.team_id_b {
+                    veto.turn = if veto.turn == *team_a { team_b.clone() } else { team_a.clone() };
+                }
+            }
+        }
+    }
+
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({
+        "success": true,
+        "mapVeto": updated.map_veto,
+        "state": updated,
+        "availablePlayers": available_players
+    }))
+    .into_response()
+}
+
+async fn cancel_veto(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+    state.map_veto = None;
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({
+        "success": true,
+        "state": updated,
+        "availablePlayers": available_players
+    }))
+    .into_response()
 }
 
 async fn chat_history(
