@@ -2,9 +2,8 @@
 
 use crate::maps::MapInfo;
 use crate::state::{
-    LobbyTeam, MapVetoState,
     format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
-    LobbyManager, Player,
+    LobbyManager, LobbyTeam, MapVetoState, Player,
 };
 use axum::{
     extract::{Path, RawQuery, State},
@@ -15,9 +14,9 @@ use axum::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
-use chrono::Utc;
 use std::sync::Arc;
 
 pub struct LobbyApiState {
@@ -66,7 +65,10 @@ fn user_from_cookies(headers: &HeaderMap) -> Option<(String, String, Option<Stri
                 .and_then(|v| v.as_str())
                 .unwrap_or("Jugador")
                 .to_string();
-            let avatar = val.get("avatar").and_then(|v| v.as_str()).map(str::to_string);
+            let avatar = val
+                .get("avatar")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             return Some((user_id, username, avatar));
         }
     }
@@ -208,11 +210,20 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-state", get(get_state))
         .route("/api/lobby/guilds", get(guilds))
         .route("/api/lobby/matches-history", get(matches_history))
-        .route("/api/lobby/matches-history/{match_id}", get(matches_history))
-        .route("/api/lobby/map-catalog", get(map_catalog).post(update_map_catalog))
+        .route(
+            "/api/lobby/matches-history/{match_id}",
+            get(matches_history),
+        )
+        .route(
+            "/api/lobby/map-catalog",
+            get(map_catalog).post(update_map_catalog),
+        )
         .route("/api/lobby/mixton-queues", get(mixton_queues))
         .route("/api/lobby/wallet", get(wallet))
-        .route("/api/lobby/player-balance/{discord_id}", get(player_balance))
+        .route(
+            "/api/lobby/player-balance/{discord_id}",
+            get(player_balance),
+        )
         .route("/api/lobby/users", get(users))
         .route("/api/lobby/steam-avatars", get(steam_avatars))
         .route("/api/lobby/steam-avatar/{steam_id}", get(steam_avatar))
@@ -228,7 +239,10 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-reset", post(reset))
         .route("/api/lobby/mixton-reset-players", post(reset_players))
         // Auto-asignación de capitanes y jugadores
-        .route("/api/lobby/mixton-auto-assign-captains", post(auto_assign_captains))
+        .route(
+            "/api/lobby/mixton-auto-assign-captains",
+            post(auto_assign_captains),
+        )
         .route("/api/lobby/mixton-auto-assign", post(auto_assign_players))
         .route("/api/lobby/mixton-assign-player", post(assign_player))
         .route("/api/lobby/mixton-remove-player", post(remove_player))
@@ -247,7 +261,10 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-force-roulette", post(force_roulette))
         // Modo torneo y configuración de rondas
         .route("/api/lobby/tournament-config", post(tournament_config))
-        .route("/api/lobby/tournament-report-winner", post(tournament_report_winner))
+        .route(
+            "/api/lobby/tournament-report-winner",
+            post(tournament_report_winner),
+        )
         .route("/api/lobby/mixton-games-config", post(games_config))
         .route("/api/lobby/mixton-rounds-config", post(games_config))
         .route("/api/lobby/mixton-toggle-command", post(toggle_command))
@@ -255,12 +272,21 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-setup", post(mixton_setup))
         .route("/api/lobby/mixton-start", post(mixton_start))
         .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
-        .route("/api/lobby/mixton-check-bet-status", post(generic_lobby_action))
+        .route(
+            "/api/lobby/mixton-check-bet-status",
+            post(generic_lobby_action),
+        )
         .route("/api/lobby/mixton-load-team", post(generic_lobby_action))
-        .route("/api/lobby/mixton-override-tier", post(generic_lobby_action))
+        .route(
+            "/api/lobby/mixton-override-tier",
+            post(generic_lobby_action),
+        )
         .route("/api/lobby/create-match", post(mixton_create_match))
         .route("/api/lobby/mixton-create-match", post(mixton_create_match))
-        .route("/api/lobby/sync-faceit-from-steam", post(generic_lobby_action))
+        .route(
+            "/api/lobby/sync-faceit-from-steam",
+            post(generic_lobby_action),
+        )
         .route("/api/lobby/verify-faceit", post(generic_lobby_action))
         .route("/api/lobby/link-steam", post(link_steam))
         .route("/api/lobby/sync-steam", post(link_steam))
@@ -293,7 +319,9 @@ async fn update_map_catalog(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<MapCatalogPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
@@ -307,7 +335,8 @@ async fn update_map_catalog(
             "catalog": updated.map_catalog,
             "state": updated,
             "availablePlayers": available_players
-        })).into_response()
+        }))
+        .into_response()
     } else {
         Json(json!({ "success": true, "catalog": state.map_catalog })).into_response()
     }
@@ -335,9 +364,7 @@ async fn guilds(State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
     }))
 }
 
-async fn player_balance(
-    Path(discord_id): Path<String>,
-) -> impl IntoResponse {
+async fn player_balance(Path(discord_id): Path<String>) -> impl IntoResponse {
     Json(json!({
         "discordId": discord_id,
         "balance": 100.0,
@@ -358,9 +385,7 @@ async fn steam_avatar(Path(_): Path<String>) -> impl IntoResponse {
     Json(json!({ "avatar": "https://cdn.discordapp.com/embed/avatars/0.png" }))
 }
 
-async fn recharge(
-    Json(_): Json<serde_json::Value>,
-) -> impl IntoResponse {
+async fn recharge(Json(_): Json<serde_json::Value>) -> impl IntoResponse {
     Json(json!({
         "success": true,
         "balance": 100.0,
@@ -402,7 +427,9 @@ async fn join(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<JoinPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.join_queue(guild_id, payload.player).await;
     let available_players = partition_available_players(&state);
@@ -415,7 +442,9 @@ async fn player_ready(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
 
     let cookie_user = user_from_cookies(&headers);
@@ -475,7 +504,9 @@ async fn leave(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
 
     let discord_id = if let Some(id) = payload.discord_id {
@@ -492,7 +523,8 @@ async fn leave(
 
     let state = manager.leave_queue(guild_id, &discord_id).await;
     let available_players = partition_available_players(&state);
-    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn unready(
@@ -501,7 +533,9 @@ async fn unready(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
 
     let discord_id = if let Some(id) = payload.discord_id {
@@ -518,7 +552,8 @@ async fn unready(
 
     let state = manager.set_ready(guild_id, &discord_id, false).await;
     let available_players = partition_available_players(&state);
-    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn reset(
@@ -552,7 +587,9 @@ async fn auto_assign_captains(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+    state
+        .available_players
+        .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
 
     for team in &mut state.teams {
         if team.captain.is_none() && !state.available_players.is_empty() {
@@ -565,7 +602,8 @@ async fn auto_assign_captains(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn auto_assign_players(
@@ -587,7 +625,9 @@ async fn auto_assign_players(
     // Auto-asignar capitanes si faltan
     for team in &mut state.teams {
         if team.captain.is_none() && !state.available_players.is_empty() {
-            state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+            state
+                .available_players
+                .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
             let mut cap = state.available_players.remove(0);
             cap.ensure_discord_user();
             team.captain = Some(cap);
@@ -595,7 +635,9 @@ async fn auto_assign_players(
     }
 
     // Ordenar disponibles por ELO desc
-    state.available_players.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+    state
+        .available_players
+        .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
 
     while !state.available_players.is_empty() {
         let incomplete_indices: Vec<usize> = state
@@ -615,7 +657,11 @@ async fn auto_assign_players(
 
         for &idx in &incomplete_indices {
             let t = &state.teams[idx];
-            let cap_elo = t.captain.as_ref().map(|c| c.faceit_elo as u64).unwrap_or(1000);
+            let cap_elo = t
+                .captain
+                .as_ref()
+                .map(|c| c.faceit_elo as u64)
+                .unwrap_or(1000);
             let players_elo: u64 = t.players.iter().map(|p| p.faceit_elo as u64).sum();
             let total = cap_elo + players_elo;
             if total < min_elo {
@@ -629,7 +675,10 @@ async fn auto_assign_players(
         state.teams[best_team_idx].players.push(player);
     }
 
-    let all_done = state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+    let all_done = state
+        .teams
+        .iter()
+        .all(|t| t.captain.is_some() && t.players.len() == 4);
     if all_done {
         state.draft_finished = true;
         state.draft_started = false;
@@ -640,7 +689,8 @@ async fn auto_assign_players(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn assign_player(
@@ -648,13 +698,19 @@ async fn assign_player(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignPlayerPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let p_id = payload.player_id.or(payload.discord_id);
     if let (Some(tid), Some(did)) = (payload.team_id, p_id) {
-        let mut player = if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == did) {
+        let mut player = if let Some(pos) = state
+            .available_players
+            .iter()
+            .position(|p| p.discord_id == did)
+        {
             state.available_players.remove(pos)
         } else {
             let mut found = None;
@@ -690,7 +746,11 @@ async fn assign_player(
             }
         }
 
-        let all_done = state.teams.len() >= 2 && state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+        let all_done = state.teams.len() >= 2
+            && state
+                .teams
+                .iter()
+                .all(|t| t.captain.is_some() && t.players.len() == 4);
         if all_done {
             state.draft_finished = true;
             state.draft_started = false;
@@ -701,7 +761,8 @@ async fn assign_player(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn remove_player(
@@ -709,7 +770,9 @@ async fn remove_player(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignPlayerPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
@@ -751,7 +814,8 @@ async fn remove_player(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn clear_team(
@@ -759,7 +823,9 @@ async fn clear_team(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<ClearTeamPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
     if let Some(tid) = payload.team_id {
@@ -789,7 +855,8 @@ async fn clear_team(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn assign_captain(
@@ -797,14 +864,20 @@ async fn assign_captain(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignCaptainPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(ref tid) = payload.team_id {
         match payload.discord_id {
             Some(ref did) if !did.is_empty() => {
-                let mut player = if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == *did) {
+                let mut player = if let Some(pos) = state
+                    .available_players
+                    .iter()
+                    .position(|p| p.discord_id == *did)
+                {
                     state.available_players.remove(pos)
                 } else if let Some(ref p) = payload.player {
                     p.clone()
@@ -845,7 +918,8 @@ async fn assign_captain(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn pick_player(
@@ -853,13 +927,19 @@ async fn pick_player(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<PickPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let p_id = payload.player_id.or(payload.discord_id);
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(pid) = p_id {
-        if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == pid) {
+        if let Some(pos) = state
+            .available_players
+            .iter()
+            .position(|p| p.discord_id == pid)
+        {
             let mut player = state.available_players.remove(pos);
             player.ensure_discord_user();
 
@@ -879,7 +959,11 @@ async fn pick_player(
             state.current_pick_index += 1;
         }
 
-        let all_done = state.teams.len() >= 2 && state.teams.iter().all(|t| t.captain.is_some() && t.players.len() == 4);
+        let all_done = state.teams.len() >= 2
+            && state
+                .teams
+                .iter()
+                .all(|t| t.captain.is_some() && t.players.len() == 4);
         if all_done {
             state.draft_finished = true;
             state.draft_started = false;
@@ -890,7 +974,8 @@ async fn pick_player(
     state.sanitize();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn captain_proposal(
@@ -903,7 +988,10 @@ async fn captain_proposal(
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
-        let bet = payload.get("betAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let bet = payload
+            .get("betAmount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         if team_id.contains("1") || team_id.to_lowercase().contains('a') {
             state.captain_a_proposal = Some(json!(bet));
         } else {
@@ -916,7 +1004,8 @@ async fn captain_proposal(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn captain_ready(
@@ -929,7 +1018,10 @@ async fn captain_ready(
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
-        let is_ready = payload.get("isReady").and_then(|v| v.as_bool()).unwrap_or(true);
+        let is_ready = payload
+            .get("isReady")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         if team_id.contains("1") || team_id.to_lowercase().contains('a') {
             state.captain_a_ready = is_ready;
         } else {
@@ -939,7 +1031,8 @@ async fn captain_ready(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn force_roulette(
@@ -961,7 +1054,8 @@ async fn force_roulette(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn tournament_config(
@@ -969,7 +1063,9 @@ async fn tournament_config(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<TournamentConfigPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
@@ -987,7 +1083,8 @@ async fn tournament_config(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn tournament_report_winner(
@@ -999,7 +1096,8 @@ async fn tournament_report_winner(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
     let available_players = partition_available_players(&state);
-    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn games_config(
@@ -1007,7 +1105,9 @@ async fn games_config(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<GamesConfigPayload>,
 ) -> impl IntoResponse {
-    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
@@ -1018,7 +1118,8 @@ async fn games_config(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn toggle_command(
@@ -1041,7 +1142,11 @@ async fn mixton_setup(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    let num_teams = payload.get("numTeams").and_then(|v| v.as_u64()).unwrap_or(2).clamp(2, 8) as usize;
+    let num_teams = payload
+        .get("numTeams")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .clamp(2, 8) as usize;
 
     while state.teams.len() < num_teams {
         let idx = state.teams.len() + 1;
@@ -1075,7 +1180,8 @@ async fn mixton_setup(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn mixton_start(
@@ -1088,7 +1194,10 @@ async fn mixton_start(
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
-        state.pick_order = orders.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        state.pick_order = orders
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
     }
     state.draft_started = true;
     state.draft_finished = false;
@@ -1096,7 +1205,8 @@ async fn mixton_start(
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn mixton_pick_order(
@@ -1109,12 +1219,16 @@ async fn mixton_pick_order(
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
-        state.pick_order = orders.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        state.pick_order = orders
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
     }
 
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn mixton_create_match(
@@ -1128,8 +1242,14 @@ async fn mixton_create_match(
 
     let match_id = format!("match_{}", chrono::Utc::now().timestamp_millis());
 
-    let team_a_id = payload.get("teamIdA").and_then(|v| v.as_str()).unwrap_or("team_1");
-    let team_b_id = payload.get("teamIdB").and_then(|v| v.as_str()).unwrap_or("team_2");
+    let team_a_id = payload
+        .get("teamIdA")
+        .and_then(|v| v.as_str())
+        .unwrap_or("team_1");
+    let team_b_id = payload
+        .get("teamIdB")
+        .and_then(|v| v.as_str())
+        .unwrap_or("team_2");
 
     for t in &mut state.teams {
         if t.id == team_a_id || t.id == team_b_id {
@@ -1185,11 +1305,27 @@ async fn start_veto(
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    let team_a_id = payload.get("teamIdA").and_then(|v| v.as_str()).unwrap_or("team_1").to_string();
-    let team_b_id = payload.get("teamIdB").and_then(|v| v.as_str()).unwrap_or("team_2").to_string();
-    let bet = payload.get("betAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let team_a_id = payload
+        .get("teamIdA")
+        .and_then(|v| v.as_str())
+        .unwrap_or("team_1")
+        .to_string();
+    let team_b_id = payload
+        .get("teamIdB")
+        .and_then(|v| v.as_str())
+        .unwrap_or("team_2")
+        .to_string();
+    let bet = payload
+        .get("betAmount")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
-    let active_maps: Vec<MapInfo> = state.map_catalog.iter().filter(|m| m.active).cloned().collect();
+    let active_maps: Vec<MapInfo> = state
+        .map_catalog
+        .iter()
+        .filter(|m| m.active)
+        .cloned()
+        .collect();
     let pool_len = active_maps.len();
     let ban_count = if pool_len > 1 { pool_len - 1 } else { 0 };
     let mut ban_sequence = Vec::with_capacity(ban_count);
@@ -1248,7 +1384,11 @@ async fn map_ban(
 
     let map_id = payload.get("mapId").and_then(|v| v.as_str()).unwrap_or("");
     if map_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Debes indicar el mapa a banear." }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Debes indicar el mapa a banear." })),
+        )
+            .into_response();
     }
 
     if let Some(ref mut veto) = state.map_veto {
@@ -1271,7 +1411,11 @@ async fn map_ban(
                 veto.final_chosen_map = Some(chosen);
             } else if let Some(team_a) = &veto.team_id_a {
                 if let Some(team_b) = &veto.team_id_b {
-                    veto.turn = if veto.turn == *team_a { team_b.clone() } else { team_a.clone() };
+                    veto.turn = if veto.turn == *team_a {
+                        team_b.clone()
+                    } else {
+                        team_a.clone()
+                    };
                 }
             }
         }
@@ -1352,7 +1496,8 @@ async fn chat_message(
 
     if is_multipart {
         let req_again = axum::extract::Request::from_parts(parts, body);
-        if let Ok(mut multipart) = axum::extract::Multipart::from_request(req_again, &manager).await {
+        if let Ok(mut multipart) = axum::extract::Multipart::from_request(req_again, &manager).await
+        {
             while let Ok(Some(field)) = multipart.next_field().await {
                 let name = field.name().unwrap_or("").to_string();
                 if name == "message" || name == "content" {
@@ -1371,7 +1516,11 @@ async fn chat_message(
                         .unwrap_or("png");
                     if let Ok(bytes) = field.bytes().await {
                         if !bytes.is_empty() {
-                            let filename = format!("chat_{}.{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), ext);
+                            let filename = format!(
+                                "chat_{}.{}",
+                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                                ext
+                            );
                             let target_path = format!("public/uploads/{}", filename);
                             let srv_path = format!("/srv/public/uploads/{}", filename);
                             let _ = tokio::fs::create_dir_all("public/uploads").await;
@@ -1385,9 +1534,16 @@ async fn chat_message(
             }
         }
     } else {
-        let bytes = axum::body::to_bytes(body, 1024 * 64).await.unwrap_or_default();
+        let bytes = axum::body::to_bytes(body, 1024 * 64)
+            .await
+            .unwrap_or_default();
         if let Ok(payload) = serde_json::from_slice::<SendChatPayload>(&bytes) {
-            message_text = payload.message.or(payload.content).unwrap_or_default().trim().to_string();
+            message_text = payload
+                .message
+                .or(payload.content)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             body_guild_id = payload.guild_id;
             author_id = payload.author_id.or(payload.discord_id);
             author_name = payload.author_name.or(payload.author);
@@ -1456,7 +1612,9 @@ async fn link_steam(
         )
             .into_response();
     }
-    let input = payload.steam_input.unwrap_or_else(|| "detect_faceit".to_string());
+    let input = payload
+        .steam_input
+        .unwrap_or_else(|| "detect_faceit".to_string());
     Json(json!({
         "success": true,
         "message": format!("Steam vinculado ({input})"),

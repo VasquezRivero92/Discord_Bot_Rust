@@ -97,7 +97,10 @@ mod tests {
     #[test]
     fn default_catalog_has_7_premier_maps() {
         let catalog = default_catalog();
-        let premier_count = catalog.iter().filter(|m| m.is_official_premier && m.active).count();
+        let premier_count = catalog
+            .iter()
+            .filter(|m| m.is_official_premier && m.active)
+            .count();
         assert_eq!(premier_count, 7);
     }
 }

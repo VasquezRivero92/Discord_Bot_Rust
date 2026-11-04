@@ -82,7 +82,10 @@ impl Player {
         }
         if self.discord_user.is_none() {
             let avatar = format_discord_avatar(&self.discord_id, self.avatar.as_deref());
-            let name = self.faceit_nickname.clone().unwrap_or_else(|| self.nickname.clone());
+            let name = self
+                .faceit_nickname
+                .clone()
+                .unwrap_or_else(|| self.nickname.clone());
             self.discord_user = Some(DiscordUserDetails {
                 username: self.nickname.clone(),
                 display_name: name,
@@ -224,12 +227,24 @@ pub struct MapVetoState {
     pub started_at: Option<i64>,
 }
 
-fn default_true() -> bool { true }
-fn default_one() -> u32 { 1 }
-fn default_bo1() -> String { "bo1".to_string() }
-fn default_ban() -> String { "ban".to_string() }
-fn default_queue() -> String { "auto".to_string() }
-fn default_steam() -> String { "steam".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_one() -> u32 {
+    1
+}
+fn default_bo1() -> String {
+    "bo1".to_string()
+}
+fn default_ban() -> String {
+    "ban".to_string()
+}
+fn default_queue() -> String {
+    "auto".to_string()
+}
+fn default_steam() -> String {
+    "steam".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -250,7 +265,9 @@ pub struct ChatMessage {
     pub timestamp: i64,
 }
 
-fn default_source() -> String { "web".to_string() }
+fn default_source() -> String {
+    "web".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LobbyState {
@@ -347,7 +364,12 @@ impl LobbyState {
 
         let team_a_id = team_a.id.clone();
         let team_b_id = team_b.id.clone();
-        let active_maps: Vec<MapInfo> = self.map_catalog.iter().filter(|m| m.active).cloned().collect();
+        let active_maps: Vec<MapInfo> = self
+            .map_catalog
+            .iter()
+            .filter(|m| m.active)
+            .cloned()
+            .collect();
         let pool_len = active_maps.len();
         let ban_count = if pool_len > 1 { pool_len - 1 } else { 0 };
         let mut ban_sequence = Vec::with_capacity(ban_count);
@@ -517,7 +539,11 @@ impl LobbyManager {
         let state = states.entry(guild_id.to_string()).or_default();
 
         player.ensure_discord_user();
-        if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == player.discord_id) {
+        if let Some(pos) = state
+            .available_players
+            .iter()
+            .position(|p| p.discord_id == player.discord_id)
+        {
             let existing = &state.available_players[pos];
             if player.faceit_elo == 1000 && existing.faceit_elo != 1000 {
                 player.faceit_elo = existing.faceit_elo;
@@ -545,7 +571,9 @@ impl LobbyManager {
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
 
-        state.available_players.retain(|p| p.discord_id != discord_id);
+        state
+            .available_players
+            .retain(|p| p.discord_id != discord_id);
         for t in &mut state.teams {
             t.players.retain(|p| p.discord_id != discord_id);
             if let Some(ref c) = t.captain {
@@ -568,7 +596,11 @@ impl LobbyManager {
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
 
-        if let Some(p) = state.available_players.iter_mut().find(|p| p.discord_id == discord_id) {
+        if let Some(p) = state
+            .available_players
+            .iter_mut()
+            .find(|p| p.discord_id == discord_id)
+        {
             p.ready = ready;
         }
         for t in &mut state.teams {
@@ -627,7 +659,14 @@ impl LobbyManager {
             picked_maps: Vec::new(),
             ban_history: Vec::new(),
             chosen_map: None,
-            ban_sequence: vec!["team_1".into(), "team_2".into(), "team_1".into(), "team_2".into(), "team_1".into(), "team_2".into()],
+            ban_sequence: vec![
+                "team_1".into(),
+                "team_2".into(),
+                "team_1".into(),
+                "team_2".into(),
+                "team_1".into(),
+                "team_2".into(),
+            ],
             turn: "team_1".into(),
             current_step: "ban".into(),
             active_maps,
@@ -647,11 +686,19 @@ impl LobbyManager {
     }
 
     /// Veto de mapa (Ban).
-    pub async fn ban_map(&self, guild_id: &str, team_id: &str, map_id: &str) -> Result<LobbyState, String> {
+    pub async fn ban_map(
+        &self,
+        guild_id: &str,
+        team_id: &str,
+        map_id: &str,
+    ) -> Result<LobbyState, String> {
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
 
-        let veto = state.map_veto.as_mut().ok_or("No hay proceso de veto activo")?;
+        let veto = state
+            .map_veto
+            .as_mut()
+            .ok_or("No hay proceso de veto activo")?;
         if veto.turn != team_id {
             return Err("No es el turno de tu equipo para vetar".into());
         }
@@ -669,10 +716,17 @@ impl LobbyManager {
             veto.completed = true;
             veto.chosen_map = Some(chosen.clone());
             veto.final_chosen_map = Some(chosen);
-            info!("[Lobby] Veto completado. Mapa elegido: {:?}", veto.final_chosen_map);
+            info!(
+                "[Lobby] Veto completado. Mapa elegido: {:?}",
+                veto.final_chosen_map
+            );
         } else {
             // Alternar turno
-            veto.turn = if team_id == "team_1" { "team_2".into() } else { "team_1".into() };
+            veto.turn = if team_id == "team_1" {
+                "team_2".into()
+            } else {
+                "team_1".into()
+            };
         }
 
         state.updated_at = Utc::now().timestamp_millis();
@@ -750,7 +804,10 @@ mod tests {
         let mgr = LobbyManager::new("guild_123");
         mgr.start_map_veto("guild_123").await;
 
-        let s = mgr.ban_map("guild_123", "team_1", "de_mirage").await.unwrap();
+        let s = mgr
+            .ban_map("guild_123", "team_1", "de_mirage")
+            .await
+            .unwrap();
         let veto = s.map_veto.unwrap();
         assert!(veto.banned_maps.contains(&"de_mirage".to_string()));
         assert_eq!(veto.turn, "team_2");
