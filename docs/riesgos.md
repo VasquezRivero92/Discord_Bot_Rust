@@ -96,6 +96,14 @@ un canal; el `Stream` devuelto lee de ese canal. El stream es perezoso (el liste
 pedir el primer elemento) y soltarlo cierra el listener. Tipo de retorno:
 `impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static` (no hizo falta un `Box`).
 
+`watch_document(colección, id)` es lo mismo con un target de documentos (`DocumentsTarget`) que
+lleva solo ese id (el `doc(id).onSnapshot` de Node): Firestore no envía ni cobra los cambios de
+los demás documentos de la colección. La traducción es la misma; un documento que no existe no
+llega en la instantánea y su `CURRENT` da `Synced([])`. Es lo que usa el watcher de ajustes
+globales (`faceit_config/settings`); el target se construye con `listen_target_type`, una función
+pura con prueba. No se ha ejecutado contra un servidor (prueba `#[ignore]`
+`watch_document_ignores_other_documents`).
+
 Traducción de eventos:
 
 | Evento de Firestore | `ChangeEvent` |
@@ -201,12 +209,20 @@ la única cota de lo desactualizados que pueden estar los datos.
   que el índice que falte salga a la luz. `MatchHistoryRepo` reproduce el respaldo del legacy
   (barrido por `createdAt` y filtro en memoria) ante cualquier error salvo `QuotaExceeded`; ahí el
   índice sí consta en `firestore.indexes.json`. `claims`/`orders` no necesitan índices.
-- **Sin verificación en vivo.** `FirestoreClient::query`, `count` y `list_raw_docs`, y los
-  listeners de Firestore (watcher de `faceit_config/settings` y de ajustes por servidor), nunca se
-  han ejecutado aquí contra el emulador ni contra Firestore real: solo hay pruebas sin red (dobles
-  de los repositorios y construcción de las consultas). Los índices de arriba, el código que
+- **Sin verificación en vivo.** `FirestoreClient::query`, `count` y `list_raw_docs`, y el único
+  listener que corre en producción, nunca se han ejecutado aquí contra el emulador ni contra
+  Firestore real: solo hay pruebas sin red (dobles de los repositorios y construcción de las
+  consultas y del target de escucha). Ese listener es el watcher de ajustes globales, que arranca
+  `routes::admin` con Firestore configurado y escucha **solo el documento**
+  `faceit_config/settings` (`watch_document`), como el `doc('settings').onSnapshot` del legacy; los
+  demás documentos de `faceit_config` (`mixton_chat_<guild>`, `mixton_lobby_<guild>`, `panel_*`,
+  `status_panel`, `mixton_ready_panel_*`, `messages`), que Node escribe a menudo, no le llegan ni
+  cuestan lecturas. El watcher de ajustes por servidor (`FirestoreGuildSettingsRepo`, que sí
+  escucharía la colección `guild_settings` entera) existe y está probado con dobles, pero **no se
+  lanza en producción**: ninguna ruta montada lo crea. Los índices de arriba, el código que
   devuelve Firestore ante un índice que falta y la agregación `COUNT` de `/stats` están sin
-  comprobar contra un servidor.
+  comprobar contra un servidor. `count` devuelve `DataError::Decode` (no 0) si la respuesta no
+  trae el recuento, y `/stats` cae entonces a la lectura completa.
 - **Capa de entorno congelada al arrancar.** `effective_config_for_guild` toma la capa de entorno
   de `Config` (`EnvDefaults`), leída una sola vez al arrancar. En Node, `POST /settings` reescribe
   `process.env` en caliente, así que un consumidor futuro en Rust vería los valores anteriores

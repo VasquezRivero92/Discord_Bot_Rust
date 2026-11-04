@@ -187,6 +187,44 @@ async fn watch_emits_modified_after_update() {
     }
 }
 
+/// Requiere el emulador (ver la cabecera del archivo). `watch_document` solo entrega eventos del
+/// documento observado, nunca de sus vecinos de colección.
+#[tokio::test]
+#[ignore = "requiere FIRESTORE_EMULATOR_HOST con el emulador de Firestore en marcha"]
+async fn watch_document_ignores_other_documents() {
+    let client = emulator_client().await;
+    let collection = unique("watchdoc");
+    rest_upsert(&collection, "settings", r#"{"v":{"stringValue":"a"}}"#).await;
+    rest_upsert(&collection, "mixton_chat_x", r#"{"v":{"stringValue":"a"}}"#).await;
+
+    let mut events = Box::pin(client.watch_document(&collection, "settings"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    macro_rules! next {
+        () => {
+            tokio::time::timeout_at(deadline, events.next())
+                .await
+                .expect("evento a tiempo")
+                .expect("el stream sigue abierto")
+                .expect("evento sin error")
+        };
+    }
+    assert_eq!(next!(), ChangeEvent::Added("settings".into()));
+    assert_eq!(next!(), ChangeEvent::Synced(vec!["settings".into()]));
+
+    rest_upsert(&collection, "mixton_chat_x", r#"{"v":{"stringValue":"b"}}"#).await;
+    rest_upsert(&collection, "settings", r#"{"v":{"stringValue":"b"}}"#).await;
+    loop {
+        let event = next!();
+        assert!(
+            !format!("{event:?}").contains("mixton_chat_x"),
+            "evento de otro documento: {event:?}"
+        );
+        if event == ChangeEvent::Modified("settings".into()) {
+            break;
+        }
+    }
+}
+
 /// Requiere el emulador (ver la cabecera del archivo).
 #[tokio::test]
 #[ignore = "requiere FIRESTORE_EMULATOR_HOST con el emulador de Firestore en marcha"]

@@ -9,21 +9,46 @@ use crate::error::DataError;
 use firestore::gcloud_sdk::google::firestore::v1::target_change::TargetChangeType;
 use firestore::gcloud_sdk::google::firestore::v1::{value::ValueType, Value as PbValue};
 use firestore::{
-    FirestoreDb, FirestoreDbOptions, FirestoreDocument, FirestoreListenEvent, FirestoreListener,
-    FirestoreListenerTarget, FirestoreMemListenStateStorage, FirestoreQueryCollection,
+    FirestoreCollectionDocuments, FirestoreDb, FirestoreDbOptions, FirestoreDocument,
+    FirestoreListenEvent, FirestoreListener, FirestoreListenerTarget,
+    FirestoreListenerTargetParams, FirestoreMemListenStateStorage, FirestoreQueryCollection,
     FirestoreQueryDirection, FirestoreQueryFilter, FirestoreQueryFilterCompare,
     FirestoreQueryFilterComposite, FirestoreQueryFilterCompositeOperator, FirestoreQueryOrder,
-    FirestoreQueryParams, FirestoreValue,
+    FirestoreQueryParams, FirestoreTargetType, FirestoreValue,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-/// Id del único target que registra cada listener de [`FirestoreClient::watch_collection`].
+/// Id del único target que registra cada listener de [`FirestoreClient::watch_collection`] y
+/// [`FirestoreClient::watch_document`].
 const WATCH_TARGET_ID: u32 = 1;
+
+/// Qué observa un listener: una colección entera o un solo documento.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchScope {
+    /// Toda la colección, sin filtros (un target de consulta).
+    Collection(String),
+    /// Solo `collection/id` (un target de documentos con ese único id): Firestore no envía ni
+    /// cobra los cambios de los demás documentos de la colección.
+    Document { collection: String, id: String },
+}
+
+/// Target de escucha del crate `firestore` para `scope`. Pura (sin red): es exactamente lo que
+/// [`FirestoreClient::watch_collection`] / [`FirestoreClient::watch_document`] registran.
+pub(crate) fn listen_target_type(scope: &WatchScope) -> FirestoreTargetType {
+    match scope {
+        WatchScope::Collection(collection) => FirestoreTargetType::Query(
+            FirestoreQueryParams::new(FirestoreQueryCollection::Single(collection.clone())),
+        ),
+        WatchScope::Document { collection, id } => FirestoreTargetType::Documents(
+            FirestoreCollectionDocuments::new(collection.clone(), vec![id.clone()]),
+        ),
+    }
+}
 
 /// Tamaño de página de `list_docs` (máximo que acepta Firestore por página: 300 es holgado).
 const LIST_PAGE_SIZE: usize = 300;
@@ -297,33 +322,60 @@ impl FirestoreClient {
         &self,
         collection: &str,
     ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
+        self.watch(WatchScope::Collection(collection.to_string()))
+    }
+
+    /// Como [`FirestoreClient::watch_collection`] pero solo para `collection/id` (el
+    /// `doc(id).onSnapshot` de Node): Firestore solo envía (y cobra) los cambios de ese documento.
+    ///
+    /// Mismo stream y misma semántica: `Added`/`Modified`/`Removed` llevan siempre `id`, cada
+    /// apertura (y reconexión, con `Reset`) termina en un `Synced` con `[id]` si el documento
+    /// existe o con `[]` si no (un documento que no existe no genera ningún evento propio en la
+    /// instantánea), y los errores terminales igual.
+    pub fn watch_document(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
+        self.watch(WatchScope::Document {
+            collection: collection.to_string(),
+            id: id.to_string(),
+        })
+    }
+
+    /// Stream de cambios de `scope` (ver [`FirestoreClient::watch_collection`]).
+    pub fn watch(
+        &self,
+        scope: WatchScope,
+    ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
         let db = self.db.clone();
-        let collection = collection.to_string();
-        futures::stream::once(async move { start_watch(db, collection).await }).flat_map(
-            |started| match started {
+        futures::stream::once(async move { start_watch(db, scope).await }).flat_map(|started| {
+            match started {
                 Ok(events) => events.left_stream(),
                 Err(err) => futures::stream::once(async move { Err(err) }).right_stream(),
-            },
-        )
+            }
+        })
     }
 }
 
 type Listener = FirestoreListener<FirestoreDb, FirestoreMemListenStateStorage>;
 
-/// Abre el listener de `collection` y devuelve el stream de eventos ya traducidos.
+/// Abre el listener de `scope` y devuelve el stream de eventos ya traducidos.
 async fn start_watch(
     db: FirestoreDb,
-    collection: String,
+    scope: WatchScope,
 ) -> Result<impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static, DataError> {
     let mut listener: Listener = db
         .create_listener(FirestoreMemListenStateStorage::new())
         .await?;
     let target = FirestoreListenerTarget::new(WATCH_TARGET_ID);
-    db.fluent()
-        .select()
-        .from(collection.as_str())
-        .listen()
-        .add_target(target.clone(), &mut listener)?;
+    // Lo mismo que `db.fluent().select()...listen().add_target(..)` (sin etiquetas ni opciones
+    // de petición), pero con el target construido por `listen_target_type`, que es puro.
+    listener.add_target(FirestoreListenerTargetParams::new(
+        target.clone(),
+        listen_target_type(&scope),
+        HashMap::new(),
+    ))?;
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<ChangeEvent, DataError>>();
     let state = Arc::new(Mutex::new(WatchState::new(WATCH_TARGET_ID as i32)));
@@ -1014,6 +1066,39 @@ mod tests {
             !state.take_resync_request(),
             "la petición se consume una vez"
         );
+    }
+
+    // --- listen_target_type ----------------------------------------------------------------
+
+    #[test]
+    fn collection_scope_is_unfiltered_query_target() {
+        match listen_target_type(&WatchScope::Collection("guild_settings".into())) {
+            FirestoreTargetType::Query(q) => {
+                assert_eq!(
+                    q.collection_id,
+                    FirestoreQueryCollection::Single("guild_settings".into())
+                );
+                assert!(q.filter.is_none());
+                assert!(q.parent.is_none());
+            }
+            other => panic!("se esperaba un target de consulta: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_scope_is_single_document_target() {
+        let scope = WatchScope::Document {
+            collection: "faceit_config".into(),
+            id: "settings".into(),
+        };
+        match listen_target_type(&scope) {
+            FirestoreTargetType::Documents(docs) => {
+                assert_eq!(docs.collection, "faceit_config");
+                assert_eq!(docs.documents, vec!["settings".to_string()]);
+                assert!(docs.parent.is_none());
+            }
+            other => panic!("se esperaba un target de documentos: {other:?}"),
+        }
     }
 
     // --- count: decodificación del resultado de la agregación ------------------------------

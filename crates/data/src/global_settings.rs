@@ -12,7 +12,7 @@
 
 use crate::cache::TtlCache;
 use crate::error::DataError;
-use crate::firestore::{ChangeEvent, FirestoreClient};
+use crate::firestore::{ChangeEvent, FirestoreClient, WatchScope};
 use crate::guild_settings::GuildSettings;
 use crate::model::lenient_string;
 use crate::source::{from_json, strip_synthetic, DocSource};
@@ -142,9 +142,21 @@ pub trait GlobalSettingsRepo: Send + Sync {
 pub trait GlobalSettingsSource: Send + Sync + 'static {
     /// Lee `faceit_config/settings`; `Ok(None)` si no existe.
     async fn fetch(&self) -> Result<Option<GlobalSettings>, DataError>;
-    /// Stream de cambios de la colección `faceit_config` (el watcher solo mira la clave
-    /// `settings`; los demás documentos no tocan su entrada).
+    /// Stream de cambios del documento `faceit_config/settings` (en producción, un listener de
+    /// ese único documento: [`settings_watch_scope`]). El watcher solo mira la clave `settings`,
+    /// así que un evento de otro id tampoco tocaría su entrada.
     fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>>;
+}
+
+/// Lo que observa el watcher de producción: solo `faceit_config/settings`, como el
+/// `faceit_config.doc('settings').onSnapshot` del legacy (`database.js` ~805). Escuchar la
+/// colección entera traería (y cobraría) cada cambio de `mixton_chat_<guild>`,
+/// `mixton_lobby_<guild>`, `panel_*`, `status_panel`, `messages`..., que Node escribe sin parar.
+pub(crate) fn settings_watch_scope() -> WatchScope {
+    WatchScope::Document {
+        collection: COLLECTION.to_string(),
+        id: DOC_ID.to_string(),
+    }
 }
 
 #[async_trait]
@@ -157,7 +169,7 @@ impl GlobalSettingsSource for FirestoreClient {
     }
 
     fn watch(&self) -> BoxStream<'static, Result<ChangeEvent, DataError>> {
-        self.watch_collection(COLLECTION).boxed()
+        FirestoreClient::watch(self, settings_watch_scope()).boxed()
     }
 }
 
@@ -196,7 +208,7 @@ impl<S: GlobalSettingsSource> FirestoreGlobalSettingsRepo<S> {
         self.restarts.load(Ordering::Relaxed)
     }
 
-    /// Lanza el watcher de `faceit_config` (mismo comportamiento que el de `guild_settings`:
+    /// Lanza el watcher de `faceit_config/settings` (mismo bucle que el de `guild_settings`:
     /// `Added`/`Modified` de `settings` invalidan, `Removed` purga también la copia vieja, `Reset`
     /// invalida, `Synced` sin `settings` purga la copia vieja; reapertura con espera 1 s -> 60 s).
     pub fn spawn_watcher(self: Arc<Self>) -> WatcherHandle {
@@ -1023,7 +1035,9 @@ mod tests {
         assert_eq!(admin(&repo.get().await), Some("r1"));
         assert_eq!(fake.fetches(), 1, "cacheado");
 
-        // Otros documentos de faceit_config no tocan la entrada.
+        // El listener real solo trae `settings` (ver
+        // `production_watcher_targets_only_the_settings_document`); aun así, un evento de otro
+        // id no tocaría la entrada.
         tx.send(Ok(ChangeEvent::Modified("messages".into())))
             .unwrap();
         settle().await;
@@ -1078,6 +1092,38 @@ mod tests {
         fake.fail(Some(DataError::QuotaExceeded));
         assert_eq!(repo.get().await, GlobalSettings::legacy_defaults());
         assert_eq!(repo.watcher_restarts(), 0);
+    }
+
+    /// El watcher de producción escucha solo el documento `faceit_config/settings` (como el
+    /// `doc('settings').onSnapshot` del legacy): el target que se registra en Firestore lleva ese
+    /// único id, así que los cambios de `mixton_chat_<guild>`, `mixton_lobby_<guild>`,
+    /// `panel_*`, `messages`... ni se leen (no cuestan lecturas) ni llegan a la caché.
+    #[test]
+    fn production_watcher_targets_only_the_settings_document() {
+        use crate::firestore::{listen_target_type, WatchScope};
+        use firestore::FirestoreTargetType;
+
+        let scope = settings_watch_scope();
+        assert_eq!(
+            scope,
+            WatchScope::Document {
+                collection: "faceit_config".into(),
+                id: "settings".into(),
+            }
+        );
+        match listen_target_type(&scope) {
+            FirestoreTargetType::Documents(docs) => {
+                assert_eq!(docs.collection, "faceit_config");
+                assert_eq!(docs.parent, None);
+                assert_eq!(docs.documents, vec!["settings".to_string()]);
+                for other in ["mixton_chat_x", "mixton_lobby_x", "panel_x", "messages"] {
+                    assert!(!docs.documents.iter().any(|d| d == other), "{other}");
+                }
+            }
+            FirestoreTargetType::Query(q) => {
+                panic!("se esperaba un target de documento, no una consulta: {q:?}")
+            }
+        }
     }
 
     #[tokio::test]
