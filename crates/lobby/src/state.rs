@@ -199,6 +199,17 @@ impl LobbyManager {
     }
 
     /// Retorna una copia del estado actual del lobby en memoria.
+    /// Actualiza el estado del lobby y lo difunde a los WebSockets.
+    pub async fn update_state(&self, guild_id: &str, mut new_state: LobbyState) -> LobbyState {
+        let mut states = self.states.write().await;
+        new_state.updated_at = Utc::now().timestamp_millis();
+        states.insert(guild_id.to_string(), new_state.clone());
+        drop(states);
+
+        self.broadcast_state(guild_id).await;
+        new_state
+    }
+
     pub async fn get_state(&self, guild_id: &str) -> LobbyState {
         let states = self.states.read().await;
         states

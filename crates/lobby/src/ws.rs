@@ -6,7 +6,9 @@ use axum::extract::{RawQuery, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{debug, error, warn};
 
 fn extract_guild_id(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
@@ -49,13 +51,14 @@ async fn handle_socket(socket: WebSocket, manager: Arc<LobbyManager>, guild_id: 
             "state": state,
             "availablePlayers": state.available_players,
             "commandEnabled": true,
+            "guildName": "Servidor Oficial",
             "guildId": guild_id
         }
     })
     .to_string();
 
     if let Err(e) = sender.send(Message::Text(initial_state.into())).await {
-        error!("[WS] Error enviando estado inicial: {e}");
+        error!("[WS] Error enviando estado inicial a {guild_id}: {e}");
         return;
     }
 
@@ -70,34 +73,75 @@ async fn handle_socket(socket: WebSocket, manager: Arc<LobbyManager>, guild_id: 
         let _ = sender.send(Message::Text(history_msg.into())).await;
     }
 
+    // Canal interno para coordinar respuestas salientes (Pongs, mensajes directos) hacia el sender
+    let (tx_out, mut rx_out) = mpsc::channel::<Message>(64);
+
     // 3. Suscribirse a las difusiones del guild
     let rx = manager.get_broadcast_channel(&guild_id).await;
     let mut broadcast_rx = rx.subscribe();
 
-    // 4. Bucle bidireccional
+    // 4. Bucle emisor (mensajes directos, difusiones y heartbeat Ping cada 20 segundos)
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
-            }
-        }
-    });
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                Message::Close(_) => break,
-                Message::Ping(_) => {}
-                Message::Pong(_) => {}
-                Message::Text(t) => {
-                    info!("[WS] Mensaje recibido del cliente en {guild_id}: {t}");
+        loop {
+            tokio::select! {
+                Some(msg) = rx_out.recv() => {
+                    if sender.send(msg).await.is_err() {
+                        break;
+                    }
                 }
-                Message::Binary(_) => {}
+                Ok(broadcast_msg) = broadcast_rx.recv() => {
+                    if sender.send(Message::Text(broadcast_msg.into())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    // Enviar Ping frame para evitar que Cloudflare o el navegador cierren el túnel por inactividad
+                    if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    // Si una de las dos tareas finaliza (p. ej. el cliente cerró la pestaña), abortamos la otra limpiamente
+    // 5. Bucle receptor: procesa Pings entrantes de Cloudflare/navegador y responde con Pong
+    let tx_out_clone = tx_out.clone();
+    let gid_clone = guild_id.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(msg_res) = receiver.next().await {
+            match msg_res {
+                Ok(Message::Ping(payload)) => {
+                    // RFC 6455: Todo Ping debe recibir su correspondiente Pong
+                    if tx_out_clone.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Pong(_)) => {
+                    // Pong recibido satisfactoriamente
+                }
+                Ok(Message::Text(t)) => {
+                    if t == "ping" {
+                        let _ = tx_out_clone.send(Message::Text("pong".into())).await;
+                    } else {
+                        debug!("[WS] Mensaje de cliente en {gid_clone}: {t}");
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    debug!("[WS] Cliente cerró el WebSocket en {gid_clone}");
+                    break;
+                }
+                Ok(Message::Binary(_)) => {}
+                Err(e) => {
+                    warn!("[WS] Conexión cerrada o error de lectura en {gid_clone}: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
     tokio::select! {
         _ = (&mut send_task) => recv_task.abort(),
         _ = (&mut recv_task) => send_task.abort(),
