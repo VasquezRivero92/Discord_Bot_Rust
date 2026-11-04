@@ -250,15 +250,7 @@ impl FirestoreClient {
             .aggregate(|a| a.fields([a.field(COUNT_ALIAS).count()]))
             .query()
             .await?;
-        let count = rows
-            .first()
-            .and_then(|row| row.fields.get(COUNT_ALIAS))
-            .and_then(|v| match v.value_type {
-                Some(ValueType::IntegerValue(n)) => u64::try_from(n).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
-        Ok(count)
+        count_from_rows(&rows)
     }
 
     /// Consulta `collection` con los filtros, el orden y el límite de `q` y devuelve los
@@ -383,6 +375,33 @@ async fn start_watch(
             }
         },
     ))
+}
+
+/// Número de la agregación `COUNT` de [`FirestoreClient::count`] a partir de las filas que
+/// devuelve el crate. Pura (sin red).
+///
+/// Una respuesta sin filas, sin el alias [`COUNT_ALIAS`] o con un valor que no es un entero no
+/// negativo es un [`DataError::Decode`], nunca un 0: así quien llama (p. ej. `/stats`) puede caer
+/// a su respaldo en lugar de cachear y servir un recuento falso.
+fn count_from_rows(rows: &[FirestoreDocument]) -> Result<u64, DataError> {
+    let row = rows
+        .first()
+        .ok_or_else(|| DataError::Decode("la agregación COUNT no devolvió filas".into()))?;
+    let value = row.fields.get(COUNT_ALIAS).ok_or_else(|| {
+        DataError::Decode(format!(
+            "la agregación COUNT no trae el alias {COUNT_ALIAS:?}"
+        ))
+    })?;
+    match value.value_type {
+        Some(ValueType::IntegerValue(n)) => u64::try_from(n).map_err(|_| {
+            DataError::Decode(format!(
+                "la agregación COUNT devolvió un entero negativo: {n}"
+            ))
+        }),
+        ref other => Err(DataError::Decode(format!(
+            "la agregación COUNT devolvió un valor que no es entero: {other:?}"
+        ))),
+    }
 }
 
 /// Id de documento (último segmento) de un nombre de recurso de Firestore como
@@ -995,6 +1014,65 @@ mod tests {
             !state.take_resync_request(),
             "la petición se consume una vez"
         );
+    }
+
+    // --- count: decodificación del resultado de la agregación ------------------------------
+
+    fn count_row(fields: &[(&str, ValueType)]) -> Document {
+        Document {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), val(v.clone())))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn count_reads_integer_under_alias() {
+        let rows = [count_row(&[(COUNT_ALIAS, ValueType::IntegerValue(42))])];
+        assert_eq!(count_from_rows(&rows), Ok(42));
+    }
+
+    #[test]
+    fn count_legit_zero_is_ok_zero() {
+        let rows = [count_row(&[(COUNT_ALIAS, ValueType::IntegerValue(0))])];
+        assert_eq!(count_from_rows(&rows), Ok(0));
+    }
+
+    #[test]
+    fn count_without_rows_is_decode_error() {
+        let err = count_from_rows(&[]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn count_row_without_alias_is_decode_error() {
+        let rows = [count_row(&[("otro", ValueType::IntegerValue(7))])];
+        let err = count_from_rows(&rows).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+        let err = count_from_rows(&[count_row(&[])]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn count_non_integer_or_negative_is_decode_error() {
+        for bad in [
+            ValueType::StringValue("42".into()),
+            ValueType::DoubleValue(42.0),
+            ValueType::NullValue(0),
+            ValueType::IntegerValue(-1),
+        ] {
+            let rows = [count_row(&[(COUNT_ALIAS, bad.clone())])];
+            let err = count_from_rows(&rows).unwrap_err();
+            assert!(matches!(err, DataError::Decode(_)), "{bad:?}: {err:?}");
+        }
+        // Valor sin tipo (campo presente pero vacío).
+        let mut row = Document::default();
+        row.fields
+            .insert(COUNT_ALIAS.to_string(), PbValue { value_type: None });
+        let err = count_from_rows(&[row]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
     }
 
     // --- query: construcción de la consulta estructurada ------------------------------------
