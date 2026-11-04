@@ -205,8 +205,11 @@ pub(crate) struct YapeCache {
 struct YapeState {
     /// Datos y el instante en que **terminó** su lectura (`Date.now()` tras el `Promise.all`).
     data: Option<(Instant, Arc<Value>)>,
-    /// Lectura en curso, compartida por todas las peticiones que llegan mientras dura.
-    inflight: Option<YapeFetch>,
+    /// Lectura en curso con su número, compartida por todas las peticiones que llegan mientras
+    /// dura.
+    inflight: Option<(u64, YapeFetch)>,
+    /// Número de la última lectura lanzada.
+    last_fetch: u64,
 }
 
 impl YapeCache {
@@ -214,6 +217,23 @@ impl YapeCache {
     /// lanzar una. La lectura corre en su propia tarea (como la promesa de Node, sigue aunque
     /// el cliente se vaya) y al terminar guarda el resultado y suelta `inflight` (`finally`).
     async fn get_or_fetch(self: &Arc<Self>, repos: &AdminRepos) -> Result<Arc<Value>, ()> {
+        self.get_or_fetch_with(|| {
+            let repos = repos.clone();
+            async move { read_yape(&repos).await }.boxed()
+        })
+        .await
+    }
+
+    /// [`YapeCache::get_or_fetch`] con la lectura como parámetro (costura para pruebas): `read`
+    /// solo se llama si hay que lanzar una lectura nueva.
+    ///
+    /// Si la tarea falla (`JoinError`: pánico o cancelación), nunca llega a su `finally`; aquí se
+    /// suelta `inflight` (si sigue siendo esa misma lectura) para que la siguiente petición lance
+    /// otra en lugar de recibir el mismo `Err` compartido hasta el próximo `invalidate`.
+    async fn get_or_fetch_with(
+        self: &Arc<Self>,
+        read: impl FnOnce() -> BoxFuture<'static, Value>,
+    ) -> Result<Arc<Value>, ()> {
         let fetch = {
             let mut st = self.state.lock().expect("mutex envenenado");
             if let Some((at, data)) = &st.data {
@@ -222,24 +242,50 @@ impl YapeCache {
                 }
             }
             match &st.inflight {
-                Some(f) => f.clone(),
+                Some((_, f)) => f.clone(),
                 None => {
+                    st.last_fetch += 1;
+                    let id = st.last_fetch;
                     let cache = self.clone();
-                    let repos = repos.clone();
+                    let read = read();
                     let task = tokio::spawn(async move {
-                        let data = Arc::new(read_yape(&repos).await);
+                        let data = Arc::new(read.await);
                         let mut st = cache.state.lock().expect("mutex envenenado");
                         st.data = Some((Instant::now(), data.clone()));
                         st.inflight = None;
                         data
                     });
-                    let f: YapeFetch = async move { task.await.map_err(|_| ()) }.boxed().shared();
-                    st.inflight = Some(f.clone());
+                    // Débil: la lectura guardada en `inflight` no mantiene viva su propia caché.
+                    let cache = Arc::downgrade(self);
+                    let f: YapeFetch = async move {
+                        task.await.map_err(|err| {
+                            tracing::error!("La lectura Yape terminó sin resultado: {err}");
+                            if let Some(cache) = cache.upgrade() {
+                                cache.clear_failed_inflight(id);
+                            }
+                        })
+                    }
+                    .boxed()
+                    .shared();
+                    st.inflight = Some((id, f.clone()));
                     f
                 }
             }
         };
         fetch.await
+    }
+
+    /// Suelta `inflight` si sigue siendo la lectura `id` (que ha fallado); una lectura más nueva,
+    /// lanzada tras un `invalidate`, se conserva.
+    fn clear_failed_inflight(&self, id: u64) {
+        let mut st = self.state.lock().expect("mutex envenenado");
+        if st
+            .inflight
+            .as_ref()
+            .is_some_and(|(current, _)| *current == id)
+        {
+            st.inflight = None;
+        }
     }
 
     /// `invalidateYapeCache()`: sin datos ni lectura en curso (la que estuviera en marcha
@@ -327,6 +373,40 @@ pub async fn invalidate_after_legacy_writes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Si la tarea de la lectura Yape falla (pánico o cancelación: `JoinError`), la siguiente
+    /// petición lanza una lectura nueva en lugar de recibir el mismo `Err` compartido hasta un
+    /// `manual-approve`.
+    #[tokio::test]
+    async fn failed_yape_read_is_not_shared_forever() {
+        let cache = Arc::new(YapeCache::default());
+        let first = cache
+            .get_or_fetch_with(|| {
+                async { panic!("lectura Yape rota (esperado en la prueba)") }.boxed()
+            })
+            .await;
+        assert_eq!(first, Err(()));
+        assert!(
+            cache.state.lock().unwrap().inflight.is_none(),
+            "la lectura fallida se suelta"
+        );
+        let second = cache
+            .get_or_fetch_with(|| async { json!({ "ok": true }) }.boxed())
+            .await;
+        assert_eq!(second.map(|v| (*v).clone()), Ok(json!({ "ok": true })));
+    }
+
+    /// Solo se suelta la lectura fallida, no una más nueva lanzada tras un `invalidate`.
+    #[tokio::test]
+    async fn clearing_a_failed_read_keeps_a_newer_one() {
+        let cache = YapeCache::default();
+        let newer: YapeFetch = async { Ok(Arc::new(json!(1))) }.boxed().shared();
+        cache.state.lock().unwrap().inflight = Some((2, newer));
+        cache.clear_failed_inflight(1);
+        assert!(cache.state.lock().unwrap().inflight.is_some());
+        cache.clear_failed_inflight(2);
+        assert!(cache.state.lock().unwrap().inflight.is_none());
+    }
 
     #[test]
     fn legacy_writes_match_like_express() {
