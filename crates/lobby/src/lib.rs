@@ -1,10 +1,15 @@
 //! Crate `lobby`: Gestión en tiempo real del lobby Mixton, salas y WebSockets.
 
+pub mod draft;
 pub mod maps;
 pub mod routes;
 pub mod state;
 pub mod ws;
 
+pub use draft::{
+    assign_captain, auto_assign_captains, generate_draft_pick_sequence, is_captain_eligible,
+    player_tier, proposal_to_f64, set_captain_proposal, set_captain_ready,
+};
 pub use maps::{default_catalog, MapInfo};
 pub use routes::{router, LobbyApiState};
 pub use state::{ChatMessage, LobbyManager, LobbyState, LobbyTeam, MapVetoState, Player};
