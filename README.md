@@ -34,8 +34,9 @@ Con Firestore configurado, Rust sirve también diez lecturas del panel de
 administración: `GET /api/admin/claims`, `/claims/:code`, `/orders`, `/logs`,
 `/support-calls`, `/messages`, `/matches/history`, `/stats`, `/users/backup` y
 `/yape/transactions`. Sin Firestore siguen en Node. Todo lo demás de
-`/api/admin/*` sigue en Node por el proxy: las escrituras y las lecturas
-`/stats/:nickname`, `/matches/:id/demo` y `/settings`. El proxy tiene además dos
+`/api/admin/*` sigue en Node por el proxy: las escrituras y el resto de
+lecturas, entre otras `/users`, `/matches`, `/guilds`, `/stats/:nickname`,
+`/matches/:id/demo` y `/settings` (lista completa en el runbook, §3.4). El proxy tiene además dos
 guardas de tiempo opcionales (`PROXY_FIRST_BYTE_TIMEOUT_SECS`,
 `WS_IDLE_TIMEOUT_SECS`), desactivadas por defecto.
 

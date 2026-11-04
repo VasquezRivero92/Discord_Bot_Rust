@@ -25,8 +25,8 @@ Precedencia dentro de `web::build_app` (gana la primera que coincide):
    servidos desde `STATIC_DIR`, con las mismas cabeceras de caché que el legado.
 4. Todo lo demás pasa a Node por el proxy (HTTP y WebSocket). Eso incluye
    `/auth/discord/callback`, `/auth/steam*`, `/auth/demo-login`, `/health`,
-   el resto de `/api/admin/*` (todas las escrituras y, entre las lecturas,
-   `/stats/:nickname`, `/matches/:id/demo` y `/settings`),
+   el resto de `/api/admin/*` (todas las escrituras y las demás lecturas, ver
+   3.4),
    `/api/lobby/*` (incluido el WebSocket `/api/lobby/mixton-ws`),
    `/api/cs2/*`, `/webhook*`, `POST /api/reclamaciones` y `POST /api/checkout/purchase`.
 
@@ -58,11 +58,23 @@ El proxy tiene dos guardas de tiempo opcionales, **desactivadas por defecto**
   `504 {"error":"Servicio no disponible"}`. El plazo cuenta desde que se envía la
   petición, incluida la subida del cuerpo si Node lo lee antes de contestar. Una
   vez llegada la cabecera, el cuerpo fluye sin límite: nunca se corta una
-  respuesta empezada. No se aplica a `/api/halloween/stream` (SSE; se compara
-  sin distinguir mayúsculas y con una `/` final opcional, como Express) ni a los
-  WebSocket. Es la única ruta de larga duración del legado: no hay más
-  `text/event-stream` ni esperas largas en `index.js`, `routes/*.js` y
-  `services/*.js`.
+  respuesta empezada. No se aplica a los WebSocket ni a las rutas de
+  `proxy::FIRST_BYTE_TIMEOUT_EXEMPT`, que se comparan como Express (sin
+  distinguir mayúsculas, con una `/` final opcional y, bajo un montaje, una `/`
+  de más tras él), solo por la ruta:
+  - `GET /api/halloween/stream`: SSE, la única respuesta en streaming del legado.
+  - Las que esperan al servidor de CS2 o a la máquina EC2 antes de contestar:
+    `POST /api/lobby/mixton-create-match` (en modo steam arranca la partida:
+    `launchMatchInternal` -> `cs2ServerManager.startServer` ->
+    `ensureEc2InstanceRunning`), y las que apagan el servidor
+    (`cs2ServerManager.stopServer`, directamente o con `resolveMixtonMatchEnd`):
+    `POST /api/matchzy/event`, `POST /api/lobby/tournament-report-winner`,
+    `POST /api/admin/matches/:id/cleanup`, `POST /api/cs2/match-finish` y
+    `POST /api/cs2/match-cancel`.
+
+  No hay más rutas así en los manejadores HTTP del legado (`index.js`,
+  `routes/*.js`, `webhooks/*.js`). Las llamadas a la API de Faceit reintentan
+  solo errores de red, con esperas de 0,5 s y 1 s, y no están exentas.
 - `WS_IDLE_TIMEOUT_SECS`: cierra un WebSocket proxificado (frame de cierre
   1001 a ambos lados) tras ese tiempo sin ningún frame en ninguna dirección.
   Los ping/pong y los cierres cuentan como actividad. Un socket activo no se
@@ -154,12 +166,25 @@ partida:
 - `PROXY_FIRST_BYTE_TIMEOUT_SECS=90`. Cloudflare espera como mucho 100 s la
   cabecera del origen (planes no Enterprise) y después devuelve su página 524;
   con 90 s, el visitante recibe un 504 JSON y Rust libera la conexión antes. Un
-  valor mayor de 100 no cambia nada para quien llega por el túnel. Los valores
-  bajos cortan peticiones lentas legítimas: el arranque del servidor de CS2
-  enciende la instancia EC2 y espera el SSH hasta unos 45 s
-  (`services/awsEc2Service.js`, `cs2ServerManager.startServer`, llamado desde
-  `routes/lobby.js:4674`). No está comprobado si alguna respuesta HTTP espera a
-  ese arranque, así que no bajes de 60 sin medirlo.
+  valor mayor de 100 no cambia nada para quien llega por el túnel. Valores por
+  debajo de 2 no tienen sentido: el proxy tarda hasta 2 s (`CONNECT_TIMEOUT`)
+  en dar por caído a Node, y con un tope menor un Node inalcanzable respondería
+  504 en lugar de 502. Los valores bajos cortan peticiones lentas legítimas que
+  no están exentas: sin medir, no bajes de 60.
+  Las rutas exentas pueden tardar mucho más que 100 s. En un arranque en frío,
+  `POST /api/lobby/mixton-create-match` (modo steam) espera hasta 120 s a que
+  la instancia EC2 termine de pararse (si se estaba parando), hasta 120 s a que
+  arranque
+  (`waitUntilInstanceStopped`/`waitUntilInstanceRunning`, `maxWaitTime: 120`)
+  y el SSH hasta 15 intentos con 3 s de pausa entre ellos
+  (`waitForSshReady`, `services/awsEc2Service.js`), y después MCSManager y sus
+  alternativas. `stopServer` encadena peticiones a MCSManager con un tope de
+  8 s cada una y una pausa de 2,5 s (unos 26 s en el peor caso). Más allá de
+  100 s, Cloudflare corta y el usuario ve el 524 **mientras Node sigue
+  lanzando la partida**: un reintento llega con el primer lanzamiento aún en
+  curso (no he comprobado qué hace el legado con dos a la vez). Rust no lo
+  evita (la ruta está exenta para no empeorarlo cortando antes); es un riesgo
+  del legado que el corte no cambia.
 - `WS_IDLE_TIMEOUT_SECS=3600`. Ni el lobby (`routes/lobby.js`) ni el cliente
   (`web_panel_src/src/App.tsx`) envían ping, así que el temporizador mide
   silencio real: un lobby sin cambios no emite nada. El cliente se reconecta
@@ -241,9 +266,10 @@ archivo. Si la conexión falla, el binario sale con código 1 y un mensaje claro
 **Qué sirve Rust.** Solo con Firestore configurado (3.3): las diez lecturas
 `GET /api/admin/*` del punto 1 de la sección 1. Se montan todas o ninguna: no
 hay un interruptor por ruta. Siguen en Node, por el proxy, todas las escrituras
-del panel y las lecturas `/stats/:nickname` (API de Faceit),
-`/matches/:id/demo` (estado en memoria de Node y API de Faceit) y `/settings`
-(valores de `process.env` que `POST /settings` reescribe en caliente).
+del panel y el resto de lecturas `GET /api/admin/*`: `/me`, `/steam/status`, `/system`, `/faceit-club-queues`, `/firestore-metrics`, `/users`, `/discord/roles`, `/matches`, `/leaderboard`, `/stats/:nickname`, `/settings`, `/matches/:id/demo`, `/matches/:id/stats`, `/status`, `/guilds`, `/guilds/:guildId/settings` y `/map-catalog`. Entre ellas,
+`/stats/:nickname` usa la API de Faceit, `/matches/:id/demo` el estado en
+memoria de Node y la API de Faceit, y `/settings` valores de `process.env` que
+`POST /settings` reescribe en caliente.
 
 **Las escrituras del panel tienen que pasar por Rust.** `/stats` tiene una caché
 de 60 s por servidor y `/yape/transactions` una de 30 s, como en el legado. Node
@@ -254,7 +280,11 @@ cuando Node contesta, a través del proxy, `POST /api/admin/users/:id/unlink`,
 directamente en Node (`:3001`, sin pasar por Rust), las lecturas de Rust pueden
 quedar desactualizadas hasta 60 s (`/stats`) o 30 s (`/yape/transactions`).
 Los cambios que no hace el panel (p. ej. un usuario que se vincula por Discord)
-solo los cubre el TTL, igual que en Node.
+solo los cubre el TTL, igual que en Node. Con `PROXY_FIRST_BYTE_TIMEOUT_SECS`,
+esas tres escrituras no están exentas: si Node tarda y Rust responde 504, Rust
+ya ha vaciado su caché, pero Node puede terminar la escritura después. Una
+lectura entre medias vuelve a guardar el dato anterior, que dura hasta el TTL
+(60 s o 30 s).
 
 **Rollback por ruta.** No hay variable ni lista de rutas configurable: el
 reparto lo decide el código (`routes::admin::simple_reads::router` y
