@@ -234,13 +234,16 @@ async fn wallet() -> impl IntoResponse {
 
 async fn guilds(State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
     let g_id = manager.resolve_guild_id(None);
-    Json(json!([
-        {
-            "id": g_id,
-            "name": "Servidor Oficial",
-            "icon": null
-        }
-    ]))
+    Json(json!({
+        "guilds": [
+            {
+                "id": g_id,
+                "name": "Servidor Oficial",
+                "icon": null,
+                "memberCount": 0
+            }
+        ]
+    }))
 }
 
 async fn player_balance(
