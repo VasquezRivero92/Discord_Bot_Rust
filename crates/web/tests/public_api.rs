@@ -300,6 +300,9 @@ async fn claim_lookup_error_maps_to_legacy_500_without_internal_text() {
         async fn get_by_code(&self, _code: &str) -> Result<Option<Claim>, DataError> {
             Err(DataError::Firestore("INTERNAL-SECRET-DETAIL".into()))
         }
+        async fn list(&self, _limit: u32, _status: Option<&str>) -> Result<Vec<Claim>, DataError> {
+            Err(DataError::Firestore("INTERNAL-SECRET-DETAIL".into()))
+        }
     }
     let app = public_api::router(Arc::new(Failing));
     let (status, _, body) = call(&app, Method::GET, "/api/reclamaciones/X", &[]).await;

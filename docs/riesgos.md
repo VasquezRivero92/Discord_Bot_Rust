@@ -96,6 +96,14 @@ un canal; el `Stream` devuelto lee de ese canal. El stream es perezoso (el liste
 pedir el primer elemento) y soltarlo cierra el listener. Tipo de retorno:
 `impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static` (no hizo falta un `Box`).
 
+`watch_document(colección, id)` es lo mismo con un target de documentos (`DocumentsTarget`) que
+lleva solo ese id (el `doc(id).onSnapshot` de Node): Firestore no envía ni cobra los cambios de
+los demás documentos de la colección. La traducción es la misma; un documento que no existe no
+llega en la instantánea y su `CURRENT` da `Synced([])`. Es lo que usa el watcher de ajustes
+globales (`faceit_config/settings`); el target se construye con `listen_target_type`, una función
+pura con prueba. No se ha ejecutado contra un servidor (prueba `#[ignore]`
+`watch_document_ignores_other_documents`).
+
 Traducción de eventos:
 
 | Evento de Firestore | `ChangeEvent` |
@@ -171,3 +179,86 @@ la única cota de lo desactualizados que pueden estar los datos.
    errores realistas en un doble, `DataError::from(tonic::Status::...)` aplica el mismo mapeo que
    el cliente real. Si la Tarea 11 necesita intercambiar el cliente, el trait de repositorio es
    suyo.
+
+## Fase 2A
+
+- **Índices compuestos (requisito de despliegue; Rust nunca los crea).** `FirestoreClient::query`
+  con un filtro sobre un campo y `order_by` sobre *otro* necesita un índice compuesto en Firestore;
+  sin él responde `FAILED_PRECONDITION` (llega como `DataError::Firestore`). Combinaciones que usa
+  el legacy (`database.js`):
+  - `faceit_matches_history`: `guild_id ==` + `createdAt desc`. Está en
+    `firestore.indexes.json` del legacy, así que el índice ya se despliega.
+  - `faceit_bot_logs` (`getRecentLogs`) y `faceit_support_calls` (`getSupportCalls`): `guild_id ==`
+    + `createdAt desc` cuando se pasa `guildId`. **No constan** en `firestore.indexes.json`; no he
+    podido comprobar si existen en la consola de Firebase del proyecto real. Esas lecturas ya están
+    portadas (`/logs`, `/support-calls`), así que antes de activar Firestore en Rust hay que
+    confirmar que el índice (`guild_id` asc, `createdAt` desc) de cada colección está desplegado,
+    o añadirlo al archivo de índices del legacy (paso previo en `runbook-corte.md` 3.4). Sin
+    `guildId` solo ordenan por `createdAt` (índice automático de un campo).
+  - `claims` y `orders` (`getClaims`/`getOrders`): solo filtro `status ==`, sin orden en Firestore
+    (el legacy ordena en memoria). No necesitan índice si el repositorio hace lo mismo.
+  - `faceit_users` (`mixton_ready ==` + `mixton_guild_id ==`): solo igualdades, índice ya listado en
+    `firestore.indexes.json`.
+- **Listas vacías que pueden esconder un índice que falta (Tarea 4).** El legacy traga cualquier
+  error de `getRecentLogs` y `getSupportCalls` y responde `{ logs: [] }` / `{ calls: [] }` con 200;
+  si en producción falta el índice compuesto `guild_id` + `createdAt desc` de `faceit_bot_logs` o
+  de `faceit_support_calls`, el panel de un admin de servidor (que siempre filtra por su guild)
+  puede llevar tiempo mostrando listas vacías sin que nadie lo note. Los repos de Rust
+  (`LogsRepo`, `SupportCallsRepo`) **no** tragan: devuelven el `DataError` (`Firestore` con
+  `FAILED_PRECONDITION`, o `QuotaExceeded`) y es la ruta (Tarea 7) la que, para no cambiar la
+  respuesta, debe convertirlo en la lista vacía del legacy, pero registrándolo en el log, de modo
+  que el índice que falte salga a la luz. `MatchHistoryRepo` reproduce el respaldo del legacy
+  (barrido por `createdAt` y filtro en memoria) ante cualquier error salvo `QuotaExceeded`; ahí el
+  índice sí consta en `firestore.indexes.json`. `claims`/`orders` no necesitan índices.
+- **`/matches/history` sin la caché del legacy.** `getMatchHistory` (`database.js` ~1669) guarda
+  cada resultado 5 min (`MATCH_HISTORY_TTL`) por servidor y límite, y comparte la lectura en
+  curso entre peticiones iguales. Rust no cachea: cada petición lee hasta 50 documentos, y hasta
+  200 si cae al respaldo sin índice (`max(limit * 4, 60)`). Con la cuota agotada Rust responde
+  `{ history: [] }`, mientras que el legacy seguiría sirviendo su copia (si la tenía de los
+  últimos 5 min). Más lecturas por visita al panel y un historial vacío ante cuota agotada.
+- **`/claims`: campos tipados con pérdida.** `Claim` tipa sus campos conocidos con lectores
+  tolerantes: un número donde se espera texto sale como texto (`lenient_string`), un valor de
+  otro tipo o un `null` se lee como ausente y no sale en el JSON, un objeto esperado que no lo
+  es también se omite, y `createdAt` solo se conserva si es una fecha o un objeto (solo
+  `updatedAt` y `respondedAt` se reenvían tal cual). Los campos no tipados (`extra`) no pierden
+  nada. Node reenvía el documento tal cual (`res.json`), así que con documentos
+  irregulares la salida de `/claims` (y de `/claims/:code`) puede diferir de la de Node. Con
+  datos bien formados coinciden. El contraste de la Tarea 0 del plan de la fase 2A
+  (`contrast`, runbook 5.1) tiene que incluir reclamaciones con esos casos (número en un campo de
+  texto, `null`, tipo cambiado) para medir la diferencia antes del corte.
+- **Sin verificación en vivo.** `FirestoreClient::query`, `count` y `list_raw_docs`, y el único
+  listener que corre en producción, nunca se han ejecutado aquí contra el emulador ni contra
+  Firestore real: solo hay pruebas sin red (dobles de los repositorios y construcción de las
+  consultas y del target de escucha). Ese listener es el watcher de ajustes globales, que arranca
+  `routes::admin` con Firestore configurado y escucha **solo el documento**
+  `faceit_config/settings` (`watch_document`), como el `doc('settings').onSnapshot` del legacy; los
+  demás documentos de `faceit_config` (`mixton_chat_<guild>`, `mixton_lobby_<guild>`, `panel_*`,
+  `status_panel`, `mixton_ready_panel_*`, `messages`), que Node escribe a menudo, no le llegan ni
+  cuestan lecturas. El watcher de ajustes por servidor (`FirestoreGuildSettingsRepo`, que sí
+  escucharía la colección `guild_settings` entera) existe y está probado con dobles, pero **no se
+  lanza en producción**: ninguna ruta montada lo crea. Los índices de arriba, el código que
+  devuelve Firestore ante un índice que falta y la agregación `COUNT` de `/stats` están sin
+  comprobar contra un servidor. `count` devuelve `DataError::Decode` (no 0) si la respuesta no
+  trae el recuento, y `/stats` cae entonces a la lectura completa.
+- **Capa de entorno congelada al arrancar.** `effective_config_for_guild` toma la capa de entorno
+  de `Config` (`EnvDefaults`), leída una sola vez al arrancar. En Node, `POST /settings` reescribe
+  `process.env` en caliente, así que un consumidor futuro en Rust vería los valores anteriores
+  hasta reiniciar `web`. Hoy ninguna ruta montada lo usa (`GET /settings` sigue en Node por esto).
+- **Lectura entre servidores (heredada, decisión del dueño).** `resolveTargetGuildId` no comprueba
+  permisos: un `admin` de servidor puede leer los datos de **cualquier** servidor con `?guildId=` o
+  `x-guild-id`, y con `guildId` vacío lee el ámbito global. Incluye `/users/backup`, que devuelve el
+  documento completo de cada usuario (teléfono y saldo). `/users/backup` está abierto a cualquier
+  admin, como en el legacy. Rust lo replica por paridad; endurecerlo rompe la paridad y necesita
+  una decisión del dueño.
+- **400 que el legacy no tiene.** Rust responde 400 donde Express haría otra cosa:
+  `guildId` como array u objeto de `qs` (`{"error":"guildId inválido"}`); `limit` en forma no
+  soportada (`limit[x]=`, `limit[0]=`) y `status` como array u objeto (`limit inválido`,
+  `status inválido`; el legacy uniría el array o filtraría por él); y un `:code` de
+  `/claims/:code` con codificación `%` mal formada (`400 Bad Request` en texto plano; Express da
+  su 400 en HTML). Solo afecta a consultas fabricadas a mano: el panel nunca las envía.
+- **Solo HS256.** Rust solo acepta cookies firmadas con HS256; `jsonwebtoken` de Node acepta
+  también HS384 y HS512 con el mismo secreto. El legacy solo emite HS256, así que no afecta a
+  cookies reales.
+- **`auth_token` inválido con `admin_token` válido.** Rust deja pasar la petición con el
+  `admin_token`; Node responde 401. Solo afecta a la disponibilidad (ninguna vía de privilegio) y
+  está fijado por un test; la paridad estricta es un cambio pequeño si se quiere.

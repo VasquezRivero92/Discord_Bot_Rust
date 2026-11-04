@@ -37,6 +37,9 @@ pub struct AppDeps {
     /// Source for `GET /api/reclamaciones/:code`. `None` (Firestore disabled)
     /// leaves that route on the proxy: no failing handler is registered.
     pub claims: Option<Arc<dyn ClaimsRepo>>,
+    /// Sources for the migrated `/api/admin/*` reads (Tasks 7 and 8). `None`
+    /// (Firestore disabled) leaves those routes on the proxy.
+    pub admin: Option<routes::admin::AdminRepos>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -45,7 +48,11 @@ pub struct AppDeps {
 ///
 /// 1. migrated routes: `GET /api/ping`, `GET /api/products`,
 ///    `GET /api/reclamaciones/:code` (only with a claims source),
-///    `GET /auth/discord`, `GET /auth/logout`;
+///    `GET /auth/discord`, `GET /auth/logout`, and the migrated
+///    `/api/admin/*` routes (`routes::admin::router`: the single-collection
+///    reads `claims`, `claims/:code`, `orders`, `logs`, `support-calls`,
+///    `messages` and `matches/history`, and the derived reads `stats`,
+///    `users/backup` and `yape/transactions`, only with admin sources);
 /// 2. a wrong method on one of those paths (e.g. `POST /api/ping`) goes to
 ///    the proxy instead of axum's 405 (`method_not_allowed_fallback`);
 /// 3. static files and SPA routes (`static_files::routes_with_fallback`);
@@ -75,10 +82,15 @@ pub fn build_app(deps: AppDeps) -> Router {
         cfg.legacy_url.clone(),
         proxy::ProxyOptions {
             append_peer_to_xff: cfg.proxy_append_peer_to_xff,
+            first_byte_timeout: cfg.proxy_first_byte_timeout,
+            ws_idle_timeout: cfg.ws_idle_timeout,
         },
     );
     let limited_proxy = limit.layer(proxy.clone());
 
+    // Node's panel writes (still proxied) clear the caches of the migrated
+    // reads, like the legacy `invalidateAdminUsersCache`/`invalidateYapeCache`.
+    let admin_caches = deps.admin.as_ref().map(|a| a.caches.clone());
     let mut migrated = routes::diagnostic::router()
         .merge(routes::public_api::products_router())
         .merge(routes::auth::router(routes::auth::AuthState::from_config(
@@ -86,6 +98,17 @@ pub fn build_app(deps: AppDeps) -> Router {
         )));
     if let Some(claims) = deps.claims {
         migrated = migrated.merge(routes::public_api::claims_router(claims));
+    }
+    // `/api/admin/*` migradas (solo esas: el resto sigue en el proxy). Sin
+    // secreto válido (imposible con `Config::from_map`) no se monta nada.
+    match session::SessionState::from_config(cfg) {
+        Ok(session) => {
+            migrated = migrated.merge(routes::admin::router(
+                routes::admin::AdminState { session },
+                deps.admin,
+            ));
+        }
+        Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
     // the rate-limit layer so each such request is counted exactly once (by the
@@ -103,6 +126,13 @@ pub fn build_app(deps: AppDeps) -> Router {
         cfg.static_dir.clone(),
         limited_proxy,
     ));
+    let app = match admin_caches {
+        Some(caches) => app.layer(axum::middleware::from_fn_with_state(
+            caches,
+            routes::admin::invalidate_after_legacy_writes,
+        )),
+        None => app,
+    };
 
     middleware::apply_except_rate_limit(app, cfg)
 }

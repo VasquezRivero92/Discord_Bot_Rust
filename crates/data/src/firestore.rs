@@ -7,22 +7,54 @@
 
 use crate::error::DataError;
 use firestore::gcloud_sdk::google::firestore::v1::target_change::TargetChangeType;
+use firestore::gcloud_sdk::google::firestore::v1::{value::ValueType, Value as PbValue};
 use firestore::{
-    FirestoreDb, FirestoreDbOptions, FirestoreDocument, FirestoreListenEvent, FirestoreListener,
-    FirestoreListenerTarget, FirestoreMemListenStateStorage,
+    FirestoreCollectionDocuments, FirestoreDb, FirestoreDbOptions, FirestoreDocument,
+    FirestoreListenEvent, FirestoreListener, FirestoreListenerTarget,
+    FirestoreListenerTargetParams, FirestoreMemListenStateStorage, FirestoreQueryCollection,
+    FirestoreQueryDirection, FirestoreQueryFilter, FirestoreQueryFilterCompare,
+    FirestoreQueryFilterComposite, FirestoreQueryFilterCompositeOperator, FirestoreQueryOrder,
+    FirestoreQueryParams, FirestoreTargetType, FirestoreValue,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-/// Id del único target que registra cada listener de [`FirestoreClient::watch_collection`].
+/// Id del único target que registra cada listener de [`FirestoreClient::watch_collection`] y
+/// [`FirestoreClient::watch_document`].
 const WATCH_TARGET_ID: u32 = 1;
+
+/// Qué observa un listener: una colección entera o un solo documento.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchScope {
+    /// Toda la colección, sin filtros (un target de consulta).
+    Collection(String),
+    /// Solo `collection/id` (un target de documentos con ese único id): Firestore no envía ni
+    /// cobra los cambios de los demás documentos de la colección.
+    Document { collection: String, id: String },
+}
+
+/// Target de escucha del crate `firestore` para `scope`. Pura (sin red): es exactamente lo que
+/// [`FirestoreClient::watch_collection`] / [`FirestoreClient::watch_document`] registran.
+pub(crate) fn listen_target_type(scope: &WatchScope) -> FirestoreTargetType {
+    match scope {
+        WatchScope::Collection(collection) => FirestoreTargetType::Query(
+            FirestoreQueryParams::new(FirestoreQueryCollection::Single(collection.clone())),
+        ),
+        WatchScope::Document { collection, id } => FirestoreTargetType::Documents(
+            FirestoreCollectionDocuments::new(collection.clone(), vec![id.clone()]),
+        ),
+    }
+}
 
 /// Tamaño de página de `list_docs` (máximo que acepta Firestore por página: 300 es holgado).
 const LIST_PAGE_SIZE: usize = 300;
+
+/// Alias del resultado de la agregación de [`FirestoreClient::count`] (el de Node).
+const COUNT_ALIAS: &str = "count";
 
 /// Cambio en un documento de una colección observada; lleva el id del documento.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +68,113 @@ pub enum ChangeEvent {
     Removed(String),
     /// La vista del stream ya no es fiable entera: el listener se reconectó, Firestore reinició
     /// el target (`RESET`) o el filtro de existencia no cuadró. Quien cachee la colección debe
-    /// invalidarla completa; los eventos posteriores vuelven a describir el estado.
+    /// invalidarla completa (puede llegar varias veces seguidas: debe ser idempotente); los
+    /// eventos posteriores vuelven a describir el estado.
     Reset,
+    /// La instantánea de esta apertura ya es actual (primer `CURRENT` tras cada `ADD` o `RESET`
+    /// del target) y estos son **todos** los ids presentes en la colección, ordenados. Lo
+    /// cacheado entre la apertura y este punto pudo borrarse sin evento (la instantánea
+    /// simplemente no lo trae): quien cachee debe tratarlo como un `Reset` y además descartar
+    /// todo lo que guarde (también copias viejas) de ids que no estén en la lista. Idempotente.
+    Synced(Vec<String>),
+}
+
+/// Operador de comparación de un filtro de [`Query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Dirección de ordenación de [`Query::order_by`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Asc,
+    Desc,
+}
+
+/// Valor con el que se compara un campo en un filtro de [`Query`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    String(String),
+    Integer(i64),
+    Double(f64),
+    Bool(bool),
+}
+
+impl Value {
+    fn to_firestore(&self) -> FirestoreValue {
+        let value_type = match self {
+            Value::String(v) => ValueType::StringValue(v.clone()),
+            Value::Integer(v) => ValueType::IntegerValue(*v),
+            Value::Double(v) => ValueType::DoubleValue(*v),
+            Value::Bool(v) => ValueType::BooleanValue(*v),
+        };
+        FirestoreValue::from(PbValue {
+            value_type: Some(value_type),
+        })
+    }
+}
+
+/// Consulta estructurada sobre una colección: filtros (todos a la vez, AND), un orden y un
+/// límite. `Query::default()` equivale a listar la colección entera (sin orden).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Query {
+    /// Filtros `(campo, operador, valor)`; se combinan con AND.
+    pub filters: Vec<(String, Op, Value)>,
+    /// Un único criterio de orden `(campo, dirección)`.
+    pub order_by: Option<(String, Dir)>,
+    /// Número máximo de documentos a devolver.
+    pub limit: Option<u32>,
+}
+
+fn compare_filter(field: &str, op: Op, value: &Value) -> FirestoreQueryFilter {
+    let field = field.to_string();
+    let value = value.to_firestore();
+    FirestoreQueryFilter::Compare(Some(match op {
+        Op::Eq => FirestoreQueryFilterCompare::Equal(field, value),
+        Op::Ne => FirestoreQueryFilterCompare::NotEqual(field, value),
+        Op::Lt => FirestoreQueryFilterCompare::LessThan(field, value),
+        Op::Le => FirestoreQueryFilterCompare::LessThanOrEqual(field, value),
+        Op::Gt => FirestoreQueryFilterCompare::GreaterThan(field, value),
+        Op::Ge => FirestoreQueryFilterCompare::GreaterThanOrEqual(field, value),
+    }))
+}
+
+/// Traduce `q` a los parámetros de consulta del crate `firestore`. Pura (sin red).
+fn query_params(collection: &str, q: &Query) -> FirestoreQueryParams {
+    let mut filters: Vec<FirestoreQueryFilter> = q
+        .filters
+        .iter()
+        .map(|(field, op, value)| compare_filter(field, *op, value))
+        .collect();
+    let filter = match filters.len() {
+        0 => None,
+        1 => filters.pop(),
+        _ => Some(FirestoreQueryFilter::Composite(
+            FirestoreQueryFilterComposite {
+                for_all_filters: filters,
+                operator: FirestoreQueryFilterCompositeOperator::And,
+            },
+        )),
+    };
+    let order_by = q.order_by.as_ref().map(|(field, dir)| {
+        vec![FirestoreQueryOrder {
+            field_name: field.clone(),
+            direction: match dir {
+                Dir::Asc => FirestoreQueryDirection::Ascending,
+                Dir::Desc => FirestoreQueryDirection::Descending,
+            },
+        }]
+    });
+    FirestoreQueryParams::new(FirestoreQueryCollection::Single(collection.to_string()))
+        .opt_filter(filter)
+        .opt_order_by(order_by)
+        .opt_limit(q.limit)
 }
 
 /// Cliente Firestore de solo lectura. Barato de clonar (comparte la conexión).
@@ -95,7 +232,18 @@ impl FirestoreClient {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, T)>, DataError> {
-        let docs: Vec<FirestoreDocument> = self
+        let docs = self.list_raw_docs(collection).await?;
+        docs.iter().map(decode_document).collect()
+    }
+
+    /// Lista todos los documentos de `collection` sin decodificar (para quien necesita los tipos
+    /// de Firestore, p. ej. distinguir un `Timestamp` de un texto). Mismo orden que
+    /// [`FirestoreClient::list_docs`] (por id de documento).
+    pub async fn list_raw_docs(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<FirestoreDocument>, DataError> {
+        Ok(self
             .db
             .fluent()
             .list()
@@ -104,7 +252,59 @@ impl FirestoreClient {
             .stream_all_with_errors()
             .await?
             .try_collect()
+            .await?)
+    }
+
+    /// `query.count().get()` de Node: número de documentos de `collection` que cumplen los
+    /// filtros de `q` (se ignoran su orden y su límite), con una agregación `COUNT` de Firestore
+    /// (una lectura por cada 1000 entradas de índice, sin leer los documentos).
+    pub async fn count(&self, collection: &str, q: Query) -> Result<u64, DataError> {
+        let params = query_params(
+            collection,
+            &Query {
+                order_by: None,
+                limit: None,
+                ..q
+            },
+        );
+        let mut select = self.db.fluent().select().from(collection);
+        if let Some(filter) = params.filter {
+            select = select.filter(move |_| Some(filter.clone()));
+        }
+        let rows = select
+            .aggregate(|a| a.fields([a.field(COUNT_ALIAS).count()]))
+            .query()
             .await?;
+        count_from_rows(&rows)
+    }
+
+    /// Consulta `collection` con los filtros, el orden y el límite de `q` y devuelve los
+    /// documentos como `(id, valor)`, decodificados igual que en [`FirestoreClient::list_docs`]
+    /// (un documento no decodificable hace fallar la llamada con [`DataError::Decode`]).
+    ///
+    /// **Índices:** Firestore resuelve con sus índices automáticos las consultas con filtros de un solo campo o con un
+    /// único campo ordenado, pero una consulta con un filtro sobre un campo y `order_by` sobre
+    /// *otro* campo (p. ej. `guild_id == x` ordenado por `createdAt`) necesita un índice
+    /// compuesto, y sin él Firestore responde `FAILED_PRECONDITION` (llega como
+    /// [`DataError::Firestore`]). Este cliente nunca crea índices; hay que desplegarlos aparte
+    /// (ver "Fase 2A" en `docs/riesgos.md`).
+    pub async fn query<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+        q: Query,
+    ) -> Result<Vec<(String, T)>, DataError> {
+        let params = query_params(collection, &q);
+        let mut select = self.db.fluent().select().from(collection);
+        if let Some(filter) = params.filter {
+            select = select.filter(move |_| Some(filter.clone()));
+        }
+        if let Some(orders) = params.order_by {
+            select = select.order(move |_| orders.clone());
+        }
+        if let Some(limit) = params.limit {
+            select = select.limit(limit);
+        }
+        let docs = select.query().await?;
         docs.iter().map(decode_document).collect()
     }
 
@@ -112,9 +312,9 @@ impl FirestoreClient {
     ///
     /// El stream es perezoso: el listener se abre al pedir el primer elemento y se cierra al
     /// soltar el stream. Primero llega la instantánea inicial (un `Added` por documento
-    /// existente) y luego los cambios. Las reconexiones las hace el crate por dentro (cada 5 s
-    /// tras un fallo, reanudando con el resume token en memoria) y se señalan con
-    /// [`ChangeEvent::Reset`]. Se emite un `Err` terminal (y el stream termina) si Firestore da
+    /// existente), cerrada por un [`ChangeEvent::Synced`] cuando es actual, y luego los cambios.
+    /// Las reconexiones las hace el crate por dentro (cada 5 s tras un fallo, reanudando con el
+    /// resume token en memoria) y se señalan con [`ChangeEvent::Reset`]. Se emite un `Err` terminal (y el stream termina) si Firestore da
     /// el target por terminado para siempre (p. ej. `PERMISSION_DENIED` por reglas) o si el bucle
     /// del listener se detiene por un error que el crate no reintenta; quien consume debe volver a
     /// llamar a `watch_collection`. Los errores reintentables nunca llegan al stream.
@@ -122,33 +322,60 @@ impl FirestoreClient {
         &self,
         collection: &str,
     ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
+        self.watch(WatchScope::Collection(collection.to_string()))
+    }
+
+    /// Como [`FirestoreClient::watch_collection`] pero solo para `collection/id` (el
+    /// `doc(id).onSnapshot` de Node): Firestore solo envía (y cobra) los cambios de ese documento.
+    ///
+    /// Mismo stream y misma semántica: `Added`/`Modified`/`Removed` llevan siempre `id`, cada
+    /// apertura (y reconexión, con `Reset`) termina en un `Synced` con `[id]` si el documento
+    /// existe o con `[]` si no (un documento que no existe no genera ningún evento propio en la
+    /// instantánea), y los errores terminales igual.
+    pub fn watch_document(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
+        self.watch(WatchScope::Document {
+            collection: collection.to_string(),
+            id: id.to_string(),
+        })
+    }
+
+    /// Stream de cambios de `scope` (ver [`FirestoreClient::watch_collection`]).
+    pub fn watch(
+        &self,
+        scope: WatchScope,
+    ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
         let db = self.db.clone();
-        let collection = collection.to_string();
-        futures::stream::once(async move { start_watch(db, collection).await }).flat_map(
-            |started| match started {
+        futures::stream::once(async move { start_watch(db, scope).await }).flat_map(|started| {
+            match started {
                 Ok(events) => events.left_stream(),
                 Err(err) => futures::stream::once(async move { Err(err) }).right_stream(),
-            },
-        )
+            }
+        })
     }
 }
 
 type Listener = FirestoreListener<FirestoreDb, FirestoreMemListenStateStorage>;
 
-/// Abre el listener de `collection` y devuelve el stream de eventos ya traducidos.
+/// Abre el listener de `scope` y devuelve el stream de eventos ya traducidos.
 async fn start_watch(
     db: FirestoreDb,
-    collection: String,
+    scope: WatchScope,
 ) -> Result<impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static, DataError> {
     let mut listener: Listener = db
         .create_listener(FirestoreMemListenStateStorage::new())
         .await?;
     let target = FirestoreListenerTarget::new(WATCH_TARGET_ID);
-    db.fluent()
-        .select()
-        .from(collection.as_str())
-        .listen()
-        .add_target(target.clone(), &mut listener)?;
+    // Lo mismo que `db.fluent().select()...listen().add_target(..)` (sin etiquetas ni opciones
+    // de petición), pero con el target construido por `listen_target_type`, que es puro.
+    listener.add_target(FirestoreListenerTargetParams::new(
+        target.clone(),
+        listen_target_type(&scope),
+        HashMap::new(),
+    ))?;
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<ChangeEvent, DataError>>();
     let state = Arc::new(Mutex::new(WatchState::new(WATCH_TARGET_ID as i32)));
@@ -202,6 +429,33 @@ async fn start_watch(
     ))
 }
 
+/// Número de la agregación `COUNT` de [`FirestoreClient::count`] a partir de las filas que
+/// devuelve el crate. Pura (sin red).
+///
+/// Una respuesta sin filas, sin el alias [`COUNT_ALIAS`] o con un valor que no es un entero no
+/// negativo es un [`DataError::Decode`], nunca un 0: así quien llama (p. ej. `/stats`) puede caer
+/// a su respaldo en lugar de cachear y servir un recuento falso.
+fn count_from_rows(rows: &[FirestoreDocument]) -> Result<u64, DataError> {
+    let row = rows
+        .first()
+        .ok_or_else(|| DataError::Decode("la agregación COUNT no devolvió filas".into()))?;
+    let value = row.fields.get(COUNT_ALIAS).ok_or_else(|| {
+        DataError::Decode(format!(
+            "la agregación COUNT no trae el alias {COUNT_ALIAS:?}"
+        ))
+    })?;
+    match value.value_type {
+        Some(ValueType::IntegerValue(n)) => u64::try_from(n).map_err(|_| {
+            DataError::Decode(format!(
+                "la agregación COUNT devolvió un entero negativo: {n}"
+            ))
+        }),
+        ref other => Err(DataError::Decode(format!(
+            "la agregación COUNT devolvió un valor que no es entero: {other:?}"
+        ))),
+    }
+}
+
 /// Id de documento (último segmento) de un nombre de recurso de Firestore como
 /// `projects/p/databases/(default)/documents/coleccion/id`. `None` si está vacío.
 pub fn document_id(resource_name: &str) -> Option<&str> {
@@ -237,6 +491,10 @@ pub(crate) struct WatchState {
     known: HashSet<String>,
     /// Se ha recibido ya el primer `ADD` del target (los siguientes son reconexiones).
     added_once: bool,
+    /// Falta el `CURRENT` de la apertura en curso: el próximo emite `Synced`. Se arma al crear el
+    /// estado, en cada `ADD` (también las reconexiones y la resincronización que pide el filtro
+    /// de existencia, que quita y vuelve a añadir el target) y en cada `RESET` del target.
+    awaiting_current: bool,
     /// El filtro de existencia no cuadró: hay que pedir al crate que resincronice el target.
     resync_requested: bool,
 }
@@ -247,6 +505,7 @@ impl WatchState {
             target_id,
             known: HashSet::new(),
             added_once: false,
+            awaiting_current: true,
             resync_requested: false,
         }
     }
@@ -311,15 +570,34 @@ impl WatchState {
                 if !change.target_ids.is_empty() && !self.concerns_me(&change.target_ids) {
                     return None;
                 }
+                // `CURRENT` = la instantánea de esta apertura ya está entera. Lo cacheado entre la
+                // apertura y este punto pudo borrarse sin evento (la instantánea simplemente no
+                // lo trae), así que el primer `CURRENT` tras cada `ADD`/`RESET` emite `Synced`
+                // con los ids presentes (`known` está completo en ese punto: tras un `RESET` o la
+                // resincronización se vació y se volvió a llenar; tras reanudar con token, los
+                // borrados intermedios llegan como eventos). Un `CURRENT` repetido no emite nada.
+                // Así llega un evento extra por apertura además del `Reset` de la reconexión o
+                // del `RESET`; quien consume debe ser idempotente.
                 match TargetChangeType::try_from(change.target_change_type).ok()? {
-                    TargetChangeType::Add if self.added_once => Some(ChangeEvent::Reset),
+                    TargetChangeType::Add if self.added_once => {
+                        self.awaiting_current = true;
+                        Some(ChangeEvent::Reset)
+                    }
                     TargetChangeType::Add => {
                         self.added_once = true;
+                        self.awaiting_current = true;
                         None
                     }
                     TargetChangeType::Reset => {
                         self.known.clear();
+                        self.awaiting_current = true;
                         Some(ChangeEvent::Reset)
+                    }
+                    TargetChangeType::Current if self.awaiting_current => {
+                        self.awaiting_current = false;
+                        let mut ids: Vec<String> = self.known.iter().cloned().collect();
+                        ids.sort();
+                        Some(ChangeEvent::Synced(ids))
                     }
                     TargetChangeType::NoChange
                     | TargetChangeType::Current
@@ -371,7 +649,7 @@ mod tests {
     use super::*;
     use firestore::gcloud_sdk::google::firestore::v1::{
         target_change::TargetChangeType, value::ValueType, ArrayValue, Document, DocumentChange,
-        DocumentDelete, DocumentRemove, ExistenceFilter, MapValue, TargetChange, Value,
+        DocumentDelete, DocumentRemove, ExistenceFilter, MapValue, TargetChange, Value as PbValue,
     };
     use firestore::gcloud_sdk::google::rpc::Status as RpcStatus;
     use firestore::gcloud_sdk::prost_types::Timestamp;
@@ -386,8 +664,8 @@ mod tests {
         format!("{ROOT}/{collection}/{id}")
     }
 
-    fn val(value_type: ValueType) -> Value {
-        Value {
+    fn val(value_type: ValueType) -> PbValue {
+        PbValue {
             value_type: Some(value_type),
         }
     }
@@ -593,13 +871,19 @@ mod tests {
         assert_eq!(state.on_event(other), None);
     }
 
+    fn synced(ids: &[&str]) -> Option<ChangeEvent> {
+        Some(ChangeEvent::Synced(
+            ids.iter().map(|id| id.to_string()).collect(),
+        ))
+    }
+
     #[test]
     fn first_add_is_silent_and_later_adds_are_reset() {
         let mut state = WatchState::new(TARGET);
         assert_eq!(state.on_event(target_change(TargetChangeType::Add)), None);
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Current)),
-            None
+            synced(&[])
         );
         assert_eq!(
             state.on_event(target_change(TargetChangeType::NoChange)),
@@ -609,6 +893,83 @@ mod tests {
         assert_eq!(
             state.on_event(target_change(TargetChangeType::Add)),
             Some(ChangeEvent::Reset)
+        );
+    }
+
+    #[test]
+    fn first_current_of_each_opening_is_synced_with_known_ids() {
+        let mut state = WatchState::new(TARGET);
+        assert_eq!(state.on_event(target_change(TargetChangeType::Add)), None);
+        state.on_event(changed("b"));
+        state.on_event(changed("a"));
+        // La instantánea inicial ya es actual: lleva todos los ids presentes, ordenados.
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            synced(&["a", "b"])
+        );
+        // Un CURRENT repetido sin nueva apertura no vuelve a disparar.
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            None
+        );
+        // Reconexión del crate (reanuda con token: `known` sigue valiendo; el borrado llega
+        // como evento): ADD (Reset) y su CURRENT (Synced, uno extra).
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Add)),
+            Some(ChangeEvent::Reset)
+        );
+        let deleted = FirestoreListenEvent::DocumentDelete(DocumentDelete {
+            document: name("faceit_users", "b"),
+            removed_target_ids: vec![TARGET],
+            read_time: None,
+        });
+        state.on_event(deleted);
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            synced(&["a"])
+        );
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            None
+        );
+    }
+
+    #[test]
+    fn current_after_target_reset_is_synced_once_with_resent_ids() {
+        let mut state = WatchState::new(TARGET);
+        state.on_event(target_change(TargetChangeType::Add));
+        state.on_event(changed("a"));
+        state.on_event(target_change(TargetChangeType::Current));
+        // RESET del target: Firestore reenvía el estado y vuelve a mandar CURRENT.
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Reset)),
+            Some(ChangeEvent::Reset)
+        );
+        state.on_event(changed("c"));
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            synced(&["c"]),
+            "lo no reenviado tras el RESET ya no está"
+        );
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            None
+        );
+    }
+
+    #[test]
+    fn current_for_other_target_is_ignored() {
+        let mut state = WatchState::new(TARGET);
+        state.on_event(target_change(TargetChangeType::Add));
+        let other = FirestoreListenEvent::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Current as i32,
+            target_ids: vec![TARGET + 1],
+            ..Default::default()
+        });
+        assert_eq!(state.on_event(other), None);
+        assert_eq!(
+            state.on_event(target_change(TargetChangeType::Current)),
+            synced(&[])
         );
     }
 
@@ -704,6 +1065,216 @@ mod tests {
         assert!(
             !state.take_resync_request(),
             "la petición se consume una vez"
+        );
+    }
+
+    // --- listen_target_type ----------------------------------------------------------------
+
+    #[test]
+    fn collection_scope_is_unfiltered_query_target() {
+        match listen_target_type(&WatchScope::Collection("guild_settings".into())) {
+            FirestoreTargetType::Query(q) => {
+                assert_eq!(
+                    q.collection_id,
+                    FirestoreQueryCollection::Single("guild_settings".into())
+                );
+                assert!(q.filter.is_none());
+                assert!(q.parent.is_none());
+            }
+            other => panic!("se esperaba un target de consulta: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_scope_is_single_document_target() {
+        let scope = WatchScope::Document {
+            collection: "faceit_config".into(),
+            id: "settings".into(),
+        };
+        match listen_target_type(&scope) {
+            FirestoreTargetType::Documents(docs) => {
+                assert_eq!(docs.collection, "faceit_config");
+                assert_eq!(docs.documents, vec!["settings".to_string()]);
+                assert!(docs.parent.is_none());
+            }
+            other => panic!("se esperaba un target de documentos: {other:?}"),
+        }
+    }
+
+    // --- count: decodificación del resultado de la agregación ------------------------------
+
+    fn count_row(fields: &[(&str, ValueType)]) -> Document {
+        Document {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), val(v.clone())))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn count_reads_integer_under_alias() {
+        let rows = [count_row(&[(COUNT_ALIAS, ValueType::IntegerValue(42))])];
+        assert_eq!(count_from_rows(&rows), Ok(42));
+    }
+
+    #[test]
+    fn count_legit_zero_is_ok_zero() {
+        let rows = [count_row(&[(COUNT_ALIAS, ValueType::IntegerValue(0))])];
+        assert_eq!(count_from_rows(&rows), Ok(0));
+    }
+
+    #[test]
+    fn count_without_rows_is_decode_error() {
+        let err = count_from_rows(&[]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn count_row_without_alias_is_decode_error() {
+        let rows = [count_row(&[("otro", ValueType::IntegerValue(7))])];
+        let err = count_from_rows(&rows).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+        let err = count_from_rows(&[count_row(&[])]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn count_non_integer_or_negative_is_decode_error() {
+        for bad in [
+            ValueType::StringValue("42".into()),
+            ValueType::DoubleValue(42.0),
+            ValueType::NullValue(0),
+            ValueType::IntegerValue(-1),
+        ] {
+            let rows = [count_row(&[(COUNT_ALIAS, bad.clone())])];
+            let err = count_from_rows(&rows).unwrap_err();
+            assert!(matches!(err, DataError::Decode(_)), "{bad:?}: {err:?}");
+        }
+        // Valor sin tipo (campo presente pero vacío).
+        let mut row = Document::default();
+        row.fields
+            .insert(COUNT_ALIAS.to_string(), PbValue { value_type: None });
+        let err = count_from_rows(&[row]).unwrap_err();
+        assert!(matches!(err, DataError::Decode(_)), "{err:?}");
+    }
+
+    // --- query: construcción de la consulta estructurada ------------------------------------
+
+    use firestore::gcloud_sdk::google::firestore::v1::{
+        structured_query::{composite_filter, field_filter, filter::FilterType, Direction},
+        StructuredQuery,
+    };
+
+    fn structured(collection: &str, q: &Query) -> StructuredQuery {
+        StructuredQuery::try_from(query_params(collection, q)).expect("consulta válida")
+    }
+
+    fn field_filter_of(filter: &structured_query::Filter) -> &structured_query::FieldFilter {
+        match filter.filter_type.as_ref().expect("filtro") {
+            FilterType::FieldFilter(f) => f,
+            other => panic!("se esperaba un filtro de campo, llegó {other:?}"),
+        }
+    }
+
+    use firestore::gcloud_sdk::google::firestore::v1::structured_query;
+
+    #[test]
+    fn query_builds_expected_structured_query() {
+        let q = Query {
+            filters: vec![
+                ("guild_id".into(), Op::Eq, Value::String("g1".into())),
+                ("level".into(), Op::Ge, Value::Integer(3)),
+            ],
+            order_by: Some(("createdAt".into(), Dir::Desc)),
+            limit: Some(50),
+        };
+        let sq = structured("faceit_bot_logs", &q);
+
+        assert_eq!(sq.from.len(), 1);
+        assert_eq!(sq.from[0].collection_id, "faceit_bot_logs");
+        assert!(!sq.from[0].all_descendants);
+        assert_eq!(sq.limit, Some(50));
+        assert_eq!(sq.order_by.len(), 1);
+        assert_eq!(
+            sq.order_by[0].field.as_ref().unwrap().field_path,
+            "createdAt"
+        );
+        assert_eq!(sq.order_by[0].direction, Direction::Descending as i32);
+
+        let filter = sq.r#where.expect("filtro");
+        let FilterType::CompositeFilter(composite) = filter.filter_type.expect("compuesto") else {
+            panic!("varios filtros deben ir en un AND");
+        };
+        assert_eq!(composite.op, composite_filter::Operator::And as i32);
+        assert_eq!(composite.filters.len(), 2);
+        let first = field_filter_of(&composite.filters[0]);
+        assert_eq!(first.field.as_ref().unwrap().field_path, "guild_id");
+        assert_eq!(first.op, field_filter::Operator::Equal as i32);
+        assert_eq!(
+            first.value.as_ref().unwrap().value_type,
+            Some(ValueType::StringValue("g1".into()))
+        );
+        let second = field_filter_of(&composite.filters[1]);
+        assert_eq!(second.field.as_ref().unwrap().field_path, "level");
+        assert_eq!(second.op, field_filter::Operator::GreaterThanOrEqual as i32);
+        assert_eq!(
+            second.value.as_ref().unwrap().value_type,
+            Some(ValueType::IntegerValue(3))
+        );
+    }
+
+    #[test]
+    fn query_single_filter_is_not_wrapped_in_composite() {
+        let q = Query {
+            filters: vec![("status".into(), Op::Eq, Value::String("pendiente".into()))],
+            ..Query::default()
+        };
+        let sq = structured("orders", &q);
+        let filter = sq.r#where.expect("filtro");
+        let f = field_filter_of(&filter);
+        assert_eq!(f.field.as_ref().unwrap().field_path, "status");
+        assert_eq!(f.op, field_filter::Operator::Equal as i32);
+    }
+
+    #[test]
+    fn query_default_has_no_filter_order_or_limit() {
+        let sq = structured("claims", &Query::default());
+        assert!(sq.r#where.is_none());
+        assert!(sq.order_by.is_empty());
+        assert_eq!(sq.limit, None);
+    }
+
+    #[test]
+    fn query_values_and_ops_map_to_firestore_types() {
+        let cases = [
+            (Op::Eq, field_filter::Operator::Equal),
+            (Op::Ne, field_filter::Operator::NotEqual),
+            (Op::Lt, field_filter::Operator::LessThan),
+            (Op::Le, field_filter::Operator::LessThanOrEqual),
+            (Op::Gt, field_filter::Operator::GreaterThan),
+            (Op::Ge, field_filter::Operator::GreaterThanOrEqual),
+        ];
+        for (op, expected) in cases {
+            let q = Query {
+                filters: vec![("f".into(), op, Value::Bool(true))],
+                order_by: Some(("f".into(), Dir::Asc)),
+                limit: None,
+            };
+            let sq = structured("c", &q);
+            let filter = sq.r#where.clone().expect("filtro");
+            let f = field_filter_of(&filter);
+            assert_eq!(f.op, expected as i32);
+            assert_eq!(
+                f.value.as_ref().unwrap().value_type,
+                Some(ValueType::BooleanValue(true))
+            );
+            assert_eq!(sq.order_by[0].direction, Direction::Ascending as i32);
+        }
+        assert_eq!(
+            Value::Double(1.5).to_firestore().value.value_type,
+            Some(ValueType::DoubleValue(1.5))
         );
     }
 }

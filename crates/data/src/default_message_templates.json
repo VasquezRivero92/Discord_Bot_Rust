@@ -1,0 +1,8 @@
+{
+  "welcomeTitle": "¡Bienvenido al Servidor! 🎉",
+  "welcomeDescription": "¡Hola **{username}**! Gracias por unirte a nuestra comunidad.\n\nAquí tienes una **guía rápida** para unirte y verificar tu cuenta de **Faceit**:\n\n📌 **PASO 1: Únete al Club**\nHaz clic en el siguiente enlace y únete a nuestro club oficial en la plataforma:\n🔗 **[Hacer clic aquí para Unirse al Club]({clubUrl})**\n\n📌 **PASO 2: Obtén tu Nickname de Faceit**\nAsegúrate de copiar tu nombre de usuario exacto tal y como aparece en tu perfil de Faceit.\n\n📌 **PASO 3: Vincula tu cuenta en Discord**\nVe al canal de Discord {linkChannelMention} y escribe el comando:\n➡️ `/verificar_fc`\n\nEl bot te pedirá tu nickname de Faceit. Escríbelo, presiona enviar y ¡listo! Tus roles de nivel y del Club se actualizarán automáticamente.\n\n¡Nos vemos en el servidor y buena suerte en tus partidas! 🎮",
+  "welcomeColor": "#FF5500",
+  "supportTitle": "🚨 Soporte y Llamado de Admin",
+  "supportDescription": "¿Tienes algún problema en tu partida activa de Faceit?\n\nPresiona el botón de abajo para solicitar la asistencia de un administrador del staff.\n\n⚠️ **Requisitos y Notas Importantes**:\n- Debes tener tu cuenta de Faceit vinculada con el bot (usa `/verificar_fc` si aún no lo has hecho).\n- Solo funcionará si te encuentras actualmente en una **partida activa** de Faceit en este servidor/club.\n- Al presionar el botón, se enviará una notificación con el enlace a tu partida al equipo de soporte.",
+  "supportColor": "#FF0000"
+}

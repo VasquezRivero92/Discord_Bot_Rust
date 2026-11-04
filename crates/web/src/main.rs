@@ -17,8 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::config::{firestore_mode, Config, FirestoreMode};
-use data::{ClaimsRepo, FirestoreClaimsRepo, FirestoreClient};
+use data::{ClaimsRepo, FirestoreClient};
 use tracing::{error, info, warn};
+use web::routes::admin::AdminRepos;
 use web::{build_app, AppDeps};
 
 const DEFAULT_PORT: u16 = 15633;
@@ -65,8 +66,8 @@ async fn run() -> ExitCode {
         }
     };
 
-    let claims = match connect_firestore(&cfg, &mode).await {
-        Ok(claims) => claims,
+    let client = match connect_firestore(&cfg, &mode).await {
+        Ok(client) => client,
         Err(msg) => {
             error!("{msg}");
             return ExitCode::FAILURE;
@@ -85,9 +86,14 @@ async fn run() -> ExitCode {
     };
     info!("listening on http://{addr}");
 
+    let admin = client.as_ref().map(AdminRepos::firestore);
+    let claims = admin
+        .as_ref()
+        .map(|a| a.claims.clone() as Arc<dyn ClaimsRepo>);
     let app = build_app(AppDeps {
         config: cfg,
         claims,
+        admin,
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(
@@ -135,11 +141,11 @@ fn init_tracing() {
 }
 
 /// Conecta solo en los modos explícitos. `Disabled` no conecta y deja
-/// `GET /api/reclamaciones/:code` en el proxy.
+/// `GET /api/reclamaciones/:code` y las lecturas de `/api/admin` en el proxy.
 async fn connect_firestore(
     cfg: &Config,
     mode: &FirestoreMode,
-) -> Result<Option<Arc<dyn ClaimsRepo>>, String> {
+) -> Result<Option<FirestoreClient>, String> {
     let project = match (mode, cfg.firestore_project_id.as_deref()) {
         (FirestoreMode::Disabled, _) | (_, None) => {
             if cfg.firebase_service_account_path.is_some()
@@ -169,7 +175,7 @@ async fn connect_firestore(
     )
     .await
     {
-        Ok(Ok(client)) => Ok(Some(Arc::new(FirestoreClaimsRepo::new(client)))),
+        Ok(Ok(client)) => Ok(Some(client)),
         // DataError solo lleva el mensaje del cliente, nunca el contenido de la clave.
         Ok(Err(e)) => Err(format!(
             "cannot connect to Firestore ({}): {e}",
@@ -193,6 +199,8 @@ fn log_banner(cfg: &Config, mode: &FirestoreMode) {
         production = cfg.production,
         trust_cf_connecting_ip = cfg.trust_cf_connecting_ip,
         proxy_append_peer_to_xff = cfg.proxy_append_peer_to_xff,
+        proxy_first_byte_timeout_secs = cfg.proxy_first_byte_timeout.map_or(0, |d| d.as_secs()),
+        ws_idle_timeout_secs = cfg.ws_idle_timeout.map_or(0, |d| d.as_secs()),
         firestore = %mode.describe(),
         "machupeek web front door starting"
     );

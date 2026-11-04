@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use common::config::{firestore_mode, Config, ConfigError, FirestoreMode};
+use common::config::{firestore_mode, Config, ConfigError, EnvQueue, FirestoreMode};
 
 fn base() -> HashMap<String, String> {
     [
@@ -66,6 +67,12 @@ fn empty_required_value_is_missing() {
         Config::from_map(&m).unwrap_err(),
         ConfigError::Missing("ADMIN_JWT_SECRET")
     );
+}
+
+#[test]
+fn jwt_secret_keeps_edge_whitespace() {
+    let cfg = Config::from_map(&with(&[("ADMIN_JWT_SECRET", " s3cr3t ")])).unwrap();
+    assert_eq!(cfg.admin_jwt_secret, " s3cr3t ");
 }
 
 #[test]
@@ -257,6 +264,83 @@ fn admin_role_name_is_the_fallback_for_admin_role_id() {
     assert_eq!(cfg.admin_role_id.as_deref(), Some("7"));
 }
 
+// ------------------------------------------------------------ capa de entorno (getEffectiveConfig)
+
+#[test]
+fn env_defaults_read_the_legacy_variables() {
+    let cfg = Config::from_map(&with(&[
+        ("DISCORD_LINK_CHANNEL_ID", " 11 "),
+        ("FACEIT_HUB_ID", "hub"),
+        ("DISCORD_SUPPORT_CHANNEL_ID", ""),
+        ("MATCH_TIMEOUT_MINUTES", "90"),
+    ]))
+    .unwrap();
+    let env = &cfg.env_defaults;
+    assert_eq!(env.discord_link_channel_id.as_deref(), Some("11"));
+    assert_eq!(env.faceit_hub_id.as_deref(), Some("hub"));
+    assert_eq!(env.discord_support_channel_id, None);
+    assert_eq!(env.match_timeout_minutes.as_deref(), Some("90"));
+    assert!(env.queues.is_empty());
+}
+
+#[test]
+fn env_queues_numbered_like_get_queues_from_env() {
+    let cfg = Config::from_map(&with(&[
+        ("FACEIT_QUEUE1_ID", "q-a"),
+        ("DISCORD_QUEUE1_NAME", "Alta"),
+        ("DISCORD_QUEUE_1_MATCHES_CHANNEL_ID", "m1"),
+        ("QUEUE1_HUB_ROLE_ID", "h1"),
+        // la 2 solo tiene sala de espera: id por defecto y nombre por defecto
+        ("DISCORD_QUEUE2_WAITING_ROOM_CHANNEL_ID", "w2"),
+        // la 3 solo tiene mixton: no cuenta
+        ("DISCORD_QUEUE3_MIXTON_CHANNEL_ID", "x3"),
+        // las listas no se usan si hay colas numeradas
+        ("DISCORD_MATCHES_CHANNEL_ID", "a,b"),
+    ]))
+    .unwrap();
+    let q = &cfg.env_defaults.queues;
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert_eq!(
+        q[0],
+        EnvQueue {
+            id: "q-a".into(),
+            queue_id: "q-a".into(),
+            name: "Alta".into(),
+            discord_matches_channel_id: "m1".into(),
+            hub_role_id: Some("h1".into()),
+            ..Default::default()
+        }
+    );
+    assert_eq!(q[1].id, "queue_2");
+    assert_eq!(q[1].name, "Cola 2");
+    assert_eq!(q[1].discord_waiting_room_channel_id, "w2");
+    assert_eq!(q[1].hub_role_id.as_deref(), Some(""));
+}
+
+#[test]
+fn env_queues_from_comma_lists_need_more_than_one() {
+    let cfg = Config::from_map(&with(&[("DISCORD_MATCHES_CHANNEL_ID", "solo")])).unwrap();
+    assert!(cfg.env_defaults.queues.is_empty());
+
+    let cfg = Config::from_map(&with(&[
+        ("DISCORD_MATCHES_CHANNEL_ID", "m1, m2,,"),
+        ("DISCORD_WAITING_ROOM_CHANNEL_ID", "w1"),
+        ("FACEIT_QUEUE_IDS", "qa"),
+        ("DISCORD_HUB_ROLE_ID", "dh"),
+    ]))
+    .unwrap();
+    let q = &cfg.env_defaults.queues;
+    assert_eq!(q.len(), 2);
+    assert_eq!((q[0].id.as_str(), q[1].id.as_str()), ("qa", "queue_2"));
+    assert_eq!(q[1].name, "Cola 2");
+    assert_eq!(q[1].discord_matches_channel_id, "m2");
+    // lista corta: cae al primero
+    assert_eq!(q[1].discord_waiting_room_channel_id, "w1");
+    assert_eq!(q[1].discord_mixton_channel_id, "");
+    assert_eq!(q[1].hub_role_id, None);
+    assert_eq!(q[1].discord_hub_role_id, "dh");
+}
+
 // ------------------------------------------------------------ BASE_URL
 
 #[test]
@@ -290,6 +374,48 @@ fn proxy_append_peer_to_xff_defaults_off_and_parses() {
         Config::from_map(&m).unwrap_err(),
         ConfigError::Invalid("PROXY_APPEND_PEER_TO_XFF", "nope".into())
     );
+}
+
+// ------------------------------------------------------------ proxy timeouts
+
+#[test]
+fn proxy_timeouts_are_disabled_when_unset_empty_or_zero() {
+    let cfg = Config::from_map(&base()).unwrap();
+    assert_eq!(cfg.proxy_first_byte_timeout, None);
+    assert_eq!(cfg.ws_idle_timeout, None);
+    for v in ["", "  ", "0", "00", " 0 "] {
+        let cfg = Config::from_map(&with(&[
+            ("PROXY_FIRST_BYTE_TIMEOUT_SECS", v),
+            ("WS_IDLE_TIMEOUT_SECS", v),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.proxy_first_byte_timeout, None, "{v:?}");
+        assert_eq!(cfg.ws_idle_timeout, None, "{v:?}");
+    }
+}
+
+#[test]
+fn proxy_timeouts_parse_whole_seconds() {
+    let cfg = Config::from_map(&with(&[
+        ("PROXY_FIRST_BYTE_TIMEOUT_SECS", "120"),
+        ("WS_IDLE_TIMEOUT_SECS", " 900 "),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.proxy_first_byte_timeout, Some(Duration::from_secs(120)));
+    assert_eq!(cfg.ws_idle_timeout, Some(Duration::from_secs(900)));
+}
+
+#[test]
+fn invalid_proxy_timeouts_are_config_errors() {
+    for key in ["PROXY_FIRST_BYTE_TIMEOUT_SECS", "WS_IDLE_TIMEOUT_SECS"] {
+        for v in ["abc", "-1", "+5", "1.5", "30s", "99999999999999999999999"] {
+            assert_eq!(
+                Config::from_map(&with(&[(key, v)])).unwrap_err(),
+                ConfigError::Invalid(key, v.into()),
+                "{key}={v}"
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------ Firestore

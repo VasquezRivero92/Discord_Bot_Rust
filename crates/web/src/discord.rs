@@ -167,9 +167,9 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// Las cadenas vacías cuentan como ausentes (`||` de JS).
 ///
 /// **El llamador debe aportar `global_admin_role`**, ya resuelto como
-/// `settings.adminRoleId || settings.adminRoleName || env`. Todavía no hay repo de
-/// `faceit_config/settings` en `data`; el plan de la fase 2 lo añade, y hasta entonces el
-/// llamador puede pasar solo la parte de entorno (o `None`).
+/// `settings.adminRoleId || settings.adminRoleName || env`: es `data::global_admin_role(&global,
+/// &cfg)` con `global` de `data::GlobalSettingsRepo`, e `is_default_guild` es
+/// `data::is_default_guild(guild_id, &global, &cfg)`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdminRoleSources<'a> {
     /// Ajustes del servidor (`GuildSettingsRepo`), si existen.

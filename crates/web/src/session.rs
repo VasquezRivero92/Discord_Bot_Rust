@@ -19,7 +19,7 @@
 //! }
 //!
 //! let app = Router::new()/* rutas */.with_state(AppState {
-//!     session: SessionState::from_config(&config),
+//!     session: SessionState::from_config(&config)?,
 //! });
 //! ```
 //!
@@ -57,6 +57,10 @@ pub const SESSION_SECS: u64 = 8 * 3600;
 /// menos de 4 KiB); evita trabajar con valores absurdamente grandes.
 const MAX_TOKEN_LEN: usize = 16 * 1024;
 
+/// Máximo de candidatos de cookie que se verifican por petición (evita que
+/// una cabecera con miles de cookies fuerce miles de verificaciones HMAC).
+const MAX_VERIFY_ATTEMPTS: usize = 16;
+
 const MSG_NOT_AUTH: &str = "No autenticado";
 const MSG_BAD_TOKEN: &str = "Token inválido o expirado";
 const MSG_FORBIDDEN: &str = "No autorizado. Se requieren permisos de administrador.";
@@ -67,6 +71,9 @@ pub enum SessionError {
     /// El token es demasiado grande para ser legítimo.
     #[error("token too large")]
     TooLarge,
+    /// El secreto de firma está vacío.
+    #[error("empty secret")]
+    EmptySecret,
     /// El token no es válido (firma, formato, algoritmo o caducidad).
     #[error("invalid token: {0}")]
     Invalid(#[from] jsonwebtoken::errors::Error),
@@ -165,6 +172,17 @@ pub fn verify(token: &str, secret: &[u8]) -> Result<SessionClaims, SessionError>
     v.validate_aud = false; // npm solo valida `aud` si se le pide
     v.set_required_spec_claims(&["exp"]);
     let data = jsonwebtoken::decode::<SessionClaims>(token, &DecodingKey::from_secret(secret), &v)?;
+    // Node rechaza con `clockTimestamp >= exp`; jsonwebtoken (Rust) solo con
+    // `exp < now`, así que la frontera exacta se cierra aquí.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if data.claims.exp <= now {
+        return Err(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature,
+        )
+        .into());
+    }
     Ok(data.claims)
 }
 
@@ -186,16 +204,21 @@ impl std::fmt::Debug for SessionState {
 }
 
 impl SessionState {
-    pub fn new(secret: &[u8], secure_cookies: bool) -> Self {
-        Self {
+    /// Falla con [`SessionError::EmptySecret`] si `secret` está vacío.
+    pub fn new(secret: &[u8], secure_cookies: bool) -> Result<Self, SessionError> {
+        if secret.is_empty() {
+            return Err(SessionError::EmptySecret);
+        }
+        Ok(Self {
             secret: Arc::from(secret),
             secure_cookies,
-        }
+        })
     }
 
     /// `Secure` según `Config::production` (que ya incluye
-    /// `NODE_ENV=production` o `BASE_URL` https, como en Node).
-    pub fn from_config(cfg: &common::config::Config) -> Self {
+    /// `NODE_ENV=production` o `BASE_URL` https, como en Node). El secreto es
+    /// el valor crudo (sin recortar) de `ADMIN_JWT_SECRET`.
+    pub fn from_config(cfg: &common::config::Config) -> Result<Self, SessionError> {
         Self::new(cfg.admin_jwt_secret.as_bytes(), cfg.production)
     }
 
@@ -287,9 +310,14 @@ enum Outcome {
 
 fn authenticate(parts: &Parts, state: &SessionState) -> Outcome {
     let mut any = false;
+    let mut attempts = 0;
     for name in [AUTH_COOKIE, ADMIN_COOKIE] {
         for value in cookie_values(parts, name) {
             any = true;
+            if attempts >= MAX_VERIFY_ATTEMPTS {
+                return Outcome::Invalid;
+            }
+            attempts += 1;
             if let Ok(claims) = state.verify(&value) {
                 return Outcome::Valid(claims);
             }
@@ -310,14 +338,28 @@ pub enum SessionRejection {
     Forbidden,
 }
 
+impl SessionRejection {
+    /// Código HTTP del legacy (401 o 403).
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::NotAuthenticated | Self::InvalidToken => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+        }
+    }
+
+    /// Mensaje del legacy (`middleware/auth.js`), campo `error` del cuerpo.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotAuthenticated => MSG_NOT_AUTH,
+            Self::InvalidToken => MSG_BAD_TOKEN,
+            Self::Forbidden => MSG_FORBIDDEN,
+        }
+    }
+}
+
 impl IntoResponse for SessionRejection {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            Self::NotAuthenticated => (StatusCode::UNAUTHORIZED, MSG_NOT_AUTH),
-            Self::InvalidToken => (StatusCode::UNAUTHORIZED, MSG_BAD_TOKEN),
-            Self::Forbidden => (StatusCode::FORBIDDEN, MSG_FORBIDDEN),
-        };
-        (status, Json(json!({ "error": msg }))).into_response()
+        (self.status(), Json(json!({ "error": self.message() }))).into_response()
     }
 }
 
