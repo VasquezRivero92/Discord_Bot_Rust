@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Player {
     #[serde(rename = "discordId")]
     pub discord_id: String,

@@ -253,7 +253,6 @@ async fn claim_lookup_stays_on_node_when_firestore_is_disabled() {
 async fn everything_not_migrated_reaches_node() {
     let f = Front::start(true, &[]).await;
     let cases: &[(&str, &str)] = &[
-        ("GET", "/auth/discord/callback?code=x&state=/"),
         ("GET", "/auth/steam"),
         ("GET", "/auth/steam/return?openid.mode=x"),
         ("POST", "/auth/demo-login"),

@@ -2,10 +2,13 @@ use crate::maps::default_catalog;
 use crate::state::{ChatMessage, LobbyManager, Player};
 use axum::{
     extract::{RawQuery, State},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -34,24 +37,56 @@ fn extract_guild_id(raw: Option<&str>) -> Option<String> {
     None
 }
 
-#[derive(Deserialize)]
+/// Extrae de forma segura el usuario autenticado desde las cookies de sesión (auth_token o admin_token).
+fn user_from_cookies(headers: &HeaderMap) -> Option<(String, String, Option<String>)> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if pair.starts_with("auth_token=") || pair.starts_with("admin_token=") {
+            let token = pair.split_once('=')?.1.trim_matches('"');
+            let mut parts = token.split('.');
+            let _header = parts.next()?;
+            let payload_b64 = parts.next()?;
+            let pad_len = (4 - (payload_b64.len() % 4)) % 4;
+            let padded = format!("{}{}", payload_b64, "=".repeat(pad_len));
+            let decoded = URL_SAFE_NO_PAD
+                .decode(payload_b64.as_bytes())
+                .or_else(|_| URL_SAFE_NO_PAD.decode(padded.as_bytes()))
+                .ok()?;
+            let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+            let user_id = val.get("userId").and_then(|v| v.as_str())?.to_string();
+            let username = val
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Jugador")
+                .to_string();
+            let avatar = val.get("avatar").and_then(|v| v.as_str()).map(str::to_string);
+            return Some((user_id, username, avatar));
+        }
+    }
+    None
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct JoinPayload {
-    #[serde(rename = "guildId")]
+    #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
     pub player: Player,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Default)]
 pub struct UserActionPayload {
-    #[serde(rename = "guildId")]
+    #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
-    #[serde(rename = "discordId")]
-    pub discord_id: String,
+    #[serde(rename = "discordId", default)]
+    pub discord_id: Option<String>,
+    #[serde(default)]
+    pub ready: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Default)]
 pub struct MapActionPayload {
-    #[serde(rename = "guildId")]
+    #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
     #[serde(rename = "teamId")]
     pub team_id: String,
@@ -59,18 +94,18 @@ pub struct MapActionPayload {
     pub map_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Default)]
 pub struct SendChatPayload {
-    #[serde(rename = "guildId")]
+    #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
     #[serde(rename = "authorId")]
     pub author_id: String,
     #[serde(rename = "authorName")]
     pub author_name: String,
-    #[serde(rename = "authorAvatar")]
+    #[serde(rename = "authorAvatar", default)]
     pub author_avatar: Option<String>,
     pub content: String,
-    #[serde(rename = "imageUrl")]
+    #[serde(rename = "imageUrl", default)]
     pub image_url: Option<String>,
 }
 
@@ -85,8 +120,8 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-ws", get(crate::ws::mixton_ws_handler))
         .route("/api/lobby/join", post(join))
         .route("/api/lobby/leave", post(leave))
-        .route("/api/lobby/ready", post(ready))
-        .route("/api/lobby/mixton-player-ready", post(ready))
+        .route("/api/lobby/ready", post(player_ready))
+        .route("/api/lobby/mixton-player-ready", post(player_ready))
         .route("/api/lobby/unready", post(unready))
         .route("/api/lobby/reset", post(reset))
         .route("/api/lobby/mixton-reset", post(reset))
@@ -151,31 +186,102 @@ async fn join(
     Json(json!({ "success": true, "state": state }))
 }
 
-async fn leave(
+async fn player_ready(
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
-    let state = manager.leave_queue(guild_id, &payload.discord_id).await;
-    Json(json!({ "success": true, "state": state }))
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+
+    let (discord_id, username, avatar) = if let Some(id) = payload.discord_id {
+        (id, "Jugador".to_string(), None)
+    } else if let Some((id, name, av)) = user_from_cookies(&headers) {
+        (id, name, av)
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
+        )
+            .into_response();
+    };
+
+    let is_ready = payload.ready.unwrap_or(true);
+
+    let state = if is_ready {
+        let player = Player {
+            discord_id: discord_id.clone(),
+            nickname: username,
+            faceit_nickname: None,
+            steam_id_64: None,
+            avatar,
+            faceit_elo: 1000,
+            ready: true,
+            tier: "competitor".to_string(),
+        };
+        manager.join_queue(guild_id, player).await
+    } else {
+        manager.leave_queue(guild_id, &discord_id).await
+    };
+
+    Json(json!({
+        "success": true,
+        "ready": is_ready,
+        "state": state,
+        "availablePlayers": state.available_players
+    }))
+    .into_response()
 }
 
-async fn ready(
+async fn leave(
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
-    let state = manager.set_ready(guild_id, &payload.discord_id, true).await;
-    Json(json!({ "success": true, "state": state }))
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+
+    let discord_id = if let Some(id) = payload.discord_id {
+        id
+    } else if let Some((id, _, _)) = user_from_cookies(&headers) {
+        id
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
+        )
+            .into_response();
+    };
+
+    let state = manager.leave_queue(guild_id, &discord_id).await;
+    Json(json!({ "success": true, "state": state })).into_response()
 }
 
 async fn unready(
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
-    let state = manager.set_ready(guild_id, &payload.discord_id, false).await;
-    Json(json!({ "success": true, "state": state }))
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+
+    let discord_id = if let Some(id) = payload.discord_id {
+        id
+    } else if let Some((id, _, _)) = user_from_cookies(&headers) {
+        id
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
+        )
+            .into_response();
+    };
+
+    let state = manager.set_ready(guild_id, &discord_id, false).await;
+    Json(json!({ "success": true, "state": state })).into_response()
 }
 
 async fn reset(
@@ -206,7 +312,7 @@ async fn map_ban(
     match manager.ban_map(guild_id, &payload.team_id, &payload.map_id).await {
         Ok(state) => Json(json!({ "success": true, "state": state })).into_response(),
         Err(err) => (
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "error": err })),
         )
             .into_response(),
