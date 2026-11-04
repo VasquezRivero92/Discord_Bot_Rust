@@ -575,3 +575,32 @@ fn firestore_mode_describe_never_includes_secrets() {
     .describe()
     .starts_with("key-file"));
 }
+
+#[test]
+fn aws_and_cs2_config_parsing_and_debug_redaction() {
+    let cfg = Config::from_map(&with(&[
+        ("AWS_REGION", "sa-east-1"),
+        ("AWS_ACCESS_KEY_ID", "AKIA123"),
+        ("AWS_SECRET_ACCESS_KEY", "super-secret-aws-key"),
+        ("AWS_EC2_INSTANCE_ID", "i-1234567890abcdef0"),
+        ("CS2_SERVER_IP", "10.0.0.1"),
+        ("CS2_SSH_USER", "cs2user"),
+        ("CS2_SSH_KEY_PATH", "/keys/test.pem"),
+        ("CS2_SERVER_API_KEY", "cs2-secret-api-key"),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.aws_region, "sa-east-1");
+    assert_eq!(cfg.aws_access_key_id.as_deref(), Some("AKIA123"));
+    assert_eq!(cfg.aws_secret_access_key.as_deref(), Some("super-secret-aws-key"));
+    assert_eq!(cfg.aws_ec2_instance_id.as_deref(), Some("i-1234567890abcdef0"));
+    assert_eq!(cfg.cs2_server_ip, "10.0.0.1");
+    assert_eq!(cfg.cs2_ssh_user, "cs2user");
+    assert_eq!(cfg.cs2_ssh_key_path, Some(PathBuf::from("/keys/test.pem")));
+    assert_eq!(cfg.cs2_server_api_key.as_deref(), Some("cs2-secret-api-key"));
+
+    let dbg = format!("{cfg:?}");
+    assert!(!dbg.contains("super-secret-aws-key"));
+    assert!(!dbg.contains("cs2-secret-api-key"));
+    assert!(dbg.contains("aws_secret_access_key: \"<redacted>\""));
+    assert!(dbg.contains("cs2_server_api_key: \"<redacted>\""));
+}

@@ -727,6 +727,8 @@ async fn reads_mount_only_with_firestore() {
             config: Config::from_map(&vars).unwrap(),
             claims: None,
             admin: with_firestore.then(|| fakes.repos()),
+            cs2: None,
+        lobby: None,
         }))
         .await;
         for (path, key) in ALL {

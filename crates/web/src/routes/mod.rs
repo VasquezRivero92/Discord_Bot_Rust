@@ -3,8 +3,10 @@
 
 pub mod admin;
 pub mod auth;
+pub mod cs2_api;
 pub mod diagnostic;
 pub mod public_api;
+pub mod webhooks;
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};

@@ -6,3 +6,7 @@ firebase-service-account*.json
 *service-account*.json
 cookies.txt
 .superpowers/
+
+*.pem
+clave_cs2.pem
+public/

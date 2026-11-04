@@ -209,6 +209,11 @@ impl FirestoreClient {
         Self { db }
     }
 
+    /// Acceso directo al FirestoreDb subyacente.
+    pub fn db(&self) -> &FirestoreDb {
+        &self.db
+    }
+
     /// Lee `collection/id`. `Ok(None)` si el documento no existe.
     pub async fn get_doc<T: DeserializeOwned>(
         &self,

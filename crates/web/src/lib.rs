@@ -40,6 +40,8 @@ pub struct AppDeps {
     /// Sources for the migrated `/api/admin/*` reads (Tasks 7 and 8). `None`
     /// (Firestore disabled) leaves those routes on the proxy.
     pub admin: Option<routes::admin::AdminRepos>,
+    pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
+    pub lobby: Option<Arc<lobby::LobbyManager>>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -109,6 +111,20 @@ pub fn build_app(deps: AppDeps) -> Router {
             ));
         }
         Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
+    }
+    if let Some(cs2_mgr) = deps.cs2 {
+        migrated = migrated
+            .merge(routes::cs2_api::router(routes::cs2_api::Cs2ApiState {
+                manager: cs2_mgr.clone(),
+            }))
+            .merge(routes::webhooks::router(routes::webhooks::WebhooksState {
+                cs2_manager: cs2_mgr,
+            }));
+    }
+    if let Some(lobby_mgr) = deps.lobby {
+        migrated = migrated.merge(lobby::router(lobby::LobbyApiState {
+            manager: lobby_mgr,
+        }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
     // the rate-limit layer so each such request is counted exactly once (by the

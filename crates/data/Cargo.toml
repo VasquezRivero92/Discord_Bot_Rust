@@ -15,6 +15,7 @@ serde_json.workspace = true
 chrono.workspace = true
 tracing = "0.1"
 common = { path = "../common" }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "test-util"] }

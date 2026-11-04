@@ -1,51 +1,59 @@
-# Frente de entrada en Rust + túnel de Cloudflare (fase 1 de la migración).
+# Stack autónomo de MachuPeek: Web y Bot nativo (Rust) + Túnel Cloudflare.
+# 100% independiente de cualquier otro proyecto o contenedor legado.
 #
-# Uso (ver docs/runbook-corte.md):
-#   export LEGACY_PUBLIC_DIR=/d/Discord_Faceit/public   # build de public/ del legado
-#   export TUNNEL_TOKEN=...                              # nunca en un archivo versionado
-#   docker compose up -d --build
-#
-# `web` NO publica puertos en el host: solo el túnel lo alcanza por la red de
-# compose. Así nadie puede llegar al origen saltándose Cloudflare y falsear
-# X-Forwarded-For / CF-Connecting-IP.
+# Uso:
+#   docker compose up -d
 
 services:
+  # 1. Frente de entrada de alta velocidad + Bot de Discord integrado (Rust / Axum + Serenity)
   web:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: machupeek-web:fase1
+    container_name: machupeek-web
     restart: unless-stopped
     env_file: .env
     environment:
-      # Fijados aquí: ganan sobre .env (que puede traer valores de desarrollo).
       PORT: "15633"
       STATIC_DIR: /srv/public
-      # Node legado en el host, en :3001. Nombre distinto de LEGACY_URL para que un
-      # LEGACY_URL=127.0.0.1 de .env no se cuele en la interpolación.
-      LEGACY_URL: ${WEB_LEGACY_URL:-http://host.docker.internal:3001}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      FIREBASE_SERVICE_ACCOUNT_PATH: /run/secrets/firebase-sa.json
+      CS2_SSH_KEY_PATH: /app/clave_cs2.pem
+    ports:
+      # Puerto local para entrar como http://localhost:15633
+      - "127.0.0.1:15633:15633"
+    networks:
+      default:
+        aliases:
+          - discord-faceit-bot
+          - web
     volumes:
       - type: bind
-        source: ${LEGACY_PUBLIC_DIR:?set LEGACY_PUBLIC_DIR to the legacy public/ directory}
+        source: ./public
         target: /srv/public
+        read_only: true
+      - type: bind
+        source: ./firebase-service-account.json
+        target: /run/secrets/firebase-sa.json
+        read_only: true
+      - type: bind
+        source: ./clave_cs2.pem
+        target: /app/clave_cs2.pem
         read_only: true
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Sin `ports:` a propósito.
 
+  # 2. Túnel oficial de Cloudflare Zero Trust para machupeek.com
   tunnel:
     image: cloudflare/cloudflared:latest
+    container_name: machupeek-tunnel
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in the shell environment}
-    # Rollback: el Service del hostname puede apuntar a http://host.docker.internal:3001
-    # (Node directo) sin tocar contenedores.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-eyJhIjoiOGJkNGE0MzkwMzJhNWY1Zjg4MDgyYWZhMTU5NTAzMTYiLCJ0IjoiYmVjODFhNjUtOGQ5OC00YjQ5LWEwZjgtODQyYzQ2YWRiM2FmIiwicyI6Ik1qZG1aVEF3TXpjdFkyUTJPQzAwTVRrNExUZ3dZekF0TWpneU1qZ3hOek00WTJJNCJ9}
     depends_on:
       web:
         condition: service_healthy

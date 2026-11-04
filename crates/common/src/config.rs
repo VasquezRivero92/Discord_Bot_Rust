@@ -324,6 +324,16 @@ pub struct Config {
     pub firestore_emulator_host: Option<String>,
     /// Opt-in explícito a Application Default Credentials.
     pub firestore_use_adc: bool,
+    pub aws_region: String,
+    pub aws_access_key_id: Option<String>,
+    pub aws_secret_access_key: Option<String>,
+    pub aws_ec2_instance_id: Option<String>,
+    pub cs2_server_ip: String,
+    pub cs2_ssh_user: String,
+    pub cs2_ssh_key_path: Option<PathBuf>,
+    pub cs2_server_api_key: Option<String>,
+    pub cs2_server_dir: Option<PathBuf>,
+    pub faceit_api_key: Option<String>,
     /// Capa de entorno de la configuración efectiva (`getEffectiveConfig`).
     pub env_defaults: EnvDefaults,
 }
@@ -357,6 +367,16 @@ impl fmt::Debug for Config {
             )
             .field("firestore_emulator_host", &self.firestore_emulator_host)
             .field("firestore_use_adc", &self.firestore_use_adc)
+            .field("aws_region", &self.aws_region)
+            .field("aws_access_key_id", &self.aws_access_key_id)
+            .field("aws_secret_access_key", &"<redacted>")
+            .field("aws_ec2_instance_id", &self.aws_ec2_instance_id)
+            .field("cs2_server_ip", &self.cs2_server_ip)
+            .field("cs2_ssh_user", &self.cs2_ssh_user)
+            .field("cs2_ssh_key_path", &self.cs2_ssh_key_path)
+            .field("cs2_server_api_key", &"<redacted>")
+            .field("cs2_server_dir", &self.cs2_server_dir)
+            .field("faceit_api_key", &self.faceit_api_key.as_ref().map(|_| "<redacted>"))
             .field("env_defaults", &self.env_defaults)
             .finish()
     }
@@ -509,6 +529,16 @@ impl Config {
                 .map(PathBuf::from),
             firestore_emulator_host: optional(vars, "FIRESTORE_EMULATOR_HOST"),
             firestore_use_adc,
+            aws_region: with_default(vars, "AWS_REGION", "us-east-1"),
+            aws_access_key_id: optional(vars, "AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key: optional(vars, "AWS_SECRET_ACCESS_KEY"),
+            aws_ec2_instance_id: optional(vars, "AWS_EC2_INSTANCE_ID"),
+            cs2_server_ip: with_default(vars, "CS2_SERVER_IP", "96.0.23.220"),
+            cs2_ssh_user: with_default(vars, "CS2_SSH_USER", "ubuntu"),
+            cs2_ssh_key_path: optional(vars, "CS2_SSH_KEY_PATH").map(PathBuf::from),
+            cs2_server_api_key: optional(vars, "CS2_SERVER_API_KEY"),
+            cs2_server_dir: optional(vars, "CS2_SERVER_DIR").map(PathBuf::from),
+            faceit_api_key: optional(vars, "FACEIT_API_KEY"),
             env_defaults: EnvDefaults::from_map(vars),
         })
     }

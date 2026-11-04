@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/data", "crates/web", "crates/contrast"]
+members = ["crates/common", "crates/data", "crates/web", "crates/contrast", "crates/cs2", "crates/lobby", "crates/bot"]
 
 [workspace.package]
 edition = "2021"
@@ -29,3 +29,7 @@ moka = { version = "0.12", features = ["future"] }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 url = "2"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"

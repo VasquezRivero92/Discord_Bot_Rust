@@ -1,0 +1,32 @@
+# Configuración de Docker Compose para ejecución local / desarrollo.
+# Expone el puerto 15633 en localhost y no requiere Cloudflare Tunnel.
+#
+# Uso:
+#   docker compose -f docker-compose.local.yml up --build
+
+services:
+  web:
+    build: .
+    image: machupeek-web:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "15633"
+      STATIC_DIR: /srv/public
+      FIREBASE_SERVICE_ACCOUNT_PATH: /run/secrets/firebase-sa.json
+      CS2_SSH_KEY_PATH: /app/clave_cs2.pem
+    ports:
+      - "127.0.0.1:15633:15633"
+    volumes:
+      - type: bind
+        source: ./public
+        target: /srv/public
+        read_only: true
+      - type: bind
+        source: ./firebase-service-account.json
+        target: /run/secrets/firebase-sa.json
+        read_only: true
+      - type: bind
+        source: ./clave_cs2.pem
+        target: /app/clave_cs2.pem
+        read_only: true

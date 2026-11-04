@@ -1,0 +1,19 @@
+[package]
+name = "bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+data = { path = "../data" }
+lobby = { path = "../lobby" }
+cs2 = { path = "../cs2" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = { workspace = true }
+chrono = { workspace = true }
+tracing = "0.1"
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http", "cache"] }

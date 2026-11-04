@@ -31,6 +31,7 @@ const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if std::env::args().skip(1).any(|a| a == "--healthcheck") {
         let port = std::env::var("PORT")
             .ok()
@@ -48,6 +49,13 @@ async fn main() -> ExitCode {
 
 async fn run() -> ExitCode {
     init_tracing();
+    for var in ["FIRESTORE_EMULATOR_HOST", "FIRESTORE_USE_ADC", "FIREBASE_SERVICE_ACCOUNT_PATH"] {
+        if let Ok(val) = std::env::var(var) {
+            if val.trim().is_empty() {
+                std::env::remove_var(var);
+            }
+        }
+    }
 
     // El error nunca contiene secretos: `Missing` nombra la variable e `Invalid`
     // solo se usa con variables no secretas (PORT, BASE_URL, banderas).
@@ -90,10 +98,27 @@ async fn run() -> ExitCode {
     let claims = admin
         .as_ref()
         .map(|a| a.claims.clone() as Arc<dyn ClaimsRepo>);
+    let cs2 = Some(Arc::new(cs2::Cs2ServerManager::new(&cfg)));
+    let lobby = Some(Arc::new(lobby::LobbyManager::new(&cfg.discord_guild_id)));
+
+    // Arrancar el bot nativo de Discord si hay token configurado
+    if let Some(lobby_mgr) = lobby.clone() {
+        let bot_cfg = cfg.clone();
+        let bot_fs = client.clone();
+        tokio::spawn(async move {
+            info!("Iniciando bot nativo de Discord integrado...");
+            if let Err(e) = bot::start_bot(bot_cfg, bot_fs, lobby_mgr).await {
+                error!("El bot de Discord finalizó con error: {:?}", e);
+            }
+        });
+    }
+
     let app = build_app(AppDeps {
         config: cfg,
         claims,
         admin,
+        cs2,
+        lobby,
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(
