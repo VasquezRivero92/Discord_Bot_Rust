@@ -176,8 +176,10 @@ partida:
   la instancia EC2 termine de pararse (si se estaba parando), hasta 120 s a que
   arranque
   (`waitUntilInstanceStopped`/`waitUntilInstanceRunning`, `maxWaitTime: 120`)
-  y el SSH hasta 15 intentos con 3 s de pausa entre ellos
-  (`waitForSshReady`, `services/awsEc2Service.js`), y después MCSManager y sus
+  y el SSH hasta 15 intentos, cada uno con un tope de 4 s
+  (`executeRemoteCommand('uptime', 4000)`) y 3 s de pausa entre ellos
+  (`waitForSshReady`, `services/awsEc2Service.js`): solo esa espera llega a
+  unos 100 s en el peor caso (15 × 4 s + 14 × 3 s = 102 s). Después vienen MCSManager y sus
   alternativas. `stopServer` encadena peticiones a MCSManager con un tope de
   8 s cada una y una pausa de 2,5 s (unos 26 s en el peor caso). Más allá de
   100 s, Cloudflare corta y el usuario ve el 524 **mientras Node sigue
@@ -239,7 +241,8 @@ cae en las credenciales por defecto sin pedirlo:
 | sí | no | no | no | **error de arranque, código 2** |
 
 Recomendación para el primer corte: `Disabled`, con las reclamaciones y el
-panel todavía en Node. Así el corte no depende de Firestore. Para activar `KeyFile` en
+panel todavía en Node. Así el corte no depende de Firestore. Antes de pasar a
+`KeyFile` o `Adc` en producción, haz la comprobación de índices de 3.4. Para activar `KeyFile` en
 compose, monta la clave en solo lectura con un
 `docker-compose.override.yml` (no versionado):
 
@@ -270,6 +273,23 @@ del panel y el resto de lecturas `GET /api/admin/*`: `/me`, `/steam/status`, `/s
 `/stats/:nickname` usa la API de Faceit, `/matches/:id/demo` el estado en
 memoria de Node y la API de Faceit, y `/settings` valores de `process.env` que
 `POST /settings` reescribe en caliente.
+
+**Antes de activar Firestore: índices compuestos.** Rust nunca crea índices.
+En la consola de Firebase del proyecto (Firestore Database > Índices >
+Compuestos), confirma que existen, con estado *Habilitado*, estos dos índices
+(`guild_id` ascendente, `createdAt` descendente):
+
+- `faceit_bot_logs` (`GET /api/admin/logs`);
+- `faceit_support_calls` (`GET /api/admin/support-calls`).
+
+Si falta alguno, créalo (o añádelo al `firestore.indexes.json` del legado y
+despliégalo) y espera a que termine de construirse antes de activar Firestore.
+Sin ellos, Firestore rechaza la consulta de un admin de servidor (que siempre
+filtra por su servidor) y Rust responde `{ logs: [] }` / `{ calls: [] }` con
+200, igual que el legado, y solo deja el error en el log. Es decir, el panel
+muestra listas vacías sin avisar. `faceit_matches_history` tiene su índice en
+el `firestore.indexes.json` del legado, y `/matches/history` tiene además un
+respaldo sin índice.
 
 **Las escrituras del panel tienen que pasar por Rust.** `/stats` tiene una caché
 de 60 s por servidor y `/yape/transactions` una de 30 s, como en el legado. Node
