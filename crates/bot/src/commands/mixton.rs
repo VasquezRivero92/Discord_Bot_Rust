@@ -46,7 +46,7 @@ pub async fn run_listo(
     let display_name = user.name.clone();
     let avatar_url = user.avatar_url();
 
-    let player = Player {
+    let mut player = Player {
         discord_id: discord_id.clone(),
         nickname: display_name.clone(),
         faceit_nickname: faceit_nick.clone(),
@@ -54,8 +54,12 @@ pub async fn run_listo(
         avatar: avatar_url.clone(),
         faceit_elo: elo,
         ready: true,
-        tier: "competitor".to_string(),
+        tier: "C".to_string(),
+        faceit_level: None,
+        mixton_tier_override: None,
+        discord_user: None,
     };
+    player.ensure_discord_user();
 
     let resolved_guild = lobby.resolve_guild_id(Some(&guild_str));
     lobby.join_queue(resolved_guild, player).await;

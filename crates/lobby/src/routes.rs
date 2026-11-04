@@ -1,7 +1,10 @@
 //! Endpoints REST para el Lobby de Mixtón y CS2 en Axum.
 
 use crate::maps::default_catalog;
-use crate::state::{ChatMessage, LobbyManager, Player};
+use crate::state::{
+    format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
+    LobbyManager, Player,
+};
 use axum::{
     extract::{Path, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
@@ -314,19 +317,32 @@ async fn recharge(
 }
 
 async fn get_state(
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
-    Json(json!({
+    let available_players = partition_available_players(&state);
+    let mut resp = json!({
         "state": state,
-        "availablePlayers": state.available_players,
+        "availablePlayers": available_players,
         "commandEnabled": true,
-        "guildName": "Servidor Oficial",
+        "guildName": "MachuPeek",
         "guildId": guild_id
-    }))
+    });
+    if let Some((id, name, av)) = user_from_cookies(&headers) {
+        let avatar_url = format_discord_avatar(&id, av.as_deref());
+        resp["currentUser"] = json!({
+            "userId": id,
+            "username": name,
+            "avatar": av,
+            "avatarURL": avatar_url,
+            "isAdmin": true
+        });
+    }
+    Json(resp)
 }
 
 async fn join(
@@ -337,7 +353,8 @@ async fn join(
     let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.join_queue(guild_id, payload.player).await;
-    Json(json!({ "success": true, "state": state }))
+    let available_players = partition_available_players(&state);
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
 }
 
 async fn player_ready(
@@ -349,10 +366,11 @@ async fn player_ready(
     let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
     let guild_id = manager.resolve_guild_id(g_opt.as_deref());
 
-    let (discord_id, username, avatar) = if let Some(id) = payload.discord_id {
+    let cookie_user = user_from_cookies(&headers);
+    let (discord_id, username, avatar) = if let Some((id, name, av)) = cookie_user {
+        (payload.discord_id.unwrap_or(id), name, av)
+    } else if let Some(id) = payload.discord_id {
         (id, "Jugador".to_string(), None)
-    } else if let Some((id, name, av)) = user_from_cookies(&headers) {
-        (id, name, av)
     } else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -364,26 +382,37 @@ async fn player_ready(
     let is_ready = payload.ready.unwrap_or(true);
 
     let state = if is_ready {
-        let player = Player {
+        let avatar_url = format_discord_avatar(&discord_id, avatar.as_deref());
+        let mut player = Player {
             discord_id: discord_id.clone(),
-            nickname: username,
-            faceit_nickname: None,
+            nickname: username.clone(),
+            faceit_nickname: Some(username.clone()),
             steam_id_64: None,
-            avatar,
+            avatar: avatar.clone(),
             faceit_elo: 1000,
+            faceit_level: Some(1),
             ready: true,
-            tier: "competitor".to_string(),
+            tier: "C".to_string(),
+            mixton_tier_override: None,
+            discord_user: Some(DiscordUserDetails {
+                username: username.clone(),
+                display_name: username,
+                avatar_url,
+            }),
         };
+        player.ensure_discord_user();
         manager.join_queue(guild_id, player).await
     } else {
         manager.leave_queue(guild_id, &discord_id).await
     };
 
+    let available_players = partition_available_players(&state);
+
     Json(json!({
         "success": true,
         "ready": is_ready,
         "state": state,
-        "availablePlayers": state.available_players
+        "availablePlayers": available_players
     }))
     .into_response()
 }
@@ -410,7 +439,8 @@ async fn leave(
     };
 
     let state = manager.leave_queue(guild_id, &discord_id).await;
-    Json(json!({ "success": true, "state": state })).into_response()
+    let available_players = partition_available_players(&state);
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
 }
 
 async fn unready(
@@ -435,7 +465,8 @@ async fn unready(
     };
 
     let state = manager.set_ready(guild_id, &discord_id, false).await;
-    Json(json!({ "success": true, "state": state })).into_response()
+    let available_players = partition_available_players(&state);
+    Json(json!({ "success": true, "state": state, "availablePlayers": available_players })).into_response()
 }
 
 async fn reset(
@@ -457,7 +488,8 @@ async fn reset_players(
     let mut state = manager.get_state(guild_id).await;
     state.available_players.clear();
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated }))
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
 }
 
 async fn auto_assign_captains(
@@ -495,7 +527,8 @@ async fn auto_assign_captains(
     }
 
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated })).into_response()
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn auto_assign_players(
@@ -523,7 +556,8 @@ async fn auto_assign_players(
     }
 
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated })).into_response()
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn assign_player(
@@ -545,7 +579,8 @@ async fn assign_player(
         }
     }
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated })).into_response()
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn remove_player(
@@ -575,7 +610,8 @@ async fn remove_player(
         }
     }
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated })).into_response()
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn cancel_veto(
@@ -587,7 +623,8 @@ async fn cancel_veto(
     let mut state = manager.get_state(guild_id).await;
     state.map_veto = None;
     let updated = manager.update_state(guild_id, state).await;
-    Json(json!({ "success": true, "state": updated })).into_response()
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players })).into_response()
 }
 
 async fn clear_team(

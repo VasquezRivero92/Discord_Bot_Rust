@@ -317,17 +317,34 @@ async fn logout() -> Response {
 /// `GET /auth/me`
 async fn auth_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
     match user {
-        Some(u) => Json(json!({
-            "user": {
-                "userId": u.user_id,
-                "username": u.username,
-                "avatar": u.avatar,
-                "isAdmin": u.is_admin,
-                "role": u.role,
-                "servidor": u.servidor,
-            }
-        }))
-        .into_response(),
+        Some(u) => {
+            let avatar_url = u.avatar.as_deref().map(|av| {
+                if av.starts_with("http") { av.to_string() }
+                else { format!("https://cdn.discordapp.com/avatars/{}/{}.png", u.user_id, av) }
+            }).unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/0.png".to_string());
+            Json(json!({
+                "user": {
+                    "userId": u.user_id,
+                    "username": u.username,
+                    "avatar": u.avatar,
+                    "avatarURL": avatar_url,
+                    "isAdmin": u.is_admin,
+                    "role": u.role,
+                    "servidor": u.servidor,
+                    "hasSavedPhone": false,
+                    "balance": 0.0,
+                    "faceit_nickname": u.username,
+                    "faceit_player_id": "faceit_mock",
+                    "skillLevel": 10,
+                    "faceit_level": 10,
+                    "elo": 2000,
+                    "faceit_elo": 2000,
+                    "tier": "S",
+                    "steam_id_64": "76561198000000000"
+                }
+            }))
+            .into_response()
+        },
         None => Json(json!({ "user": null })).into_response(),
     }
 }
@@ -335,19 +352,34 @@ async fn auth_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
 /// `GET /api/lobby/me`
 async fn lobby_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
     match user {
-        Some(u) => Json(json!({
-            "user": {
-                "userId": u.user_id,
-                "username": u.username,
-                "avatar": u.avatar,
-                "isAdmin": u.is_admin,
-                "role": u.role,
-                "servidor": u.servidor,
-                "hasSavedPhone": false,
-                "balance": 0.0,
-            }
-        }))
-        .into_response(),
+        Some(u) => {
+            let avatar_url = u.avatar.as_deref().map(|av| {
+                if av.starts_with("http") { av.to_string() }
+                else { format!("https://cdn.discordapp.com/avatars/{}/{}.png", u.user_id, av) }
+            }).unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/0.png".to_string());
+            Json(json!({
+                "user": {
+                    "userId": u.user_id,
+                    "username": u.username,
+                    "avatar": u.avatar,
+                    "avatarURL": avatar_url,
+                    "isAdmin": u.is_admin,
+                    "role": u.role,
+                    "servidor": u.servidor,
+                    "hasSavedPhone": false,
+                    "balance": 0.0,
+                    "faceit_nickname": u.username,
+                    "faceit_player_id": "faceit_mock",
+                    "skillLevel": 10,
+                    "faceit_level": 10,
+                    "elo": 2000,
+                    "faceit_elo": 2000,
+                    "tier": "S",
+                    "steam_id_64": "76561198000000000"
+                }
+            }))
+            .into_response()
+        },
         None => Json(json!({ "user": null })).into_response(),
     }
 }

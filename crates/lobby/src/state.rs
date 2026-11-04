@@ -9,19 +9,164 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DiscordUserDetails {
+    pub username: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "avatarURL")]
+    pub avatar_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Player {
     #[serde(rename = "discordId")]
     pub discord_id: String,
     pub nickname: String,
-    #[serde(rename = "faceit_nickname")]
+    #[serde(rename = "faceit_nickname", default)]
     pub faceit_nickname: Option<String>,
-    #[serde(rename = "steam_id_64")]
+    #[serde(rename = "steam_id_64", default)]
     pub steam_id_64: Option<String>,
     pub avatar: Option<String>,
-    #[serde(rename = "faceit_elo")]
+    #[serde(rename = "faceit_elo", default = "default_elo")]
     pub faceit_elo: u32,
+    #[serde(rename = "faceit_level", default)]
+    pub faceit_level: Option<u32>,
+    #[serde(default)]
     pub ready: bool,
+    #[serde(default = "default_tier")]
     pub tier: String,
+    #[serde(rename = "mixton_tier_override", default)]
+    pub mixton_tier_override: Option<String>,
+    #[serde(rename = "discordUser", default)]
+    pub discord_user: Option<DiscordUserDetails>,
+}
+
+fn default_elo() -> u32 {
+    1000
+}
+
+fn default_tier() -> String {
+    "C".to_string()
+}
+
+pub fn format_discord_avatar(user_id: &str, avatar: Option<&str>) -> String {
+    match avatar {
+        Some(av) if av.starts_with("http") => av.to_string(),
+        Some(av) if !av.is_empty() => {
+            let ext = if av.starts_with("a_") { "gif" } else { "png" };
+            format!("https://cdn.discordapp.com/avatars/{user_id}/{av}.{ext}")
+        }
+        _ => "https://cdn.discordapp.com/embed/avatars/0.png".to_string(),
+    }
+}
+
+pub fn elo_to_level(elo: u32) -> u32 {
+    match elo {
+        0..=500 => 1,
+        501..=750 => 2,
+        751..=900 => 3,
+        901..=1050 => 4,
+        1051..=1200 => 5,
+        1201..=1350 => 6,
+        1351..=1530 => 7,
+        1531..=1750 => 8,
+        1751..=2000 => 9,
+        _ => 10,
+    }
+}
+
+impl Player {
+    pub fn ensure_discord_user(&mut self) {
+        if self.faceit_level.is_none() {
+            self.faceit_level = Some(elo_to_level(self.faceit_elo));
+        }
+        if self.discord_user.is_none() {
+            let avatar = format_discord_avatar(&self.discord_id, self.avatar.as_deref());
+            let name = self.faceit_nickname.clone().unwrap_or_else(|| self.nickname.clone());
+            self.discord_user = Some(DiscordUserDetails {
+                username: self.nickname.clone(),
+                display_name: name,
+                avatar_url: avatar,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TieredAvailablePlayers {
+    #[serde(rename = "S")]
+    pub s: Vec<Player>,
+    #[serde(rename = "A")]
+    pub a: Vec<Player>,
+    #[serde(rename = "B")]
+    pub b: Vec<Player>,
+    #[serde(rename = "C")]
+    pub c: Vec<Player>,
+}
+
+pub fn partition_available_players(state: &LobbyState) -> TieredAvailablePlayers {
+    let mut tiered = TieredAvailablePlayers::default();
+    let occupied: std::collections::HashSet<&str> = state
+        .teams
+        .iter()
+        .flat_map(|t| {
+            let mut ids = Vec::new();
+            if let Some(ref c) = t.captain {
+                ids.push(c.discord_id.as_str());
+            }
+            for p in &t.players {
+                ids.push(p.discord_id.as_str());
+            }
+            ids
+        })
+        .collect();
+
+    for p in &state.available_players {
+        if occupied.contains(p.discord_id.as_str()) {
+            continue;
+        }
+        let mut player = p.clone();
+        player.ensure_discord_user();
+
+        let target_tier = if let Some(ref ov) = player.mixton_tier_override {
+            ov.to_uppercase()
+        } else if matches!(player.tier.to_uppercase().as_str(), "S" | "A" | "B" | "C") {
+            player.tier.to_uppercase()
+        } else if let Some(lvl) = player.faceit_level {
+            if lvl >= 10 {
+                "S".to_string()
+            } else if lvl >= 8 {
+                "A".to_string()
+            } else if lvl >= 5 {
+                "B".to_string()
+            } else {
+                "C".to_string()
+            }
+        } else if player.faceit_elo >= 2000 {
+            "S".to_string()
+        } else if player.faceit_elo >= 1700 {
+            "A".to_string()
+        } else if player.faceit_elo >= 1300 {
+            "B".to_string()
+        } else {
+            "C".to_string()
+        };
+
+        player.tier = target_tier.clone();
+        match target_tier.as_str() {
+            "S" => tiered.s.push(player),
+            "A" => tiered.a.push(player),
+            "B" => tiered.b.push(player),
+            _ => tiered.c.push(player),
+        }
+    }
+
+    tiered.s.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+    tiered.a.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+    tiered.b.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+    tiered.c.sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+
+    tiered
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,6 +256,22 @@ pub struct LobbyState {
     pub tournament: Option<serde_json::Value>,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
+}
+
+impl LobbyState {
+    pub fn sanitize(&mut self) {
+        for team in &mut self.teams {
+            if let Some(ref mut cap) = team.captain {
+                cap.ensure_discord_user();
+            }
+            for p in &mut team.players {
+                p.ensure_discord_user();
+            }
+        }
+        for p in &mut self.available_players {
+            p.ensure_discord_user();
+        }
+    }
 }
 
 impl Default for LobbyState {
@@ -221,12 +382,14 @@ impl LobbyManager {
     /// Difunde el estado actual por WebSockets a todos los navegadores conectados.
     pub async fn broadcast_state(&self, guild_id: &str) {
         let state = self.get_state(guild_id).await;
+        let available_players = partition_available_players(&state);
         let payload = serde_json::json!({
             "type": "state_update",
             "data": {
                 "state": state,
-                "availablePlayers": state.available_players,
+                "availablePlayers": available_players,
                 "commandEnabled": true,
+                "guildName": "MachuPeek",
                 "guildId": guild_id
             }
         })
@@ -237,14 +400,26 @@ impl LobbyManager {
     }
 
     /// Jugador ingresa a la sala de Mixton.
-    pub async fn join_queue(&self, guild_id: &str, player: Player) -> LobbyState {
+    pub async fn join_queue(&self, guild_id: &str, mut player: Player) -> LobbyState {
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
 
-        // Evitar duplicados
-        state.available_players.retain(|p| p.discord_id != player.discord_id);
+        player.ensure_discord_user();
+        if let Some(pos) = state.available_players.iter().position(|p| p.discord_id == player.discord_id) {
+            let existing = &state.available_players[pos];
+            if player.faceit_elo == 1000 && existing.faceit_elo != 1000 {
+                player.faceit_elo = existing.faceit_elo;
+                player.faceit_level = existing.faceit_level;
+                player.tier = existing.tier.clone();
+            }
+            if player.faceit_nickname.is_none() && existing.faceit_nickname.is_some() {
+                player.faceit_nickname = existing.faceit_nickname.clone();
+            }
+            state.available_players.remove(pos);
+        }
         state.available_players.push(player);
         state.updated_at = Utc::now().timestamp_millis();
+        state.sanitize();
 
         let updated = state.clone();
         drop(states);
@@ -416,6 +591,9 @@ mod tests {
             faceit_elo: 1500,
             ready: false,
             tier: "tier1".into(),
+            faceit_level: Some(7),
+            mixton_tier_override: None,
+            discord_user: None,
         };
 
         // 1. Join

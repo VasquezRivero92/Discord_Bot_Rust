@@ -1,6 +1,6 @@
 //! Manejador de WebSockets en tiempo real (`/api/lobby/mixton-ws`) con Axum.
 
-use crate::state::LobbyManager;
+use crate::state::{partition_available_players, LobbyManager};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
 use axum::response::IntoResponse;
@@ -45,13 +45,14 @@ async fn handle_socket(socket: WebSocket, manager: Arc<LobbyManager>, guild_id: 
 
     // 1. Enviar estado inicial
     let state = manager.get_state(&guild_id).await;
+    let available_players = partition_available_players(&state);
     let initial_state = serde_json::json!({
         "type": "state_update",
         "data": {
             "state": state,
-            "availablePlayers": state.available_players,
+            "availablePlayers": available_players,
             "commandEnabled": true,
-            "guildName": "Servidor Oficial",
+            "guildName": "MachuPeek",
             "guildId": guild_id
         }
     })
