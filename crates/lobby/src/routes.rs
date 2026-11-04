@@ -1,11 +1,11 @@
-//! Endpoints REST para la gestión del lobby de Mixton (`/api/lobby/*`).
-
+use crate::maps::default_catalog;
 use crate::state::{ChatMessage, LobbyManager, Player};
-use crate::ws::mixton_ws_handler;
-use axum::extract::{Query, State};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{
+    extract::{RawQuery, State},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -15,20 +15,33 @@ pub struct LobbyApiState {
     pub manager: Arc<LobbyManager>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GuildQuery {
-    #[serde(rename = "guildId")]
-    pub guild_id: Option<String>,
+fn extract_guild_id(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    for pair in raw.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k == "guildId" || k == "guild_id" {
+                let decoded = url::form_urlencoded::parse(v.as_bytes())
+                    .next()
+                    .map(|(_, val)| val.into_owned())
+                    .unwrap_or_else(|| v.to_string());
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+    None
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct JoinPayload {
     #[serde(rename = "guildId")]
     pub guild_id: Option<String>,
     pub player: Player,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct UserActionPayload {
     #[serde(rename = "guildId")]
     pub guild_id: Option<String>,
@@ -36,7 +49,7 @@ pub struct UserActionPayload {
     pub discord_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct MapActionPayload {
     #[serde(rename = "guildId")]
     pub guild_id: Option<String>,
@@ -46,7 +59,7 @@ pub struct MapActionPayload {
     pub map_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SendChatPayload {
     #[serde(rename = "guildId")]
     pub guild_id: Option<String>,
@@ -54,9 +67,9 @@ pub struct SendChatPayload {
     pub author_id: String,
     #[serde(rename = "authorName")]
     pub author_name: String,
-    pub content: String,
     #[serde(rename = "authorAvatar")]
     pub author_avatar: Option<String>,
+    pub content: String,
     #[serde(rename = "imageUrl")]
     pub image_url: Option<String>,
 }
@@ -64,24 +77,66 @@ pub struct SendChatPayload {
 pub fn router(state: LobbyApiState) -> Router {
     Router::new()
         .route("/api/lobby/state", get(get_state))
-        .route("/api/lobby/mixton-ws", get(mixton_ws_handler))
+        .route("/api/lobby/mixton-state", get(get_state))
+        .route("/api/lobby/me", get(lobby_me))
+        .route("/api/lobby/matches-history", get(matches_history))
+        .route("/api/lobby/map-catalog", get(map_catalog))
+        .route("/api/lobby/mixton-queues", get(mixton_queues))
+        .route("/api/lobby/wallet", get(wallet))
+        .route("/api/lobby/mixton-ws", get(crate::ws::mixton_ws_handler))
         .route("/api/lobby/join", post(join))
         .route("/api/lobby/leave", post(leave))
         .route("/api/lobby/ready", post(ready))
+        .route("/api/lobby/mixton-player-ready", post(ready))
         .route("/api/lobby/unready", post(unready))
         .route("/api/lobby/reset", post(reset))
+        .route("/api/lobby/mixton-reset", post(reset))
         .route("/api/lobby/start-veto", post(start_veto))
+        .route("/api/lobby/mixton-start-veto", post(start_veto))
         .route("/api/lobby/map-ban", post(map_ban))
+        .route("/api/lobby/mixton-ban-map", post(map_ban))
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route("/api/lobby/mixton-chat-message", post(chat_message))
+        .route("/api/lobby/mixton-chat-send", post(chat_message))
         .with_state(state.manager)
 }
 
+async fn lobby_me() -> impl IntoResponse {
+    Json(json!({ "user": null }))
+}
+
+async fn matches_history() -> impl IntoResponse {
+    Json(json!({ "history": [] }))
+}
+
+async fn map_catalog() -> impl IntoResponse {
+    let catalog = default_catalog();
+    let count = catalog.len();
+    Json(json!({
+        "success": true,
+        "catalog": catalog,
+        "activeCount": count
+    }))
+}
+
+async fn mixton_queues() -> impl IntoResponse {
+    Json(json!({
+        "queues": []
+    }))
+}
+
+async fn wallet() -> impl IntoResponse {
+    Json(json!({
+        "balance": 0.0
+    }))
+}
+
 async fn get_state(
-    Query(query): Query<GuildQuery>,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(query.guild_id.as_deref());
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.get_state(guild_id).await;
 
     Json(json!({
@@ -129,19 +184,21 @@ async fn unready(
 }
 
 async fn reset(
-    Query(query): Query<GuildQuery>,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(query.guild_id.as_deref());
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let state = manager.reset_lobby(guild_id).await;
     Json(json!({ "success": true, "state": state }))
 }
 
 async fn start_veto(
-    Query(query): Query<GuildQuery>,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(query.guild_id.as_deref());
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let veto = manager.start_map_veto(guild_id).await;
     Json(json!({ "success": veto.is_some(), "veto": veto }))
 }
@@ -162,12 +219,16 @@ async fn map_ban(
 }
 
 async fn chat_history(
-    Query(query): Query<GuildQuery>,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(query.guild_id.as_deref());
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
     let history = manager.get_chat_history(guild_id).await;
-    Json(history)
+    Json(json!({
+        "success": true,
+        "messages": history
+    }))
 }
 
 async fn chat_message(

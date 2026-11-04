@@ -75,6 +75,40 @@ pub struct LobbyState {
     pub draft_started: bool,
     #[serde(rename = "draftFinished")]
     pub draft_finished: bool,
+    #[serde(rename = "pickOrder", default)]
+    pub pick_order: Vec<String>,
+    #[serde(rename = "pickSequence", default)]
+    pub pick_sequence: Vec<String>,
+    #[serde(rename = "currentPickIndex", default)]
+    pub current_pick_index: usize,
+    #[serde(rename = "captainAProposal", default)]
+    pub captain_a_proposal: Option<serde_json::Value>,
+    #[serde(rename = "captainBProposal", default)]
+    pub captain_b_proposal: Option<serde_json::Value>,
+    #[serde(rename = "captainAReady", default)]
+    pub captain_a_ready: bool,
+    #[serde(rename = "captainBReady", default)]
+    pub captain_b_ready: bool,
+    #[serde(rename = "betAgreed", default)]
+    pub bet_agreed: bool,
+    #[serde(rename = "agreedBetAmount", default)]
+    pub agreed_bet_amount: Option<f64>,
+    #[serde(rename = "effectiveBetAmount", default)]
+    pub effective_bet_amount: f64,
+    #[serde(rename = "autoCountdownEndsAt", default)]
+    pub auto_countdown_ends_at: Option<i64>,
+    #[serde(rename = "rouletteWinnerTeamId", default)]
+    pub roulette_winner_team_id: Option<String>,
+    #[serde(rename = "rouletteWinnerName", default)]
+    pub roulette_winner_name: Option<String>,
+    #[serde(rename = "rouletteSpinning", default)]
+    pub roulette_spinning: bool,
+    #[serde(rename = "rouletteStartedAt", default)]
+    pub roulette_started_at: Option<i64>,
+    #[serde(rename = "rouletteSliceOffset", default)]
+    pub roulette_slice_offset: Option<f64>,
+    #[serde(default)]
+    pub tournament: Option<serde_json::Value>,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
 }
@@ -105,6 +139,23 @@ impl Default for LobbyState {
             map_veto: None,
             draft_started: false,
             draft_finished: false,
+            pick_order: Vec::new(),
+            pick_sequence: Vec::new(),
+            current_pick_index: 0,
+            captain_a_proposal: None,
+            captain_b_proposal: None,
+            captain_a_ready: false,
+            captain_b_ready: false,
+            bet_agreed: false,
+            agreed_bet_amount: None,
+            effective_bet_amount: 0.0,
+            auto_countdown_ends_at: None,
+            roulette_winner_team_id: None,
+            roulette_winner_name: None,
+            roulette_spinning: false,
+            roulette_started_at: None,
+            roulette_slice_offset: None,
+            tournament: None,
             updated_at: Utc::now().timestamp_millis(),
         }
     }

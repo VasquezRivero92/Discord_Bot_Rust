@@ -2,26 +2,39 @@
 
 use crate::state::LobbyManager;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{RawQuery, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info};
 
-#[derive(Debug, Deserialize)]
-pub struct WsQuery {
-    #[serde(rename = "guildId")]
-    pub guild_id: Option<String>,
+fn extract_guild_id(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    for pair in raw.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k == "guildId" || k == "guild_id" {
+                let decoded = url::form_urlencoded::parse(v.as_bytes())
+                    .next()
+                    .map(|(_, val)| val.into_owned())
+                    .unwrap_or_else(|| v.to_string());
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Handler de actualización a WebSocket de Axum.
 pub async fn mixton_ws_handler(
     ws: WebSocketUpgrade,
-    Query(query): Query<WsQuery>,
+    RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(query.guild_id.as_deref()).to_string();
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref()).to_string();
     ws.on_upgrade(move |socket| handle_socket(socket, manager, guild_id))
 }
 
