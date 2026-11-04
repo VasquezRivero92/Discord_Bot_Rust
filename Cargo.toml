@@ -7,7 +7,7 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 thiserror = "2"

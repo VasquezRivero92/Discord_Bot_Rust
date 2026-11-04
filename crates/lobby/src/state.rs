@@ -234,17 +234,23 @@ fn default_steam() -> String { "steam".to_string() }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
-    #[serde(rename = "authorId")]
-    pub author_id: String,
-    #[serde(rename = "authorName")]
-    pub author_name: String,
-    #[serde(rename = "authorAvatar")]
-    pub author_avatar: Option<String>,
+    #[serde(rename = "discordId", alias = "authorId")]
+    pub discord_id: String,
+    #[serde(rename = "author", alias = "authorName")]
+    pub author: String,
+    #[serde(rename = "avatar", alias = "authorAvatar", default)]
+    pub avatar: Option<String>,
+    #[serde(rename = "isAdmin", default)]
+    pub is_admin: bool,
+    #[serde(default = "default_source")]
+    pub source: String,
     pub content: String,
-    #[serde(rename = "imageUrl")]
+    #[serde(rename = "imageUrl", default)]
     pub image_url: Option<String>,
     pub timestamp: i64,
 }
+
+fn default_source() -> String { "web".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LobbyState {
@@ -694,7 +700,7 @@ impl LobbyManager {
         drop(chats);
 
         let payload = serde_json::json!({
-            "type": "chat_message",
+            "type": "mixton_chat_message",
             "data": msg
         })
         .to_string();

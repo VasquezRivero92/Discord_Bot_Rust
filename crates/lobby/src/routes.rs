@@ -112,13 +112,22 @@ pub struct MapActionPayload {
 pub struct SendChatPayload {
     #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
-    #[serde(rename = "authorId")]
-    pub author_id: String,
-    #[serde(rename = "authorName")]
-    pub author_name: String,
+    #[serde(rename = "authorId", default)]
+    pub author_id: Option<String>,
+    #[serde(rename = "discordId", default)]
+    pub discord_id: Option<String>,
+    #[serde(rename = "authorName", default)]
+    pub author_name: Option<String>,
+    #[serde(rename = "author", default)]
+    pub author: Option<String>,
     #[serde(rename = "authorAvatar", default)]
     pub author_avatar: Option<String>,
-    pub content: String,
+    #[serde(rename = "avatar", default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(rename = "imageUrl", default)]
     pub image_url: Option<String>,
 }
@@ -1312,20 +1321,121 @@ async fn chat_history(
 
 async fn chat_message(
     State(manager): State<Arc<LobbyManager>>,
-    Json(payload): Json<SendChatPayload>,
+    req: axum::extract::Request,
 ) -> impl IntoResponse {
-    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
-    let msg = ChatMessage {
-        id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
-        author_id: payload.author_id,
-        author_name: payload.author_name,
-        author_avatar: payload.author_avatar,
-        content: payload.content,
-        image_url: payload.image_url,
-        timestamp: chrono::Utc::now().timestamp_millis(),
+    use axum::extract::FromRequest;
+
+    let (parts, body) = req.into_parts();
+    let headers = &parts.headers;
+    let query_str = parts.uri.query();
+    let query_guild = extract_guild_id(query_str);
+
+    let cookie_user = user_from_cookies(headers);
+    let is_admin = headers
+        .get(header::COOKIE)
+        .and_then(|c| c.to_str().ok())
+        .map(|c| c.contains("admin_token="))
+        .unwrap_or(false);
+
+    let is_multipart = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("multipart/form-data"))
+        .unwrap_or(false);
+
+    let mut message_text = String::new();
+    let mut image_url: Option<String> = None;
+    let mut body_guild_id: Option<String> = None;
+    let mut author_id: Option<String> = None;
+    let mut author_name: Option<String> = None;
+    let mut author_avatar: Option<String> = None;
+
+    if is_multipart {
+        let req_again = axum::extract::Request::from_parts(parts, body);
+        if let Ok(mut multipart) = axum::extract::Multipart::from_request(req_again, &manager).await {
+            while let Ok(Some(field)) = multipart.next_field().await {
+                let name = field.name().unwrap_or("").to_string();
+                if name == "message" || name == "content" {
+                    if let Ok(text) = field.text().await {
+                        message_text = text;
+                    }
+                } else if name == "guildId" || name == "guild_id" {
+                    if let Ok(gid) = field.text().await {
+                        body_guild_id = Some(gid);
+                    }
+                } else if name == "image" {
+                    let file_name = field.file_name().unwrap_or("image.png").to_string();
+                    let ext = std::path::Path::new(&file_name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("png");
+                    if let Ok(bytes) = field.bytes().await {
+                        if !bytes.is_empty() {
+                            let filename = format!("chat_{}.{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), ext);
+                            let target_path = format!("public/uploads/{}", filename);
+                            let srv_path = format!("/srv/public/uploads/{}", filename);
+                            let _ = tokio::fs::create_dir_all("public/uploads").await;
+                            let _ = tokio::fs::create_dir_all("/srv/public/uploads").await;
+                            let _ = tokio::fs::write(&target_path, &bytes).await;
+                            let _ = tokio::fs::write(&srv_path, &bytes).await;
+                            image_url = Some(format!("/uploads/{}", filename));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let bytes = axum::body::to_bytes(body, 1024 * 64).await.unwrap_or_default();
+        if let Ok(payload) = serde_json::from_slice::<SendChatPayload>(&bytes) {
+            message_text = payload.message.or(payload.content).unwrap_or_default().trim().to_string();
+            body_guild_id = payload.guild_id;
+            author_id = payload.author_id.or(payload.discord_id);
+            author_name = payload.author_name.or(payload.author);
+            author_avatar = payload.author_avatar.or(payload.avatar);
+            image_url = payload.image_url;
+        }
+    }
+
+    let (did, name, avatar) = if let Some((id, u_name, av)) = cookie_user {
+        let av_url = format_discord_avatar(&id, av.as_deref());
+        (id, u_name, av_url)
+    } else if let Some(id) = author_id.filter(|s| !s.is_empty()) {
+        let n = author_name.unwrap_or_else(|| "Jugador".to_string());
+        let av = author_avatar.unwrap_or_else(|| format_discord_avatar(&id, None));
+        (id, n, av)
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord para enviar mensajes." })),
+        )
+            .into_response();
     };
+
+    if message_text.is_empty() && image_url.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "El mensaje no puede estar vacío." })),
+        )
+            .into_response();
+    }
+
+    let effective_gid = body_guild_id.or(query_guild);
+    let guild_id = manager.resolve_guild_id(effective_gid.as_deref());
+    let now = chrono::Utc::now().timestamp_millis();
+    let msg = ChatMessage {
+        id: format!("msg_{now}"),
+        discord_id: did.clone(),
+        author: name.clone(),
+        avatar: Some(avatar.clone()),
+        is_admin,
+        source: "web".to_string(),
+        content: message_text,
+        image_url,
+        timestamp: now,
+    };
+
     manager.add_chat_message(guild_id, msg.clone()).await;
-    Json(json!({ "success": true, "message": msg }))
+    Json(json!({ "success": true, "message": msg })).into_response()
 }
 
 #[derive(Deserialize, Debug, Default)]
