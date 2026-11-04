@@ -13,6 +13,7 @@ moka.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+tracing = "0.1"
 common = { path = "../common" }
 
 [dev-dependencies]

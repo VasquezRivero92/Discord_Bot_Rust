@@ -54,7 +54,8 @@ impl Drop for WatcherHandle {
 /// momento, que nunca recibe `Removed`). Los eventos de documentos que no están en caché no
 /// afectan a las demás claves. Cuando el stream termina (error o fin) se invalida todo y se reabre
 /// con espera exponencial (1 s, el doble cada vez, tope 60 s; vuelve a 1 s tras un stream que duró
-/// más de 60 s). `restarts` cuenta las reaperturas.
+/// más de 60 s). `restarts` cuenta las reaperturas. Un stream que termina con error deja un
+/// `warn` con el tipo de error y la espera (uno por reapertura).
 pub(crate) async fn keep_cache_in_sync<V>(
     cache: &TtlCache<String, V>,
     restarts: &AtomicU64,
@@ -70,6 +71,7 @@ pub(crate) async fn keep_cache_in_sync<V>(
         }
         first = false;
         let opened = Instant::now();
+        let mut failed: Option<&'static str> = None;
         let mut stream = open();
         // Al (re)abrir también se invalida todo: un borrado durante la espera no emite evento.
         cache.invalidate_all();
@@ -89,7 +91,8 @@ pub(crate) async fn keep_cache_in_sync<V>(
                         .invalidate_all_and_purge_stale_unless(|id| present.contains(id))
                         .await
                 }
-                Err(_) => {
+                Err(err) => {
+                    failed = Some(error_kind(&err));
                     cache.invalidate_all();
                     break;
                 }
@@ -100,7 +103,47 @@ pub(crate) async fn keep_cache_in_sync<V>(
         if opened.elapsed() > STABLE_AFTER {
             backoff = BACKOFF_MIN;
         }
+        if let Some(kind) = failed {
+            // Una línea por reapertura: como mucho una por segundo, y una por minuto si el error
+            // persiste (la espera exponencial ya lo limita). Solo el tipo de error, nunca su
+            // mensaje (podría llevar nombres o contenido de documentos).
+            tracing::warn!(
+                error_kind = kind,
+                backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                "watcher de Firestore: el stream terminó con error; se reabre tras la espera"
+            );
+        }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// Tipo de un [`DataError`] para el log, sin su mensaje.
+fn error_kind(err: &DataError) -> &'static str {
+    match err {
+        DataError::Firestore(_) => "firestore",
+        DataError::QuotaExceeded => "quota_exceeded",
+        DataError::NotFound => "not_found",
+        DataError::Decode(_) => "decode",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_kind_never_carries_the_message() {
+        let secret = "projects/p/databases/(default)/documents/faceit_config/settings";
+        for (err, want) in [
+            (DataError::Firestore(secret.into()), "firestore"),
+            (DataError::QuotaExceeded, "quota_exceeded"),
+            (DataError::NotFound, "not_found"),
+            (DataError::Decode(secret.into()), "decode"),
+        ] {
+            let kind = error_kind(&err);
+            assert_eq!(kind, want);
+            assert!(!kind.contains("faceit_config"));
+        }
     }
 }
