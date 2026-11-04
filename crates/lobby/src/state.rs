@@ -297,6 +297,8 @@ pub struct LobbyState {
     pub roulette_slice_offset: Option<f64>,
     #[serde(default)]
     pub tournament: Option<serde_json::Value>,
+    #[serde(rename = "mapCatalog", default = "default_catalog")]
+    pub map_catalog: Vec<MapInfo>,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
 }
@@ -339,14 +341,17 @@ impl LobbyState {
 
         let team_a_id = team_a.id.clone();
         let team_b_id = team_b.id.clone();
-        let ban_sequence = vec![
-            team_a_id.clone(),
-            team_b_id.clone(),
-            team_a_id.clone(),
-            team_b_id.clone(),
-            team_a_id.clone(),
-            team_b_id.clone(),
-        ];
+        let active_maps: Vec<MapInfo> = self.map_catalog.iter().filter(|m| m.active).cloned().collect();
+        let pool_len = active_maps.len();
+        let ban_count = if pool_len > 1 { pool_len - 1 } else { 0 };
+        let mut ban_sequence = Vec::with_capacity(ban_count);
+        for i in 0..ban_count {
+            if i % 2 == 0 {
+                ban_sequence.push(team_a_id.clone());
+            } else {
+                ban_sequence.push(team_b_id.clone());
+            }
+        }
 
         self.map_veto = Some(MapVetoState {
             active: true,
@@ -364,7 +369,7 @@ impl LobbyState {
             ban_sequence,
             turn: team_a_id,
             current_step: "ban".to_string(),
-            active_maps: default_catalog().into_iter().filter(|m| m.active).collect(),
+            active_maps,
             final_chosen_map: None,
             bet_amount: self.effective_bet_amount,
             queue_id: "auto".to_string(),
@@ -417,6 +422,7 @@ impl Default for LobbyState {
             roulette_started_at: None,
             roulette_slice_offset: None,
             tournament: None,
+            map_catalog: default_catalog(),
             updated_at: Utc::now().timestamp_millis(),
         }
     }
@@ -582,7 +588,11 @@ impl LobbyManager {
     pub async fn reset_lobby(&self, guild_id: &str) -> LobbyState {
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
+        let current_catalog = state.map_catalog.clone();
         *state = LobbyState::default();
+        if !current_catalog.is_empty() {
+            state.map_catalog = current_catalog;
+        }
         let updated = state.clone();
         drop(states);
 

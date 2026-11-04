@@ -1,6 +1,6 @@
 //! Endpoints REST para el Lobby de Mixtón y CS2 en Axum.
 
-use crate::maps::default_catalog;
+use crate::maps::MapInfo;
 use crate::state::{
     LobbyTeam, MapVetoState,
     format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
@@ -88,6 +88,14 @@ pub struct UserActionPayload {
     pub discord_id: Option<String>,
     #[serde(default)]
     pub ready: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct MapCatalogPayload {
+    #[serde(rename = "guildId", default)]
+    pub guild_id: Option<String>,
+    #[serde(default)]
+    pub catalog: Vec<MapInfo>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -192,7 +200,7 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/guilds", get(guilds))
         .route("/api/lobby/matches-history", get(matches_history))
         .route("/api/lobby/matches-history/{match_id}", get(matches_history))
-        .route("/api/lobby/map-catalog", get(map_catalog))
+        .route("/api/lobby/map-catalog", get(map_catalog).post(update_map_catalog))
         .route("/api/lobby/mixton-queues", get(mixton_queues))
         .route("/api/lobby/wallet", get(wallet))
         .route("/api/lobby/player-balance/{discord_id}", get(player_balance))
@@ -261,8 +269,39 @@ async fn matches_history() -> impl IntoResponse {
     Json(json!({ "history": [] }))
 }
 
-async fn map_catalog() -> impl IntoResponse {
-    Json(json!({ "catalog": default_catalog() }))
+async fn map_catalog(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let state = manager.get_state(guild_id).await;
+    Json(json!({ "catalog": state.map_catalog }))
+}
+
+async fn update_map_catalog(
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<MapCatalogPayload>,
+) -> impl IntoResponse {
+    let g_opt = payload.guild_id.or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    if !payload.catalog.is_empty() {
+        state.map_catalog = payload.catalog;
+        state.updated_at = chrono::Utc::now().timestamp_millis();
+        let updated = manager.update_state(guild_id, state).await;
+        let available_players = partition_available_players(&updated);
+        Json(json!({
+            "success": true,
+            "catalog": updated.map_catalog,
+            "state": updated,
+            "availablePlayers": available_players
+        })).into_response()
+    } else {
+        Json(json!({ "success": true, "catalog": state.map_catalog })).into_response()
+    }
 }
 
 async fn mixton_queues() -> impl IntoResponse {
@@ -1141,14 +1180,17 @@ async fn start_veto(
     let team_b_id = payload.get("teamIdB").and_then(|v| v.as_str()).unwrap_or("team_2").to_string();
     let bet = payload.get("betAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-    let ban_sequence = vec![
-        team_a_id.clone(),
-        team_b_id.clone(),
-        team_a_id.clone(),
-        team_b_id.clone(),
-        team_a_id.clone(),
-        team_b_id.clone(),
-    ];
+    let active_maps: Vec<MapInfo> = state.map_catalog.iter().filter(|m| m.active).cloned().collect();
+    let pool_len = active_maps.len();
+    let ban_count = if pool_len > 1 { pool_len - 1 } else { 0 };
+    let mut ban_sequence = Vec::with_capacity(ban_count);
+    for i in 0..ban_count {
+        if i % 2 == 0 {
+            ban_sequence.push(team_a_id.clone());
+        } else {
+            ban_sequence.push(team_b_id.clone());
+        }
+    }
 
     let veto = MapVetoState {
         active: true,
@@ -1166,7 +1208,7 @@ async fn start_veto(
         ban_sequence,
         turn: team_a_id,
         current_step: "ban".to_string(),
-        active_maps: default_catalog().into_iter().filter(|m| m.active).collect(),
+        active_maps,
         final_chosen_map: None,
         bet_amount: bet,
         queue_id: "auto".to_string(),
