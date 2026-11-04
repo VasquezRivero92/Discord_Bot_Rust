@@ -175,7 +175,7 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/map-catalog", get(map_catalog))
         .route("/api/lobby/mixton-queues", get(mixton_queues))
         .route("/api/lobby/wallet", get(wallet))
-        .route("/api/lobby/player-balance/:discord_id", get(player_balance))
+        .route("/api/lobby/player-balance/{discord_id}", get(player_balance))
         .route("/api/lobby/users", get(users))
         // WebSockets
         .route("/api/lobby/mixton-ws", get(crate::ws::mixton_ws_handler))
