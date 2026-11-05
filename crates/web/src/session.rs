@@ -424,3 +424,21 @@ where
         }
     }
 }
+
+impl lobby::auth::SessionVerifier for SessionState {
+    fn verify_token(&self, token: &str) -> Option<lobby::auth::LobbyUser> {
+        let claims = self.verify(token).ok()?;
+        Some(lobby::auth::LobbyUser {
+            user_id: claims.user_id,
+            username: claims.username,
+            avatar: claims.avatar,
+            role: if claims.role.is_empty() {
+                None
+            } else {
+                Some(claims.role)
+            },
+            servidor: claims.servidor,
+            is_admin: claims.is_admin,
+        })
+    }
+}

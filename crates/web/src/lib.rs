@@ -122,8 +122,19 @@ pub fn build_app(deps: AppDeps) -> Router {
             }));
     }
     if let Some(lobby_mgr) = deps.lobby {
+        // Falla cerrado: sin una sesión válida el lobby rechaza todo token. Nunca
+        // se usa una clave de respaldo conocida (permitiría forjar sesiones).
+        let lobby_auth: Arc<dyn lobby::auth::SessionVerifier> =
+            match session::SessionState::from_config(cfg) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::error!("lobby: sin sesión válida, se rechaza todo token: {e}");
+                    Arc::new(lobby::auth::DenyAllVerifier)
+                }
+            };
         migrated = migrated.merge(lobby::router(lobby::LobbyApiState {
             manager: lobby_mgr,
+            auth: lobby_auth,
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before

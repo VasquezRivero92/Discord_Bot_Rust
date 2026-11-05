@@ -1,5 +1,8 @@
 //! Endpoints REST para el Lobby de Mixtón y CS2 en Axum.
 
+use crate::auth::{
+    resolve_guild_for_user, OptionalLobbyUser, RequireAdmin, RequireUser, SessionVerifier,
+};
 use crate::maps::MapInfo;
 use crate::state::{
     format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
@@ -7,69 +10,45 @@ use crate::state::{
 };
 use axum::{
     extract::{Path, RawQuery, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct LobbyApiState {
     pub manager: Arc<LobbyManager>,
+    pub auth: Arc<dyn SessionVerifier>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LobbyCtx {
+    pub manager: Arc<LobbyManager>,
+    pub auth: Arc<dyn SessionVerifier>,
+}
+
+impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.manager.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for Arc<dyn SessionVerifier> {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.auth.clone()
+    }
 }
 
 fn extract_guild_id(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
-    for pair in raw.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-            if k == "guildId" || k == "guild_id" {
-                let decoded = url::form_urlencoded::parse(v.as_bytes())
-                    .next()
-                    .map(|(_, val)| val.into_owned())
-                    .unwrap_or_else(|| v.to_string());
-                if !decoded.is_empty() {
-                    return Some(decoded);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extrae de forma segura el usuario autenticado desde las cookies de sesión (auth_token o admin_token).
-fn user_from_cookies(headers: &HeaderMap) -> Option<(String, String, Option<String>)> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if pair.starts_with("auth_token=") || pair.starts_with("admin_token=") {
-            let token = pair.split_once('=')?.1.trim_matches('"');
-            let mut parts = token.split('.');
-            let _header = parts.next()?;
-            let payload_b64 = parts.next()?;
-            let pad_len = (4 - (payload_b64.len() % 4)) % 4;
-            let padded = format!("{}{}", payload_b64, "=".repeat(pad_len));
-            let decoded = URL_SAFE_NO_PAD
-                .decode(payload_b64.as_bytes())
-                .or_else(|_| URL_SAFE_NO_PAD.decode(padded.as_bytes()))
-                .ok()?;
-            let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-            let user_id = val.get("userId").and_then(|v| v.as_str())?.to_string();
-            let username = val
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Jugador")
-                .to_string();
-            let avatar = val
-                .get("avatar")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            return Some((user_id, username, avatar));
+    for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if (k == "guildId" || k == "guild_id") && !v.is_empty() {
+            return Some(v.into_owned());
         }
     }
     None
@@ -204,6 +183,10 @@ pub struct PickPayload {
 }
 
 pub fn router(state: LobbyApiState) -> Router {
+    let ctx = LobbyCtx {
+        manager: state.manager,
+        auth: state.auth,
+    };
     Router::new()
         // Estado y lecturas básicas
         .route("/api/lobby/state", get(get_state))
@@ -274,20 +257,23 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
         .route(
             "/api/lobby/mixton-check-bet-status",
-            post(generic_lobby_action),
+            post(generic_lobby_user_action),
         )
-        .route("/api/lobby/mixton-load-team", post(generic_lobby_action))
+        .route(
+            "/api/lobby/mixton-load-team",
+            post(generic_lobby_admin_action),
+        )
         .route(
             "/api/lobby/mixton-override-tier",
-            post(generic_lobby_action),
+            post(generic_lobby_admin_action),
         )
         .route("/api/lobby/create-match", post(mixton_create_match))
         .route("/api/lobby/mixton-create-match", post(mixton_create_match))
         .route(
             "/api/lobby/sync-faceit-from-steam",
-            post(generic_lobby_action),
+            post(generic_lobby_user_action),
         )
-        .route("/api/lobby/verify-faceit", post(generic_lobby_action))
+        .route("/api/lobby/verify-faceit", post(generic_lobby_user_action))
         .route("/api/lobby/link-steam", post(link_steam))
         .route("/api/lobby/sync-steam", post(link_steam))
         // Chat
@@ -295,12 +281,12 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-chat-message", post(chat_message))
         .route("/api/lobby/mixton-chat-send", post(chat_message))
         // Billetera / Recargas
-        .route("/api/lobby/quick-add-balance", post(recharge))
-        .route("/api/lobby/wallet/recharge-yape", post(recharge))
-        .with_state(state.manager)
+        .route("/api/lobby/quick-add-balance", post(quick_add_balance))
+        .route("/api/lobby/wallet/recharge-yape", post(recharge_yape))
+        .with_state(ctx)
 }
 
-async fn matches_history() -> impl IntoResponse {
+async fn matches_history(_user: OptionalLobbyUser) -> impl IntoResponse {
     Json(json!({ "history": [] }))
 }
 
@@ -315,6 +301,7 @@ async fn map_catalog(
 }
 
 async fn update_map_catalog(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<MapCatalogPayload>,
@@ -322,7 +309,11 @@ async fn update_map_catalog(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if !payload.catalog.is_empty() {
@@ -342,15 +333,15 @@ async fn update_map_catalog(
     }
 }
 
-async fn mixton_queues() -> impl IntoResponse {
+async fn mixton_queues(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "queues": [] }))
 }
 
-async fn wallet() -> impl IntoResponse {
+async fn wallet(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "balance": 0.0 }))
 }
 
-async fn guilds(State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
+async fn guilds(_user: RequireUser, State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
     let g_id = manager.resolve_guild_id(None);
     Json(json!({
         "guilds": [
@@ -364,16 +355,25 @@ async fn guilds(State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
     }))
 }
 
-async fn player_balance(Path(discord_id): Path<String>) -> impl IntoResponse {
+async fn player_balance(
+    user: RequireUser,
+    RawQuery(raw): RawQuery,
+    Path(discord_id): Path<String>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    if let Err(msg) = resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response();
+    }
     Json(json!({
         "discordId": discord_id,
         "balance": 100.0,
         "hasEnough": true,
         "deficit": 0.0
     }))
+    .into_response()
 }
 
-async fn users() -> impl IntoResponse {
+async fn users(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "users": [] }))
 }
 
@@ -385,7 +385,18 @@ async fn steam_avatar(Path(_): Path<String>) -> impl IntoResponse {
     Json(json!({ "avatar": "https://cdn.discordapp.com/embed/avatars/0.png" }))
 }
 
-async fn recharge(Json(_): Json<serde_json::Value>) -> impl IntoResponse {
+async fn quick_add_balance(
+    _admin: RequireAdmin,
+    Json(_): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    Json(json!({
+        "success": true,
+        "balance": 100.0,
+        "message": "Saldo procesado exitosamente."
+    }))
+}
+
+async fn recharge_yape(_user: RequireUser, Json(_): Json<serde_json::Value>) -> impl IntoResponse {
     Json(json!({
         "success": true,
         "balance": 100.0,
@@ -394,12 +405,22 @@ async fn recharge(Json(_): Json<serde_json::Value>) -> impl IntoResponse {
 }
 
 async fn get_state(
-    headers: HeaderMap,
+    OptionalLobbyUser(user_opt): OptionalLobbyUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let effective_guild = if let Some(ref u) = user_opt {
+        match resolve_guild_for_user(u, g_opt.as_deref(), false) {
+            Ok(g) => g,
+            Err(msg) => {
+                return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
+            }
+        }
+    } else {
+        g_opt
+    };
+    let guild_id = manager.resolve_guild_id(effective_guild.as_deref());
     let state = manager.get_state(guild_id).await;
     let available_players = partition_available_players(&state);
     let mut resp = json!({
@@ -409,20 +430,21 @@ async fn get_state(
         "guildName": "MachuPeek",
         "guildId": guild_id
     });
-    if let Some((id, name, av)) = user_from_cookies(&headers) {
-        let avatar_url = format_discord_avatar(&id, av.as_deref());
+    if let Some(user) = user_opt {
+        let avatar_url = format_discord_avatar(&user.user_id, user.avatar.as_deref());
         resp["currentUser"] = json!({
-            "userId": id,
-            "username": name,
-            "avatar": av,
+            "userId": user.user_id,
+            "username": user.username,
+            "avatar": user.avatar,
             "avatarURL": avatar_url,
-            "isAdmin": true
+            "isAdmin": user.is_admin_like()
         });
     }
-    Json(resp)
+    Json(resp).into_response()
 }
 
 async fn join(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<JoinPayload>,
@@ -430,14 +452,19 @@ async fn join(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let state = manager.join_queue(guild_id, payload.player).await;
     let available_players = partition_available_players(&state);
     Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn player_ready(
-    headers: HeaderMap,
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
@@ -445,20 +472,15 @@ async fn player_ready(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-
-    let cookie_user = user_from_cookies(&headers);
-    let (discord_id, username, avatar) = if let Some((id, name, av)) = cookie_user {
-        (payload.discord_id.unwrap_or(id), name, av)
-    } else if let Some(id) = payload.discord_id {
-        (id, "Jugador".to_string(), None)
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
-        )
-            .into_response();
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    let discord_id = payload.discord_id.unwrap_or_else(|| user.user_id.clone());
+    let username = user.username.clone();
+    let avatar = user.avatar.clone();
 
     let is_ready = payload.ready.unwrap_or(true);
 
@@ -499,7 +521,7 @@ async fn player_ready(
 }
 
 async fn leave(
-    headers: HeaderMap,
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
@@ -507,19 +529,12 @@ async fn leave(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-
-    let discord_id = if let Some(id) = payload.discord_id {
-        id
-    } else if let Some((id, _, _)) = user_from_cookies(&headers) {
-        id
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
-        )
-            .into_response();
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let discord_id = payload.discord_id.unwrap_or_else(|| user.user_id.clone());
 
     let state = manager.leave_queue(guild_id, &discord_id).await;
     let available_players = partition_available_players(&state);
@@ -528,7 +543,7 @@ async fn leave(
 }
 
 async fn unready(
-    headers: HeaderMap,
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<UserActionPayload>,
@@ -536,19 +551,12 @@ async fn unready(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
-
-    let discord_id = if let Some(id) = payload.discord_id {
-        id
-    } else if let Some((id, _, _)) = user_from_cookies(&headers) {
-        id
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
-        )
-            .into_response();
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let discord_id = payload.discord_id.unwrap_or_else(|| user.user_id.clone());
 
     let state = manager.set_ready(guild_id, &discord_id, false).await;
     let available_players = partition_available_players(&state);
@@ -557,39 +565,55 @@ async fn unready(
 }
 
 async fn reset(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let state = manager.reset_lobby(guild_id).await;
-    Json(json!({ "success": true, "state": state }))
+    Json(json!({ "success": true, "state": state })).into_response()
 }
 
 async fn reset_players(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
     state.available_players.clear();
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }
 
 async fn auto_assign_captains(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     state
         .available_players
-        .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+        .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
 
     for team in &mut state.teams {
         if team.captain.is_none() && !state.available_players.is_empty() {
@@ -607,11 +631,16 @@ async fn auto_assign_captains(
 }
 
 async fn auto_assign_players(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if state.teams.len() < 2 {
@@ -627,7 +656,7 @@ async fn auto_assign_players(
         if team.captain.is_none() && !state.available_players.is_empty() {
             state
                 .available_players
-                .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+                .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
             let mut cap = state.available_players.remove(0);
             cap.ensure_discord_user();
             team.captain = Some(cap);
@@ -637,7 +666,7 @@ async fn auto_assign_players(
     // Ordenar disponibles por ELO desc
     state
         .available_players
-        .sort_by(|a, b| b.faceit_elo.cmp(&a.faceit_elo));
+        .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
 
     while !state.available_players.is_empty() {
         let incomplete_indices: Vec<usize> = state
@@ -694,6 +723,7 @@ async fn auto_assign_players(
 }
 
 async fn assign_player(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignPlayerPayload>,
@@ -701,7 +731,11 @@ async fn assign_player(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let p_id = payload.player_id.or(payload.discord_id);
@@ -766,6 +800,7 @@ async fn assign_player(
 }
 
 async fn remove_player(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignPlayerPayload>,
@@ -773,7 +808,11 @@ async fn remove_player(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let p_id = payload.player_id.or(payload.discord_id);
@@ -819,6 +858,7 @@ async fn remove_player(
 }
 
 async fn clear_team(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<ClearTeamPayload>,
@@ -826,7 +866,11 @@ async fn clear_team(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
     if let Some(tid) = payload.team_id {
         if let Some(t) = state.teams.iter_mut().find(|t| t.id == tid) {
@@ -860,6 +904,7 @@ async fn clear_team(
 }
 
 async fn assign_captain(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<AssignCaptainPayload>,
@@ -867,7 +912,11 @@ async fn assign_captain(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(ref tid) = payload.team_id {
@@ -923,6 +972,7 @@ async fn assign_captain(
 }
 
 async fn pick_player(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<PickPayload>,
@@ -930,7 +980,11 @@ async fn pick_player(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let p_id = payload.player_id.or(payload.discord_id);
     let mut state = manager.get_state(guild_id).await;
 
@@ -979,12 +1033,17 @@ async fn pick_player(
 }
 
 async fn captain_proposal(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
@@ -1009,12 +1068,17 @@ async fn captain_proposal(
 }
 
 async fn captain_ready(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
@@ -1036,11 +1100,16 @@ async fn captain_ready(
 }
 
 async fn force_roulette(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if !state.teams.is_empty() {
@@ -1059,6 +1128,7 @@ async fn force_roulette(
 }
 
 async fn tournament_config(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<TournamentConfigPayload>,
@@ -1066,7 +1136,11 @@ async fn tournament_config(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(mode) = payload.lobby_mode {
@@ -1088,12 +1162,17 @@ async fn tournament_config(
 }
 
 async fn tournament_report_winner(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(_): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let state = manager.get_state(guild_id).await;
     let available_players = partition_available_players(&state);
     Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
@@ -1101,6 +1180,7 @@ async fn tournament_report_winner(
 }
 
 async fn games_config(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<GamesConfigPayload>,
@@ -1108,7 +1188,11 @@ async fn games_config(
     let g_opt = payload
         .guild_id
         .or_else(|| extract_guild_id(raw.as_deref()));
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(games) = payload.games_per_match.or(payload.rounds_per_game) {
@@ -1123,23 +1207,33 @@ async fn games_config(
 }
 
 async fn toggle_command(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let state = manager.get_state(guild_id).await;
     let available_players = partition_available_players(&state);
     Json(json!({ "success": true, "commandEnabled": true, "state": state, "availablePlayers": available_players })).into_response()
 }
 
 async fn mixton_setup(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let num_teams = payload
@@ -1185,12 +1279,17 @@ async fn mixton_setup(
 }
 
 async fn mixton_start(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
@@ -1210,12 +1309,17 @@ async fn mixton_start(
 }
 
 async fn mixton_pick_order(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
@@ -1232,12 +1336,17 @@ async fn mixton_pick_order(
 }
 
 async fn mixton_create_match(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let match_id = format!("match_{}", chrono::Utc::now().timestamp_millis());
@@ -1285,24 +1394,50 @@ async fn mixton_create_match(
     .into_response()
 }
 
-async fn generic_lobby_action(
+async fn generic_lobby_admin_action(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(_): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state }))
+    Json(json!({ "success": true, "state": state })).into_response()
+}
+
+async fn generic_lobby_user_action(
+    user: RequireUser,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(_): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let state = manager.get_state(guild_id).await;
+    Json(json!({ "success": true, "state": state })).into_response()
 }
 
 async fn start_veto(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let team_a_id = payload
@@ -1327,7 +1462,7 @@ async fn start_veto(
         .cloned()
         .collect();
     let pool_len = active_maps.len();
-    let ban_count = if pool_len > 1 { pool_len - 1 } else { 0 };
+    let ban_count = pool_len.saturating_sub(1);
     let mut ban_sequence = Vec::with_capacity(ban_count);
     for i in 0..ban_count {
         if i % 2 == 0 {
@@ -1374,12 +1509,17 @@ async fn start_veto(
 }
 
 async fn map_ban(
+    user: RequireUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
     let map_id = payload.get("mapId").and_then(|v| v.as_str()).unwrap_or("");
@@ -1433,11 +1573,16 @@ async fn map_ban(
 }
 
 async fn cancel_veto(
+    admin: RequireAdmin,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
     state.map_veto = None;
     let updated = manager.update_state(guild_id, state).await;
@@ -1451,19 +1596,32 @@ async fn cancel_veto(
 }
 
 async fn chat_history(
+    OptionalLobbyUser(user_opt): OptionalLobbyUser,
     RawQuery(raw): RawQuery,
     State(manager): State<Arc<LobbyManager>>,
 ) -> impl IntoResponse {
     let g_opt = extract_guild_id(raw.as_deref());
-    let guild_id = manager.resolve_guild_id(g_opt.as_deref());
+    let effective_guild = if let Some(ref u) = user_opt {
+        match resolve_guild_for_user(u, g_opt.as_deref(), false) {
+            Ok(g) => g,
+            Err(msg) => {
+                return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
+            }
+        }
+    } else {
+        g_opt
+    };
+    let guild_id = manager.resolve_guild_id(effective_guild.as_deref());
     let history = manager.get_chat_history(guild_id).await;
     Json(json!({
         "success": true,
         "messages": history
     }))
+    .into_response()
 }
 
 async fn chat_message(
+    user: RequireUser,
     State(manager): State<Arc<LobbyManager>>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
@@ -1474,12 +1632,7 @@ async fn chat_message(
     let query_str = parts.uri.query();
     let query_guild = extract_guild_id(query_str);
 
-    let cookie_user = user_from_cookies(headers);
-    let is_admin = headers
-        .get(header::COOKIE)
-        .and_then(|c| c.to_str().ok())
-        .map(|c| c.contains("admin_token="))
-        .unwrap_or(false);
+    let is_admin = user.is_admin_like();
 
     let is_multipart = headers
         .get(header::CONTENT_TYPE)
@@ -1490,9 +1643,6 @@ async fn chat_message(
     let mut message_text = String::new();
     let mut image_url: Option<String> = None;
     let mut body_guild_id: Option<String> = None;
-    let mut author_id: Option<String> = None;
-    let mut author_name: Option<String> = None;
-    let mut author_avatar: Option<String> = None;
 
     if is_multipart {
         let req_again = axum::extract::Request::from_parts(parts, body);
@@ -1545,27 +1695,13 @@ async fn chat_message(
                 .trim()
                 .to_string();
             body_guild_id = payload.guild_id;
-            author_id = payload.author_id.or(payload.discord_id);
-            author_name = payload.author_name.or(payload.author);
-            author_avatar = payload.author_avatar.or(payload.avatar);
             image_url = payload.image_url;
         }
     }
 
-    let (did, name, avatar) = if let Some((id, u_name, av)) = cookie_user {
-        let av_url = format_discord_avatar(&id, av.as_deref());
-        (id, u_name, av_url)
-    } else if let Some(id) = author_id.filter(|s| !s.is_empty()) {
-        let n = author_name.unwrap_or_else(|| "Jugador".to_string());
-        let av = author_avatar.unwrap_or_else(|| format_discord_avatar(&id, None));
-        (id, n, av)
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord para enviar mensajes." })),
-        )
-            .into_response();
-    };
+    let did = user.user_id.clone();
+    let name = user.username.clone();
+    let avatar = format_discord_avatar(&did, user.avatar.as_deref());
 
     if message_text.is_empty() && image_url.is_none() {
         return (
@@ -1576,13 +1712,17 @@ async fn chat_message(
     }
 
     let effective_gid = body_guild_id.or(query_guild);
-    let guild_id = manager.resolve_guild_id(effective_gid.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, effective_gid.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let now = chrono::Utc::now().timestamp_millis();
     let msg = ChatMessage {
         id: format!("msg_{now}"),
-        discord_id: did.clone(),
-        author: name.clone(),
-        avatar: Some(avatar.clone()),
+        discord_id: did,
+        author: name,
+        avatar: Some(avatar),
         is_admin,
         source: "web".to_string(),
         content: message_text,
@@ -1601,17 +1741,9 @@ pub struct LinkSteamPayload {
 }
 
 async fn link_steam(
-    headers: HeaderMap,
+    _user: RequireUser,
     Json(payload): Json<LinkSteamPayload>,
 ) -> impl IntoResponse {
-    let user_opt = user_from_cookies(&headers);
-    if user_opt.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Debes iniciar sesión con tu cuenta de Discord." })),
-        )
-            .into_response();
-    }
     let input = payload
         .steam_input
         .unwrap_or_else(|| "detect_faceit".to_string());
