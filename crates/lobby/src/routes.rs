@@ -173,6 +173,8 @@ pub struct PickPayload {
     pub player_id: Option<String>,
     #[serde(rename = "discordId", default)]
     pub discord_id: Option<String>,
+    #[serde(rename = "playerDiscordId", default)]
+    pub player_discord_id: Option<String>,
 }
 
 pub fn router(state: LobbyApiState) -> Router {
@@ -580,6 +582,8 @@ async fn auto_assign_captains(
     }
 }
 
+/// Autocompleta equipos de forma balanceada (Admin).
+/// Port exacto de lobby.js:3207-3300.
 async fn auto_assign_players(
     admin: RequireAdmin,
     RawQuery(raw): RawQuery,
@@ -593,83 +597,22 @@ async fn auto_assign_players(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if state.teams.len() < 2 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "error": "Se requieren al menos 2 equipos configurados." })),
-        )
-            .into_response();
-    }
-
-    // Auto-asignar capitanes si faltan
-    for team in &mut state.teams {
-        if team.captain.is_none() && !state.available_players.is_empty() {
-            state
-                .available_players
-                .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
-            let mut cap = state.available_players.remove(0);
-            cap.ensure_discord_user();
-            team.captain = Some(cap);
+    match crate::draft::auto_balance(&mut state) {
+        Ok(_count) => {
+            manager.cancel_roulette(guild_id);
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
         }
     }
-
-    // Ordenar disponibles por ELO desc
-    state
-        .available_players
-        .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
-
-    while !state.available_players.is_empty() {
-        let incomplete_indices: Vec<usize> = state
-            .teams
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.players.len() < 4)
-            .map(|(i, _)| i)
-            .collect();
-
-        if incomplete_indices.is_empty() {
-            break;
-        }
-
-        let mut best_team_idx = incomplete_indices[0];
-        let mut min_elo = u64::MAX;
-
-        for &idx in &incomplete_indices {
-            let t = &state.teams[idx];
-            let cap_elo = t
-                .captain
-                .as_ref()
-                .map(|c| c.faceit_elo as u64)
-                .unwrap_or(1000);
-            let players_elo: u64 = t.players.iter().map(|p| p.faceit_elo as u64).sum();
-            let total = cap_elo + players_elo;
-            if total < min_elo {
-                min_elo = total;
-                best_team_idx = idx;
-            }
-        }
-
-        let mut player = state.available_players.remove(0);
-        player.ensure_discord_user();
-        state.teams[best_team_idx].players.push(player);
-    }
-
-    let all_done = state
-        .teams
-        .iter()
-        .all(|t| t.captain.is_some() && t.players.len() == 4);
-    if all_done {
-        state.draft_finished = true;
-        state.draft_started = false;
-        state.current_pick_index = 0;
-        state.auto_start_veto_if_ready();
-    }
-
-    state.sanitize();
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
 }
 
 async fn assign_player(
@@ -778,9 +721,10 @@ async fn remove_player(
                     }
                     if let Some(ref c) = t.captain {
                         if c.discord_id == did {
-                            let mut cap = t.captain.take().unwrap();
-                            cap.ensure_discord_user();
-                            state.available_players.push(cap);
+                            if let Some(mut cap) = t.captain.take() {
+                                cap.ensure_discord_user();
+                                state.available_players.push(cap);
+                            }
                         }
                     }
                 }
@@ -940,6 +884,8 @@ async fn assign_captain(
     }
 }
 
+/// Realiza una selección de jugador en el draft (Capitán de turno o Admin).
+/// Port exacto de lobby.js:3116-3205.
 async fn pick_player(
     user: RequireUser,
     RawQuery(raw): RawQuery,
@@ -954,51 +900,32 @@ async fn pick_player(
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let p_id = payload.player_id.or(payload.discord_id);
+
+    let target_discord_id = payload
+        .player_discord_id
+        .or(payload.player_id)
+        .or(payload.discord_id)
+        .unwrap_or_default();
+
     let mut state = manager.get_state(guild_id).await;
+    let actor_id = &user.user_id;
+    let is_admin = user.is_admin_like();
 
-    if let Some(pid) = p_id {
-        if let Some(pos) = state
-            .available_players
-            .iter()
-            .position(|p| p.discord_id == pid)
-        {
-            let mut player = state.available_players.remove(pos);
-            player.ensure_discord_user();
-
-            let target_team_id = payload.team_id.unwrap_or_else(|| {
-                if !state.pick_order.is_empty() {
-                    state.pick_order[state.current_pick_index % state.pick_order.len()].clone()
-                } else if !state.teams.is_empty() {
-                    state.teams[0].id.clone()
-                } else {
-                    "team_1".to_string()
-                }
-            });
-
-            if let Some(t) = state.teams.iter_mut().find(|t| t.id == target_team_id) {
-                t.players.push(player);
-            }
-            state.current_pick_index += 1;
+    match crate::draft::pick_player(&mut state, actor_id, is_admin, &target_discord_id) {
+        Ok(()) => {
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
         }
-
-        let all_done = state.teams.len() >= 2
-            && state
-                .teams
-                .iter()
-                .all(|t| t.captain.is_some() && t.players.len() == 4);
-        if all_done {
-            state.draft_finished = true;
-            state.draft_started = false;
-            state.auto_start_veto_if_ready();
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
         }
     }
-
-    state.sanitize();
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
 }
 
 async fn captain_proposal(
@@ -1330,6 +1257,8 @@ async fn mixton_setup(
         .into_response()
 }
 
+/// Inicia manualmente el draft de jugadores (Admin).
+/// Port exacto de lobby.js:3059-3115.
 async fn mixton_start(
     admin: RequireAdmin,
     RawQuery(raw): RawQuery,
@@ -1344,22 +1273,40 @@ async fn mixton_start(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
-        state.pick_order = orders
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-    }
-    state.draft_started = true;
-    state.draft_finished = false;
-    state.current_pick_index = 0;
+    let pick_order = payload
+        .get("pickOrder")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+        });
 
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
+    let bet_amount = payload.get("betAmount").and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    });
+
+    match crate::draft::start_draft(&mut state, pick_order, bet_amount) {
+        Ok(()) => {
+            manager.cancel_roulette(guild_id);
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
+    }
 }
 
+/// Guarda el orden de elección de capitanes (Admin).
+/// Port exacto de lobby.js:2730-2757.
 async fn mixton_pick_order(
     admin: RequireAdmin,
     RawQuery(raw): RawQuery,
@@ -1374,17 +1321,37 @@ async fn mixton_pick_order(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if let Some(orders) = payload.get("pickOrder").and_then(|v| v.as_array()) {
-        state.pick_order = orders
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-    }
+    let orders_arr = match payload.get("pickOrder").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "El orden debe ser un array." })),
+            )
+                .into_response();
+        }
+    };
 
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
+    let pick_order: Vec<String> = orders_arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    match crate::draft::set_pick_order(&mut state, &pick_order) {
+        Ok(()) => {
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
+    }
 }
 
 async fn mixton_create_match(

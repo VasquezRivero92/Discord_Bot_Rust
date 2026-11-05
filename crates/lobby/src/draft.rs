@@ -537,6 +537,343 @@ pub fn set_captain_ready(
     }
 }
 
+/// Guarda el orden de elección de capitanes y recalcula la secuencia si el draft no ha iniciado.
+/// Port exacto de lobby.js:2730-2757.
+///
+/// Valida que cada equipo en `pick_order` exista y tenga un capitán asignado.
+/// Si el draft aún no ha comenzado, recalcula `pick_sequence` usando snake draft.
+pub fn set_pick_order(state: &mut LobbyState, pick_order: &[String]) -> Result<(), (u16, String)> {
+    for team_id in pick_order {
+        let team = state.teams.iter().find(|t| t.id == *team_id);
+        match team {
+            Some(t) if t.captain.is_some() => {}
+            _ => {
+                return Err((
+                    400,
+                    format!("El equipo {team_id} no tiene un capitán asignado."),
+                ));
+            }
+        }
+    }
+
+    state.pick_order = pick_order.to_vec();
+    if !state.draft_started {
+        state.pick_sequence = generate_draft_pick_sequence(&state.pick_order, 4);
+    }
+    Ok(())
+}
+
+/// Inicia manualmente el draft de jugadores.
+/// Port exacto de lobby.js:3059-3115.
+///
+/// Valida que existan al menos 2 equipos y que todos tengan capitán asignado.
+/// Aplica el pick_order proporcionado si coincide con los equipos existentes,
+/// inicializa la secuencia snake draft, limpia jugadores previos y resetea variables de ruleta.
+pub fn start_draft(
+    state: &mut LobbyState,
+    pick_order: Option<Vec<String>>,
+    bet_amount: Option<f64>,
+) -> Result<(), (u16, String)> {
+    if state.teams.len() < 2 {
+        return Err((
+            400,
+            "Se requieren al menos 2 equipos para iniciar.".to_string(),
+        ));
+    }
+
+    let missing_captains = state.teams.iter().any(|t| t.captain.is_none());
+    if missing_captains {
+        return Err((
+            400,
+            "Todos los equipos creados deben tener un capitán asignado.".to_string(),
+        ));
+    }
+
+    if let Some(orders) = pick_order {
+        if orders.len() == state.teams.len()
+            && orders
+                .iter()
+                .all(|id| state.teams.iter().any(|t| t.id == *id))
+        {
+            state.pick_order = orders;
+        }
+    }
+
+    if state.pick_order.len() != state.teams.len() {
+        state.pick_order = state.teams.iter().map(|t| t.id.clone()).collect();
+    }
+
+    state.pick_sequence = generate_draft_pick_sequence(&state.pick_order, 4);
+    state.draft_started = true;
+    state.draft_finished = false;
+    state.current_pick_index = 0;
+    state.roulette_spinning = false;
+    state.roulette_started_at = None;
+    state.roulette_slice_offset = None;
+    state.auto_countdown_ends_at = None;
+
+    if let Some(bet) = bet_amount {
+        state.effective_bet_amount = if bet < 0.0 || bet.is_nan() { 0.0 } else { bet };
+    } else if let Some(agreed) = state.agreed_bet_amount {
+        state.effective_bet_amount = agreed;
+    }
+
+    for t in &mut state.teams {
+        t.players.clear();
+    }
+
+    Ok(())
+}
+
+/// Realiza una selección de jugador en el draft (Capitán de turno o Admin).
+/// Port exacto de lobby.js:3116-3205.
+///
+/// Reglas y validaciones:
+/// 1. Draft activo (draft_started && !draft_finished). Si no: 400 "La selección de jugadores no está activa."
+/// 2. Determinación de equipo por pick_sequence[current_pick_index] o pick_order cíclico.
+/// 3. Equipo y capitán definidos. Si no: 500 "Equipo o capitán actual no definido."
+/// 4. Turno: solo el capitán de dicho equipo o un administrador. Si no: 403 "No es tu turno. Es turno del capitán de {team.name}."
+/// 5. Jugador no ocupado en ningún equipo. Si no: 400 "Este jugador ya ha sido elegido."
+/// 6. Jugador disponible en available_players y con ready==true. Si no: 400 "El jugador seleccionado no está disponible (/mixton_listo)."
+/// 7. Equipo no lleno (máximo 4 jugadores elegidos + 1 capitán). Si no: 400 "{team.name} ya está completo (4 jugadores elegidos + 1 capitán)."
+///
+/// Al elegir:
+/// - Quita al jugador de available_players.
+/// - Añade al jugador a current_team.players (con ensure_discord_user()).
+/// - Incrementa current_pick_index.
+/// - Si todos los equipos tienen 4 jugadores o se agotó la secuencia, marca draft_finished = true,
+///   draft_started = false y llama a auto_start_veto_if_ready().
+pub fn pick_player(
+    state: &mut LobbyState,
+    actor_id: &str,
+    is_admin: bool,
+    player_discord_id: &str,
+) -> Result<(), (u16, String)> {
+    if !state.draft_started || state.draft_finished {
+        return Err((400, "La selección de jugadores no está activa.".to_string()));
+    }
+
+    if state.pick_sequence.is_empty() {
+        state.pick_sequence = generate_draft_pick_sequence(&state.pick_order, 4);
+    }
+
+    let current_team_id = state
+        .pick_sequence
+        .get(state.current_pick_index)
+        .cloned()
+        .or_else(|| {
+            if !state.pick_order.is_empty() {
+                Some(state.pick_order[state.current_pick_index % state.pick_order.len()].clone())
+            } else {
+                None
+            }
+        });
+
+    let current_team_idx = match current_team_id {
+        Some(ref id) => state.teams.iter().position(|t| t.id == *id),
+        None => None,
+    };
+
+    let team_idx = match current_team_idx {
+        Some(idx) if state.teams[idx].captain.is_some() => idx,
+        _ => return Err((500, "Equipo o capitán actual no definido.".to_string())),
+    };
+
+    let is_captain = state.teams[team_idx]
+        .captain
+        .as_ref()
+        .map_or(false, |c| c.discord_id == actor_id);
+
+    if !is_captain && !is_admin {
+        return Err((
+            403,
+            format!(
+                "No es tu turno. Es turno del capitán de {}.",
+                state.teams[team_idx].name
+            ),
+        ));
+    }
+
+    // Validar si el jugador ya está en algún equipo
+    let already_occupied = state.teams.iter().any(|t| {
+        t.captain
+            .as_ref()
+            .map_or(false, |c| c.discord_id == player_discord_id)
+            || t.players.iter().any(|p| p.discord_id == player_discord_id)
+    });
+
+    if already_occupied {
+        return Err((400, "Este jugador ya ha sido elegido.".to_string()));
+    }
+
+    let avail_pos = state
+        .available_players
+        .iter()
+        .position(|p| p.discord_id == player_discord_id);
+
+    let player_pos = match avail_pos {
+        Some(pos) if state.available_players[pos].ready => pos,
+        _ => {
+            return Err((
+                400,
+                "El jugador seleccionado no está disponible (/mixton_listo).".to_string(),
+            ));
+        }
+    };
+
+    if state.teams[team_idx].players.len() >= 4 {
+        return Err((
+            400,
+            format!(
+                "{} ya está completo (4 jugadores elegidos + 1 capitán).",
+                state.teams[team_idx].name
+            ),
+        ));
+    }
+
+    let mut player = state.available_players.remove(player_pos);
+    player.ensure_discord_user();
+    state.teams[team_idx].players.push(player);
+
+    state.current_pick_index += 1;
+
+    let all_done = state.teams.iter().all(|t| t.players.len() >= 4);
+    if all_done || state.current_pick_index >= state.pick_sequence.len() {
+        state.draft_finished = true;
+        state.draft_started = false;
+        state.auto_start_veto_if_ready();
+    }
+
+    Ok(())
+}
+
+/// Asigna automáticamente y balancea los jugadores restantes en los equipos.
+/// Port exacto de lobby.js:3207-3300.
+///
+/// Valida que existan al menos 2 equipos con capitanes asignados y que haya
+/// suficientes jugadores en la cola de disponibles para completar todos los equipos a 4 jugadores.
+/// Ordena los jugadores por Tier (S > A > B > C) -> ELO desc -> Nivel desc.
+/// Reparte de forma balanceada: en cada iteración el equipo incompleto con menor ELO acumulado
+/// recibe al mejor jugador restante.
+pub fn auto_balance(state: &mut LobbyState) -> Result<usize, (u16, String)> {
+    if state.teams.len() < 2 {
+        return Err((
+            400,
+            "Se requieren al menos 2 equipos configurados.".to_string(),
+        ));
+    }
+
+    let missing_captains = state.teams.iter().any(|t| t.captain.is_none());
+    if missing_captains {
+        return Err((
+            400,
+            "Debes asignar manualmente los capitanes a todos los equipos antes de autocompletar."
+                .to_string(),
+        ));
+    }
+
+    // Filtrar los que ya están como capitanes o ya en algún equipo
+    let mut occupied = std::collections::HashSet::new();
+    for t in &state.teams {
+        if let Some(ref c) = t.captain {
+            occupied.insert(c.discord_id.clone());
+        }
+        for p in &t.players {
+            occupied.insert(p.discord_id.clone());
+        }
+    }
+
+    let mut pool: Vec<Player> = state
+        .available_players
+        .iter()
+        .filter(|p| !occupied.contains(&p.discord_id) && p.ready)
+        .cloned()
+        .collect();
+
+    let total_needed: usize = state
+        .teams
+        .iter()
+        .map(|t| 4usize.saturating_sub(t.players.len()))
+        .sum();
+
+    if pool.len() < total_needed {
+        return Err((
+            400,
+            format!(
+                "No hay suficientes jugadores disponibles en la cola. Se necesitan {} jugadores más, pero solo hay {} disponibles.",
+                total_needed,
+                pool.len()
+            ),
+        ));
+    }
+
+    // Ordenar pool de mayor a menor nivel/habilidad (Tier -> ELO -> Nivel)
+    pool.sort_by(|a, b| {
+        let tier_a = tier_weight(player_tier(a));
+        let tier_b = tier_weight(player_tier(b));
+        tier_b
+            .cmp(&tier_a)
+            .then_with(|| b.faceit_elo.cmp(&a.faceit_elo))
+            .then_with(|| {
+                b.faceit_level
+                    .unwrap_or(1)
+                    .cmp(&a.faceit_level.unwrap_or(1))
+            })
+    });
+
+    let mut assigned_count = 0;
+    for p in pool.into_iter().take(total_needed) {
+        let mut incomplete_indices: Vec<usize> = state
+            .teams
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.players.len() < 4)
+            .map(|(i, _)| i)
+            .collect();
+
+        if incomplete_indices.is_empty() {
+            break;
+        }
+
+        incomplete_indices.sort_by_key(|&idx| {
+            let t = &state.teams[idx];
+            let cap_elo = t
+                .captain
+                .as_ref()
+                .map(|c| c.faceit_elo as u64)
+                .unwrap_or(1000);
+            let players_elo: u64 = t.players.iter().map(|pl| pl.faceit_elo as u64).sum();
+            cap_elo + players_elo
+        });
+
+        let target_idx = incomplete_indices[0];
+        let mut player_obj = p;
+        player_obj.ensure_discord_user();
+        state.teams[target_idx].players.push(player_obj);
+        assigned_count += 1;
+    }
+
+    let mut all_team_player_ids = std::collections::HashSet::new();
+    for t in &state.teams {
+        if let Some(ref c) = t.captain {
+            all_team_player_ids.insert(c.discord_id.clone());
+        }
+        for pl in &t.players {
+            all_team_player_ids.insert(pl.discord_id.clone());
+        }
+    }
+    state
+        .available_players
+        .retain(|p| !all_team_player_ids.contains(&p.discord_id));
+
+    state.draft_finished = true;
+    state.draft_started = false;
+    state.current_pick_index = 0;
+    state.auto_start_veto_if_ready();
+
+    Ok(assigned_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,5 +1442,337 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         // Debe ser aproximadamente ahora + 7000ms
         assert!(ends_at >= now_ms + 6000 && ends_at <= now_ms + 8000);
+    }
+
+    #[test]
+    fn test_set_pick_order_and_validations() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        let err =
+            set_pick_order(&mut state, &["team_2".to_string(), "team_1".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            (
+                400,
+                "El equipo team_2 no tiene un capitán asignado.".to_string()
+            )
+        );
+
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        let ok = set_pick_order(&mut state, &["team_2".to_string(), "team_1".to_string()]);
+        assert!(ok.is_ok());
+        assert_eq!(
+            state.pick_order,
+            vec!["team_2".to_string(), "team_1".to_string()]
+        );
+        assert_eq!(state.pick_sequence[0], "team_2");
+        assert_eq!(state.pick_sequence[1], "team_1");
+        assert_eq!(state.pick_sequence[2], "team_1");
+        assert_eq!(state.pick_sequence[3], "team_2");
+    }
+
+    #[test]
+    fn test_start_draft_validations_and_success() {
+        let mut state = sample_state();
+        state.teams.clear();
+        assert_eq!(
+            start_draft(&mut state, None, None).unwrap_err(),
+            (
+                400,
+                "Se requieren al menos 2 equipos para iniciar.".to_string()
+            )
+        );
+
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        assert_eq!(
+            start_draft(&mut state, None, None).unwrap_err(),
+            (
+                400,
+                "Todos los equipos creados deben tener un capitán asignado.".to_string()
+            )
+        );
+
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        state.teams[0]
+            .players
+            .push(make_player("prev_p", 1000, Some(1), None));
+        state.agreed_bet_amount = Some(20.0);
+
+        let ok = start_draft(
+            &mut state,
+            Some(vec!["team_2".into(), "team_1".into()]),
+            Some(50.0),
+        );
+        assert!(ok.is_ok());
+        assert!(state.draft_started);
+        assert!(!state.draft_finished);
+        assert_eq!(state.current_pick_index, 0);
+        assert_eq!(state.effective_bet_amount, 50.0);
+        assert!(state.teams[0].players.is_empty());
+        assert_eq!(
+            state.pick_order,
+            vec!["team_2".to_string(), "team_1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pick_player_draft_no_activo() {
+        let mut state = sample_state();
+        state.draft_started = false;
+        let err = pick_player(&mut state, "c1", false, "p1").unwrap_err();
+        assert_eq!(
+            err,
+            (400, "La selección de jugadores no está activa.".to_string())
+        );
+
+        state.draft_started = true;
+        state.draft_finished = true;
+        let err2 = pick_player(&mut state, "c1", false, "p1").unwrap_err();
+        assert_eq!(
+            err2,
+            (400, "La selección de jugadores no está activa.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pick_player_fuera_de_turno() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        let err = pick_player(&mut state, "c2", false, "p1").unwrap_err();
+        assert_eq!(
+            err,
+            (
+                403,
+                "No es tu turno. Es turno del capitán de Equipo 1.".to_string()
+            )
+        );
+
+        let err_stranger = pick_player(&mut state, "random_user", false, "p1").unwrap_err();
+        assert_eq!(
+            err_stranger,
+            (
+                403,
+                "No es tu turno. Es turno del capitán de Equipo 1.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_pick_player_admin_puede_pickear_por_capitan() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        state
+            .available_players
+            .push(make_player("p1", 1200, Some(5), None));
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        let ok = pick_player(&mut state, "admin_user", true, "p1");
+        assert!(ok.is_ok());
+        assert_eq!(state.teams[0].players.len(), 1);
+        assert_eq!(state.teams[0].players[0].discord_id, "p1");
+        assert_eq!(state.current_pick_index, 1);
+    }
+
+    #[test]
+    fn test_pick_player_jugador_ya_elegido() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        state.teams[1]
+            .players
+            .push(make_player("already_p", 1100, Some(4), None));
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        let err = pick_player(&mut state, "c1", false, "c2").unwrap_err();
+        assert_eq!(err, (400, "Este jugador ya ha sido elegido.".to_string()));
+
+        state.teams[1]
+            .players
+            .push(make_player("p_team2", 1000, Some(3), None));
+        let err2 = pick_player(&mut state, "c1", false, "p_team2").unwrap_err();
+        assert_eq!(err2, (400, "Este jugador ya ha sido elegido.".to_string()));
+    }
+
+    #[test]
+    fn test_pick_player_jugador_no_disponible() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        let err = pick_player(&mut state, "c1", false, "p_missing").unwrap_err();
+        assert_eq!(
+            err,
+            (
+                400,
+                "El jugador seleccionado no está disponible (/mixton_listo).".to_string()
+            )
+        );
+
+        let mut p_unready = make_player("p_unready", 1200, Some(5), None);
+        p_unready.ready = false;
+        state.available_players.push(p_unready);
+        let err2 = pick_player(&mut state, "c1", false, "p_unready").unwrap_err();
+        assert_eq!(
+            err2,
+            (
+                400,
+                "El jugador seleccionado no está disponible (/mixton_listo).".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_pick_player_equipo_lleno() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        for i in 1..=4 {
+            state.teams[0]
+                .players
+                .push(make_player(&format!("p{i}"), 1000, Some(1), None));
+        }
+        state
+            .available_players
+            .push(make_player("p5", 1000, Some(1), None));
+
+        let err = pick_player(&mut state, "c1", false, "p5").unwrap_err();
+        assert_eq!(
+            err,
+            (
+                400,
+                "Equipo 1 ya está completo (4 jugadores elegidos + 1 capitán).".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_pick_player_secuencia_completa_y_auto_veto() {
+        let mut state = sample_state();
+        state.teams[0].captain = Some(make_player("c1", 2000, Some(10), None));
+        state.teams[1].captain = Some(make_player("c2", 2000, Some(10), None));
+
+        for i in 1..=8 {
+            state.available_players.push(make_player(
+                &format!("pick_{i}"),
+                1000 + i * 50,
+                Some(4),
+                None,
+            ));
+        }
+
+        start_draft(
+            &mut state,
+            Some(vec!["team_1".into(), "team_2".into()]),
+            None,
+        )
+        .unwrap();
+
+        let pick_turns = [
+            ("c1", "pick_1"),
+            ("c2", "pick_2"),
+            ("c2", "pick_3"),
+            ("c1", "pick_4"),
+            ("c1", "pick_5"),
+            ("c2", "pick_6"),
+            ("c2", "pick_7"),
+            ("c1", "pick_8"),
+        ];
+
+        for (idx, (actor, pid)) in pick_turns.iter().enumerate() {
+            assert_eq!(state.current_pick_index, idx);
+            let res = pick_player(&mut state, actor, false, pid);
+            assert!(res.is_ok(), "Fallo en pick {idx}: {res:?}");
+        }
+
+        assert_eq!(state.teams[0].players.len(), 4);
+        assert_eq!(state.teams[1].players.len(), 4);
+        assert_eq!(state.available_players.len(), 0);
+        assert!(state.draft_finished);
+        assert!(!state.draft_started);
+        assert!(state.map_veto.is_some());
+    }
+
+    #[test]
+    fn test_auto_balance_reparte_balanceado() {
+        let mut state = sample_state();
+        assert_eq!(
+            auto_balance(&mut state).unwrap_err(),
+            (400, "Debes asignar manualmente los capitanes a todos los equipos antes de autocompletar.".to_string())
+        );
+
+        state.teams[0].captain = Some(make_player("c1", 1500, Some(7), None));
+        state.teams[1].captain = Some(make_player("c2", 1000, Some(4), None));
+
+        state.available_players = vec![
+            make_player("p1", 1000, Some(1), None),
+            make_player("p2", 1000, Some(1), None),
+            make_player("p3", 1000, Some(1), None),
+        ];
+
+        let err = auto_balance(&mut state).unwrap_err();
+        assert_eq!(
+            err,
+            (400, "No hay suficientes jugadores disponibles en la cola. Se necesitan 8 jugadores más, pero solo hay 3 disponibles.".to_string())
+        );
+
+        state.available_players = vec![
+            make_player("p_s", 2200, Some(10), Some("S")),
+            make_player("p_a1", 1800, Some(9), Some("A")),
+            make_player("p_a2", 1700, Some(8), Some("A")),
+            make_player("p_b1", 1400, Some(6), None),
+            make_player("p_b2", 1300, Some(6), None),
+            make_player("p_c1", 1100, Some(4), None),
+            make_player("p_c2", 1000, Some(3), None),
+            make_player("p_c3", 900, Some(2), None),
+        ];
+
+        let count = auto_balance(&mut state).unwrap();
+        assert_eq!(count, 8);
+        assert_eq!(state.teams[0].players.len(), 4);
+        assert_eq!(state.teams[1].players.len(), 4);
+        assert!(state.available_players.is_empty());
+        assert!(state.draft_finished);
+        assert!(!state.draft_started);
+        assert_eq!(state.current_pick_index, 0);
+        assert!(state.map_veto.is_some());
+
+        let team_2_has_ps = state.teams[1].players.iter().any(|p| p.discord_id == "p_s");
+        assert!(
+            team_2_has_ps,
+            "Equipo 2 debía recibir al mejor jugador (p_s) para equilibrar"
+        );
     }
 }

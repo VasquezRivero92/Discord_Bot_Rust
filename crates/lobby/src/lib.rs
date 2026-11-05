@@ -13,8 +13,9 @@ pub use auth::{
     SessionVerifier,
 };
 pub use draft::{
-    assign_captain, auto_assign_captains, generate_draft_pick_sequence, is_captain_eligible,
-    player_tier, proposal_to_f64, set_captain_proposal, set_captain_ready,
+    assign_captain, auto_assign_captains, auto_balance, generate_draft_pick_sequence,
+    is_captain_eligible, pick_player, player_tier, proposal_to_f64, set_captain_proposal,
+    set_captain_ready, set_pick_order, start_draft,
 };
 pub use maps::{default_catalog, MapInfo};
 pub use roulette::{
