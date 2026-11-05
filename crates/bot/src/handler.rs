@@ -31,6 +31,7 @@ impl EventHandler for BotHandler {
             commands::sanciones::register_desancionar(),
             commands::panels::register_setup_recargas(),
             commands::panels::register_setup_soporte(),
+            commands::desvincular::register(),
         ];
 
         match Command::set_global_commands(&ctx.http, commands).await {
@@ -123,6 +124,16 @@ impl EventHandler for BotHandler {
                     }
                     "setup_recargas" => commands::panels::run_setup_recargas(&ctx, &command).await,
                     "setup_soporte" => commands::panels::run_setup_soporte(&ctx, &command).await,
+                    "desvincular_fc" | "desvincular" => {
+                        commands::desvincular::run(
+                            &ctx,
+                            &command,
+                            &self.config,
+                            &self.lobby,
+                            self.firestore.as_ref(),
+                        )
+                        .await
+                    }
                     unknown => {
                         warn!("Comando desconocido recibido: {}", unknown);
                         let msg = CreateInteractionResponseMessage::new()

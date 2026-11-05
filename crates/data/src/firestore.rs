@@ -180,7 +180,7 @@ fn query_params(collection: &str, q: &Query) -> FirestoreQueryParams {
 /// Cliente Firestore de solo lectura. Barato de clonar (comparte la conexión).
 #[derive(Clone)]
 pub struct FirestoreClient {
-    db: FirestoreDb,
+    pub(crate) db: FirestoreDb,
 }
 
 impl FirestoreClient {

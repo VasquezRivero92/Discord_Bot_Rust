@@ -17,6 +17,7 @@ mod source;
 mod support_calls;
 mod users;
 mod watch;
+mod write;
 
 pub use crate::admin_docs::{AdminDocsRepo, FirestoreAdminDocsRepo, StatsTotals};
 pub use crate::cache::TtlCache;
@@ -49,3 +50,4 @@ pub use crate::users::{
     FaceitUser, FakeUsersRepo, FirestoreUsersRepo, UsersRepo, USERS_ALL_TTL, USER_TTL,
 };
 pub use crate::watch::WatcherHandle;
+pub use crate::write::{json_to_firestore_value, DocSink, FakeDocSink};
