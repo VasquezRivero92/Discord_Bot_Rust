@@ -35,7 +35,10 @@ impl EventHandler for BotHandler {
 
         match Command::set_global_commands(&ctx.http, commands).await {
             Ok(registered) => {
-                info!("Comandos de barra globales registrados con éxito ({} comandos)", registered.len());
+                info!(
+                    "Comandos de barra globales registrados con éxito ({} comandos)",
+                    registered.len()
+                );
             }
             Err(err) => {
                 error!("Error al registrar comandos globales de Discord: {}", err);
@@ -59,9 +62,7 @@ impl EventHandler for BotHandler {
                         )
                         .await
                     }
-                    "stats" => {
-                        commands::stats::run(&ctx, &command, self.faceit.as_ref()).await
-                    }
+                    "stats" => commands::stats::run(&ctx, &command, self.faceit.as_ref()).await,
                     "leaderboard" => {
                         commands::leaderboard::run(
                             &ctx,
@@ -83,7 +84,10 @@ impl EventHandler for BotHandler {
                         {
                             Ok(resp) => {
                                 command
-                                    .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
+                                    .create_response(
+                                        &ctx.http,
+                                        CreateInteractionResponse::Message(resp),
+                                    )
                                     .await
                             }
                             Err(e) => Err(e),
@@ -95,12 +99,16 @@ impl EventHandler for BotHandler {
                             &command.user,
                             command.guild_id,
                             &self.lobby,
+                            self.firestore.as_ref(),
                         )
                         .await
                         {
                             Ok(resp) => {
                                 command
-                                    .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
+                                    .create_response(
+                                        &ctx.http,
+                                        CreateInteractionResponse::Message(resp),
+                                    )
                                     .await
                             }
                             Err(e) => Err(e),
@@ -133,7 +141,10 @@ impl EventHandler for BotHandler {
 
             Interaction::Component(component) => {
                 let custom_id = component.data.custom_id.as_str();
-                info!("Botón presionado por <@{}>: {}", component.user.id, custom_id);
+                info!(
+                    "Botón presionado por <@{}>: {}",
+                    component.user.id, custom_id
+                );
 
                 let result = match custom_id {
                     "mixton_listo_btn" => {
@@ -148,7 +159,10 @@ impl EventHandler for BotHandler {
                         {
                             Ok(resp) => {
                                 component
-                                    .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
+                                    .create_response(
+                                        &ctx.http,
+                                        CreateInteractionResponse::Message(resp),
+                                    )
                                     .await
                             }
                             Err(e) => Err(e),
@@ -160,12 +174,16 @@ impl EventHandler for BotHandler {
                             &component.user,
                             component.guild_id,
                             &self.lobby,
+                            self.firestore.as_ref(),
                         )
                         .await
                         {
                             Ok(resp) => {
                                 component
-                                    .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
+                                    .create_response(
+                                        &ctx.http,
+                                        CreateInteractionResponse::Message(resp),
+                                    )
                                     .await
                             }
                             Err(e) => Err(e),
@@ -173,7 +191,9 @@ impl EventHandler for BotHandler {
                     }
                     "llamar_admin_btn" => {
                         // Enviar alerta a canal de admin alerts si está configurado
-                        if let Some(chan_str) = &self.config.env_defaults.discord_admin_alerts_channel_id {
+                        if let Some(chan_str) =
+                            &self.config.env_defaults.discord_admin_alerts_channel_id
+                        {
                             if let Ok(chan_id) = chan_str.parse::<u64>() {
                                 let alert_chan = ChannelId::new(chan_id);
                                 let alert_embed = CreateEmbed::new()
@@ -229,7 +249,10 @@ impl EventHandler for BotHandler {
                 };
 
                 if let Err(err) = result {
-                    error!("Error procesando interacción de botón {}: {}", custom_id, err);
+                    error!(
+                        "Error procesando interacción de botón {}: {}",
+                        custom_id, err
+                    );
                 }
             }
 

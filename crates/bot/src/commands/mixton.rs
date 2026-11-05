@@ -1,5 +1,5 @@
 use data::FirestoreClient;
-use lobby::state::{LobbyManager, Player};
+use lobby::state::LobbyManager;
 use serenity::all::*;
 use std::sync::Arc;
 
@@ -20,49 +20,90 @@ pub async fn run_listo(
     lobby: &Arc<LobbyManager>,
     firestore: Option<&FirestoreClient>,
 ) -> Result<CreateInteractionResponseMessage, serenity::Error> {
-    let guild_str = guild_id
-        .map(|g| g.to_string())
-        .unwrap_or_else(|| "default".to_string());
+    let guild_id = match guild_id {
+        Some(gid) => gid,
+        None => {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("❌ Este comando solo puede usarse dentro de un servidor.")
+                .ephemeral(true));
+        }
+    };
+
+    let fs = match firestore {
+        Some(fs) => fs,
+        None => {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("❌ No se pudo verificar tu cuenta en este momento. Inténtalo más tarde.")
+                .ephemeral(true));
+        }
+    };
 
     let discord_id = user.id.to_string();
+    let guild_str = guild_id.to_string();
 
-    // Consultar vinculación en Firestore si está disponible
-    let mut faceit_nick = None;
-    let mut elo = 1000;
-    let mut steam_id = None;
-
-    if let Some(fs) = firestore {
-        // En Firestore, los usuarios están indexados en la colección users
-        // o podemos consultar por discord_id
-        if let Ok(Some(doc)) = fs.get_doc::<serde_json::Value>("users", &discord_id).await {
-            faceit_nick = doc.get("faceit_nickname").and_then(|v| v.as_str()).map(str::to_string);
-            if let Some(e) = doc.get("faceit_elo").and_then(|v| v.as_u64()) {
-                elo = e as u32;
-            }
-            steam_id = doc.get("steam_id_64").and_then(|v| v.as_str()).map(str::to_string);
+    // Leer doc global users/{discord_id} y doc por servidor {guild_id}_{discord_id} en faceit_users
+    let global_doc = match fs
+        .get_doc::<serde_json::Value>("faceit_users", &discord_id)
+        .await
+    {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(
+                "Error al leer doc global de faceit_users/{}: {}",
+                discord_id,
+                e
+            );
+            None
         }
+    };
+
+    let server_doc_id = format!("{guild_str}_{discord_id}");
+    let server_doc = match fs
+        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
+        .await
+    {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(
+                "Error al leer doc de servidor de faceit_users/{}: {}",
+                server_doc_id,
+                e
+            );
+            None
+        }
+    };
+
+    let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    if !super::mixton_logic::is_user_verified(&merged) {
+        return Ok(CreateInteractionResponseMessage::new()
+            .content("❌ No estás verificado. Debes vincular tu cuenta de Faceit usando el comando `/verificar_fc <nickname>` o desde la web antes de unirte al mixton.")
+            .ephemeral(true));
     }
 
     let display_name = user.name.clone();
     let avatar_url = user.avatar_url();
 
-    let mut player = Player {
-        discord_id: discord_id.clone(),
-        nickname: display_name.clone(),
-        faceit_nickname: faceit_nick.clone(),
-        steam_id_64: steam_id,
-        avatar: avatar_url.clone(),
-        faceit_elo: elo,
-        ready: true,
-        tier: "C".to_string(),
-        faceit_level: None,
-        mixton_tier_override: None,
-        discord_user: None,
-    };
-    player.ensure_discord_user();
+    let player =
+        super::mixton_logic::build_player_from_doc(&discord_id, &display_name, avatar_url, &merged);
 
     let resolved_guild = lobby.resolve_guild_id(Some(&guild_str));
-    lobby.join_queue(resolved_guild, player).await;
+    let mut state = lobby.join_queue(resolved_guild, player.clone()).await;
+
+    // Si hay >= 10 jugadores listos, faltan capitanes y el draft no está iniciado/terminado:
+    if super::mixton_logic::should_auto_assign_captains(&state) {
+        let ready = state.available_players.clone();
+        match lobby::draft::auto_assign_captains(&mut state, ready) {
+            Ok(_) => {
+                lobby.cancel_roulette(resolved_guild);
+                state.sanitize();
+                let _ = lobby.update_state(resolved_guild, state).await;
+            }
+            Err(e) => {
+                tracing::warn!("Error al auto-asignar capitanes en /mixton_listo: {}", e);
+            }
+        }
+    }
+
     lobby.broadcast_state(resolved_guild).await;
 
     let embed = CreateEmbed::new()
@@ -75,11 +116,28 @@ pub async fn run_listo(
         ))
         .color(0x15C253)
         .field("Jugador", format!("**{}**", display_name), true)
-        .field("Faceit Nick", faceit_nick.unwrap_or_else(|| "No vinculado".to_string()), true)
-        .field("ELO", format!("{}", elo), true)
+        .field(
+            "Faceit Nick",
+            player
+                .faceit_nickname
+                .unwrap_or_else(|| "No vinculado".to_string()),
+            true,
+        )
+        .field(
+            "ELO / Nivel",
+            format!(
+                "{} (Nivel {})",
+                player.faceit_elo,
+                player.faceit_level.unwrap_or(1)
+            ),
+            true,
+        )
+        .field("Tier", player.tier, true)
         .footer(CreateEmbedFooter::new("Machupeek CS2 • Sistema Mixton"));
 
-    Ok(CreateInteractionResponseMessage::new().embed(embed).ephemeral(true))
+    Ok(CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .ephemeral(true))
 }
 
 pub async fn run_no_listo(
@@ -87,15 +145,91 @@ pub async fn run_no_listo(
     user: &User,
     guild_id: Option<GuildId>,
     lobby: &Arc<LobbyManager>,
+    firestore: Option<&FirestoreClient>,
 ) -> Result<CreateInteractionResponseMessage, serenity::Error> {
-    let guild_str = guild_id
-        .map(|g| g.to_string())
-        .unwrap_or_else(|| "default".to_string());
+    let guild_id = match guild_id {
+        Some(gid) => gid,
+        None => {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("❌ Este comando solo puede usarse dentro de un servidor.")
+                .ephemeral(true));
+        }
+    };
 
     let discord_id = user.id.to_string();
-    let resolved_guild = lobby.resolve_guild_id(Some(&guild_str));
+    let guild_str = guild_id.to_string();
 
-    lobby.leave_queue(resolved_guild, &discord_id).await;
+    // Si Firestore está configurado, verificar vinculación
+    if let Some(fs) = firestore {
+        let global_doc = match fs
+            .get_doc::<serde_json::Value>("faceit_users", &discord_id)
+            .await
+        {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!(
+                    "Error al leer doc global de faceit_users/{}: {}",
+                    discord_id,
+                    e
+                );
+                None
+            }
+        };
+
+        let server_doc_id = format!("{guild_str}_{discord_id}");
+        let server_doc = match fs
+            .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
+            .await
+        {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!(
+                    "Error al leer doc de servidor de faceit_users/{}: {}",
+                    server_doc_id,
+                    e
+                );
+                None
+            }
+        };
+
+        let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+        if !super::mixton_logic::is_user_verified(&merged) {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("❌ No estás verificado. Este comando es solo para miembros registrados.")
+                .ephemeral(true));
+        }
+    }
+
+    let resolved_guild = lobby.resolve_guild_id(Some(&guild_str));
+    let mut state = lobby.get_state(resolved_guild).await;
+
+    let modified = super::mixton_logic::clean_lobby_on_player_leave(&mut state, &discord_id);
+    if modified {
+        lobby.cancel_roulette(resolved_guild);
+    }
+
+    state
+        .available_players
+        .retain(|p| p.discord_id != discord_id);
+    state.updated_at = chrono::Utc::now().timestamp_millis();
+
+    if modified && super::mixton_logic::should_auto_assign_captains(&state) {
+        let ready = state.available_players.clone();
+        match lobby::draft::auto_assign_captains(&mut state, ready) {
+            Ok(_) => {
+                lobby.cancel_roulette(resolved_guild);
+                state.sanitize();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Error al auto-asignar capitanes tras /mixton_no_listo: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    lobby.update_state(resolved_guild, state).await;
     lobby.broadcast_state(resolved_guild).await;
 
     let embed = CreateEmbed::new()
@@ -109,5 +243,7 @@ pub async fn run_no_listo(
         .color(0xFF3E3E)
         .footer(CreateEmbedFooter::new("Machupeek CS2 • Sistema Mixton"));
 
-    Ok(CreateInteractionResponseMessage::new().embed(embed).ephemeral(true))
+    Ok(CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .ephemeral(true))
 }
