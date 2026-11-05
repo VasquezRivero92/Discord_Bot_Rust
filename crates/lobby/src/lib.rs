@@ -6,6 +6,7 @@ pub mod maps;
 pub mod roulette;
 pub mod routes;
 pub mod state;
+pub mod veto;
 pub mod ws;
 
 pub use auth::{
@@ -24,4 +25,8 @@ pub use roulette::{
 };
 pub use routes::{resolve_discord_avatar_url, router, LobbyApiState};
 pub use state::{ChatMessage, LobbyManager, LobbyState, LobbyTeam, MapVetoState, Player};
+pub use veto::{
+    apply_veto_map_action, cancel_veto, generate_map_ban_sequence, generate_map_veto_plan,
+    init_map_veto_state, verify_veto_turn, VetoActionResult, VetoPlan, VetoStep, VetoTurnContext,
+};
 pub use ws::mixton_ws_handler;

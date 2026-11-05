@@ -6,7 +6,7 @@ use crate::auth::{
 use crate::maps::MapInfo;
 use crate::state::{
     format_discord_avatar, partition_available_players, ChatMessage, DiscordUserDetails,
-    LobbyManager, LobbyTeam, MapVetoState, Player,
+    LobbyManager, LobbyTeam, Player,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, RawQuery, State},
@@ -1462,17 +1462,75 @@ async fn start_veto(
     let team_a_id = payload
         .get("teamIdA")
         .and_then(|v| v.as_str())
-        .unwrap_or("team_1")
+        .unwrap_or("")
         .to_string();
     let team_b_id = payload
         .get("teamIdB")
         .and_then(|v| v.as_str())
-        .unwrap_or("team_2")
+        .unwrap_or("")
         .to_string();
-    let bet = payload
-        .get("betAmount")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+
+    if team_a_id.is_empty() || team_b_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Debes seleccionar dos equipos para el encuentro." })),
+        )
+            .into_response();
+    }
+
+    let team_a = match state.teams.iter().find(|t| t.id == team_a_id) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Equipos no encontrados." })),
+            )
+                .into_response();
+        }
+    };
+    let team_b = match state.teams.iter().find(|t| t.id == team_b_id) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Equipos no encontrados." })),
+            )
+                .into_response();
+        }
+    };
+
+    let role_str = user.role.as_deref().unwrap_or("");
+    let is_admin = role_str == "global_admin" || role_str == "admin" || user.is_admin;
+    let is_captain_of_match = team_a
+        .captain
+        .as_ref()
+        .map(|c| c.discord_id == user.user_id)
+        .unwrap_or(false)
+        || team_b
+            .captain
+            .as_ref()
+            .map(|c| c.discord_id == user.user_id)
+            .unwrap_or(false);
+
+    if !is_admin && !is_captain_of_match {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Solo los capitanes de la partida o un administrador pueden iniciar la fase de veto."
+            })),
+        )
+            .into_response();
+    }
+
+    let a_complete = team_a.captain.is_some() && team_a.players.len() == 4;
+    let b_complete = team_b.captain.is_some() && team_b.players.len() == 4;
+    if !a_complete || !b_complete {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Ambos equipos deben estar completos (5 jugadores c/u)." })),
+        )
+            .into_response();
+    }
 
     let active_maps: Vec<MapInfo> = state
         .map_catalog
@@ -1480,39 +1538,51 @@ async fn start_veto(
         .filter(|m| m.active)
         .cloned()
         .collect();
-    let pool_len = active_maps.len();
-    let ban_count = pool_len.saturating_sub(1);
-    let mut ban_sequence = Vec::with_capacity(ban_count);
-    for i in 0..ban_count {
-        if i % 2 == 0 {
-            ban_sequence.push(team_a_id.clone());
-        } else {
-            ban_sequence.push(team_b_id.clone());
-        }
+    if active_maps.len() < 2 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Se requieren al menos 2 mapas activos para iniciar el veto. Configura los mapas en el panel administrativo."
+            })),
+        )
+            .into_response();
     }
 
-    let veto = MapVetoState {
-        active: true,
-        completed: false,
-        team_id_a: Some(team_a_id.clone()),
-        team_id_b: Some(team_b_id.clone()),
-        games_per_match: state.games_per_match,
-        veto_mode: "bo1".to_string(),
-        action_type: "ban".to_string(),
-        current_ban_index: 0,
-        banned_maps: Vec::new(),
-        picked_maps: Vec::new(),
-        ban_history: Vec::new(),
-        chosen_map: None,
-        ban_sequence,
-        turn: team_a_id,
-        current_step: "ban".to_string(),
+    let raw_games = payload
+        .get("gamesPerMatch")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(state.games_per_match);
+    let games_per_match = match raw_games {
+        1 | 3 | 5 => raw_games,
+        _ => 1,
+    };
+
+    let bet = payload
+        .get("betAmount")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let queue_id = payload
+        .get("queueId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+    let match_mode = payload
+        .get("matchMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("steam");
+
+    let veto = match crate::veto::init_map_veto_state(
+        &team_a_id,
+        &team_b_id,
         active_maps,
-        final_chosen_map: None,
-        bet_amount: bet,
-        queue_id: "auto".to_string(),
-        match_mode: "steam".to_string(),
-        started_at: Some(chrono::Utc::now().timestamp_millis()),
+        games_per_match,
+        bet,
+        queue_id,
+        match_mode,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(v) => v,
+        Err((code, msg)) => return (code, Json(json!({ "error": msg }))).into_response(),
     };
 
     state.map_veto = Some(veto);
@@ -1550,34 +1620,71 @@ async fn map_ban(
             .into_response();
     }
 
-    if let Some(ref mut veto) = state.map_veto {
-        if !veto.banned_maps.contains(&map_id.to_string()) {
-            veto.banned_maps.push(map_id.to_string());
-            veto.ban_history.push(json!({
-                "mapId": map_id,
-                "teamId": veto.turn,
-                "timestamp": chrono::Utc::now().timestamp_millis()
-            }));
-            veto.current_ban_index += 1;
-
-            veto.active_maps.retain(|m| m.id != map_id);
-
-            if veto.active_maps.len() == 1 {
-                let chosen = veto.active_maps[0].id.clone();
-                veto.active = false;
-                veto.completed = true;
-                veto.chosen_map = Some(chosen.clone());
-                veto.final_chosen_map = Some(chosen);
-            } else if let Some(team_a) = &veto.team_id_a {
-                if let Some(team_b) = &veto.team_id_b {
-                    veto.turn = if veto.turn == *team_a {
-                        team_b.clone()
-                    } else {
-                        team_a.clone()
-                    };
-                }
-            }
+    let veto = match state.map_veto.as_ref() {
+        Some(v) if v.active && !v.completed => v,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "No hay una fase de veto de mapas activa." })),
+            )
+                .into_response();
         }
+    };
+
+    let is_pick_mode =
+        veto.action_type == "pick" || veto.veto_mode == "bo3" || veto.veto_mode == "bo5";
+    if !is_pick_mode && veto.banned_maps.contains(&map_id.to_string()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Este mapa ya fue baneado." })),
+        )
+            .into_response();
+    }
+    if is_pick_mode
+        && veto
+            .picked_maps
+            .iter()
+            .any(|p| p.get("mapId").and_then(|v| v.as_str()) == Some(map_id))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Este mapa ya fue seleccionado por un equipo." })),
+        )
+            .into_response();
+    }
+
+    let pool = if !veto.pool.is_empty() {
+        veto.pool.clone()
+    } else {
+        state
+            .map_catalog
+            .iter()
+            .filter(|m| m.active)
+            .cloned()
+            .collect()
+    };
+    if !pool.iter().any(|m| m.id == map_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Mapa no válido en el pool." })),
+        )
+            .into_response();
+    }
+
+    let role_str = user.role.as_deref().unwrap_or("");
+    let is_admin = role_str == "global_admin" || role_str == "admin" || user.is_admin;
+    if let Err((code, msg)) =
+        crate::veto::verify_veto_turn(&state, veto, &user.user_id, role_str, is_admin)
+    {
+        return (code, Json(json!({ "error": msg }))).into_response();
+    }
+
+    let actor_nick = user.username.as_str();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Err((code, msg)) =
+        crate::veto::apply_veto_map_action(&mut state, map_id, Some(actor_nick), now_ms, None)
+    {
+        return (code, Json(json!({ "error": msg }))).into_response();
     }
 
     let updated = manager.update_state(guild_id, state).await;
@@ -1603,7 +1710,7 @@ async fn cancel_veto(
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
-    state.map_veto = None;
+    crate::veto::cancel_veto(&mut state);
     let updated = manager.update_state(guild_id, state).await;
     let available_players = partition_available_players(&updated);
     Json(json!({
