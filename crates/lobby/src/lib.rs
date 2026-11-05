@@ -7,6 +7,7 @@ pub mod maps;
 pub mod notify;
 pub mod roulette;
 pub mod routes;
+pub mod settle;
 pub mod state;
 pub mod veto;
 pub mod ws;

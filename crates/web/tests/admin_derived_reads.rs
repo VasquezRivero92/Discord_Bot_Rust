@@ -552,6 +552,7 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             cs2: None,
             lobby: None,
             docs: None,
+            source: None,
             notifier: Default::default(),
             wallet: None,
         }))
@@ -612,6 +613,7 @@ async fn legacy_panel_writes_clear_the_rust_caches() {
         cs2: None,
         lobby: None,
         docs: None,
+        source: None,
         notifier: Default::default(),
         wallet: None,
     }))

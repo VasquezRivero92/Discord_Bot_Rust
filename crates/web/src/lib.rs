@@ -43,6 +43,7 @@ pub struct AppDeps {
     pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
     pub lobby: Option<Arc<lobby::LobbyManager>>,
     pub docs: Option<Arc<dyn data::DocSink>>,
+    pub source: Option<Arc<dyn data::DocSource>>,
     pub notifier: lobby::notify::NotifierSlot,
     pub wallet: Option<Arc<dyn data::WalletStore>>,
 }
@@ -117,9 +118,20 @@ pub fn build_app(deps: AppDeps) -> Router {
     }
     let lobby_cs2 = deps.cs2.clone();
     if let Some(cs2_mgr) = deps.cs2 {
+        let settle = match (&deps.docs, &deps.source) {
+            (Some(docs), Some(source)) => Some(Arc::new(lobby::settle::SettleDeps {
+                cs2: Some(cs2_mgr.clone()),
+                docs: Arc::clone(docs),
+                source: Arc::clone(source),
+                wallet: deps.wallet.clone(),
+            })),
+            _ => None,
+        };
         migrated = migrated
             .merge(routes::cs2_api::router(routes::cs2_api::Cs2ApiState {
                 manager: cs2_mgr.clone(),
+                settle,
+                secret: cfg.cs2_api_secret.clone(),
             }))
             .merge(routes::webhooks::router(routes::webhooks::WebhooksState {
                 cs2_manager: cs2_mgr,

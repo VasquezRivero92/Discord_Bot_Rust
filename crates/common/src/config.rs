@@ -334,6 +334,8 @@ pub struct Config {
     pub cs2_server_api_key: Option<String>,
     pub cs2_server_dir: Option<PathBuf>,
     pub faceit_api_key: Option<String>,
+    /// Secreto compartido para autenticar llamadas de la API local de CS2 (`/api/cs2/*`).
+    pub cs2_api_secret: Option<String>,
     /// Capa de entorno de la configuración efectiva (`getEffectiveConfig`).
     pub env_defaults: EnvDefaults,
 }
@@ -376,7 +378,14 @@ impl fmt::Debug for Config {
             .field("cs2_ssh_key_path", &self.cs2_ssh_key_path)
             .field("cs2_server_api_key", &"<redacted>")
             .field("cs2_server_dir", &self.cs2_server_dir)
-            .field("faceit_api_key", &self.faceit_api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "faceit_api_key",
+                &self.faceit_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "cs2_api_secret",
+                &self.cs2_api_secret.as_ref().map(|_| "<redacted>"),
+            )
             .field("env_defaults", &self.env_defaults)
             .finish()
     }
@@ -539,6 +548,7 @@ impl Config {
             cs2_server_api_key: optional(vars, "CS2_SERVER_API_KEY"),
             cs2_server_dir: optional(vars, "CS2_SERVER_DIR").map(PathBuf::from),
             faceit_api_key: optional(vars, "FACEIT_API_KEY"),
+            cs2_api_secret: optional(vars, "CS2_API_SECRET"),
             env_defaults: EnvDefaults::from_map(vars),
         })
     }

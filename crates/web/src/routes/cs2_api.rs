@@ -3,6 +3,7 @@
 //! Usadas por el servidor local de CS2 para consultar partidas en curso y reportar resultados.
 
 use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,6 +16,8 @@ use tracing::info;
 #[derive(Clone)]
 pub struct Cs2ApiState {
     pub manager: Arc<Cs2ServerManager>,
+    pub settle: Option<Arc<lobby::settle::SettleDeps>>,
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,49 +73,221 @@ async fn current_match(State(state): State<Cs2ApiState>) -> impl IntoResponse {
     }))
 }
 
+/// Comparación byte a byte en tiempo constante sin cortocircuito para evitar ataques de temporización.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Verifica la autenticación mediante la cabecera `x-cs2-secret`.
+///
+/// Si hay secreto configurado y la cabecera falta o no coincide -> 401 Unauthorized sin tocar nada.
+/// Si hay secreto y coincide -> Ok(true).
+/// Si no hay secreto configurado -> Ok(false).
+fn check_auth(
+    state_secret: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<bool, axum::response::Response> {
+    if let Some(expected) = state_secret {
+        let provided = headers.get("x-cs2-secret").and_then(|v| v.to_str().ok());
+        match provided {
+            Some(secret_header) if constant_time_eq(secret_header, expected) => Ok(true),
+            _ => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "No autorizado."})),
+            )
+                .into_response()),
+        }
+    } else {
+        Ok(false)
+    }
+}
+
 async fn match_finish(
     State(state): State<Cs2ApiState>,
+    headers: HeaderMap,
     Json(payload): Json<MatchFinishPayload>,
 ) -> impl IntoResponse {
+    let authenticated = match check_auth(state.secret.as_deref(), &headers) {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
     let match_id = &payload.match_id;
     info!(
-        "[CS2 API Rust] Fin de partida reportado para {match_id}. Ganador: {:?}, Marcador: {:?} - {:?}",
+        "[CS2 API Rust] Fin de partida reportado para {match_id}. Ganador: {:?}, Marcador: {:?} - {:?}, Autenticado: {authenticated}",
         payload.winner, payload.team1_score, payload.team2_score
     );
 
-    // 1. Limpiar la partida activa de la memoria RAM
-    let _ = state.manager.clear_match(match_id).await;
+    if let Some(ref settle) = state.settle {
+        // Guardar estadísticas detalladas si vienen
+        if let Some(ref stats) = payload.stats {
+            let _ = settle
+                .docs
+                .set_doc("faceit_matches_stats", match_id, stats)
+                .await;
+        }
 
-    // 2. Verificar auto-apagado de máquina virtual en AWS EC2 si ya no hay partidas
-    let _ = state.manager.auto_shutdown_if_idle().await;
+        let action = lobby::settle::MatchAction::from_winner(
+            payload.winner.as_deref(),
+            payload.team1_score.map(|s| s as i64),
+            payload.team2_score.map(|s| s as i64),
+        );
 
-    Json(json!({
-        "success": true,
-        "matchId": match_id,
-        "statsSaved": payload.stats.is_some(),
-        "resolved": true,
-        "message": "Estadísticas registradas y match finalizado correctamente en Rust."
-    }))
+        match lobby::settle::resolve_match_end(
+            settle,
+            match_id,
+            action,
+            payload.team1_score.map(|s| s as i64),
+            payload.team2_score.map(|s| s as i64),
+            authenticated,
+            payload.stats.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "matchId": match_id,
+                    "resolved": true,
+                    "action": outcome.action.as_str(),
+                    "statsSaved": payload.stats.is_some(),
+                    "payoutsApplied": outcome.payouts_applied,
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::NotFound) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "matchId": match_id,
+                    "resolved": false,
+                    "message": "Match no encontrado o ya resuelto."
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Unauthorized) => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "No autorizado."
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Store(msg)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Error interno: {msg}")
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        // Sin settle (Firestore deshabilitado) conserva el comportamiento actual de limpiar memoria
+        let _ = state.manager.clear_match(match_id).await;
+        let _ = state.manager.auto_shutdown_if_idle().await;
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "matchId": match_id,
+                "statsSaved": payload.stats.is_some(),
+                "resolved": true,
+                "message": "Estadísticas registradas y match finalizado correctamente en Rust."
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn match_cancel(
     State(state): State<Cs2ApiState>,
+    headers: HeaderMap,
     Json(payload): Json<MatchCancelPayload>,
 ) -> impl IntoResponse {
+    let authenticated = match check_auth(state.secret.as_deref(), &headers) {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
     let match_id = &payload.match_id;
     info!(
-        "[CS2 API Rust] Cancelación de partida reportada para {match_id}. Motivo: {:?}",
+        "[CS2 API Rust] Cancelación de partida reportada para {match_id}. Motivo: {:?}, Autenticado: {authenticated}",
         payload.reason
     );
 
-    let _ = state.manager.clear_match(match_id).await;
-    let _ = state.manager.auto_shutdown_if_idle().await;
+    if let Some(ref settle) = state.settle {
+        match lobby::settle::resolve_match_end(
+            settle,
+            match_id,
+            lobby::settle::MatchAction::Cancel,
+            None,
+            None,
+            authenticated,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "matchId": match_id,
+                    "resolved": true,
+                    "action": outcome.action.as_str(),
+                    "statsSaved": false,
+                    "payoutsApplied": outcome.payouts_applied,
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::NotFound) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "matchId": match_id,
+                    "resolved": false,
+                    "message": "Match no encontrado o ya resuelto."
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Unauthorized) => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "No autorizado."
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Store(msg)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Error interno: {msg}")
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        let _ = state.manager.clear_match(match_id).await;
+        let _ = state.manager.auto_shutdown_if_idle().await;
 
-    Json(json!({
-        "success": true,
-        "matchId": match_id,
-        "message": "Match cancelado y limpiado de la memoria en Rust."
-    }))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "matchId": match_id,
+                "message": "Match cancelado y limpiado de la memoria en Rust."
+            })),
+        )
+            .into_response()
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +316,8 @@ mod tests {
         let manager = test_manager();
         let app = router(Cs2ApiState {
             manager: manager.clone(),
+            settle: None,
+            secret: None,
         });
 
         // 1. Inicialmente sin partidas
@@ -153,7 +330,14 @@ mod tests {
 
         // 2. Registrar una partida
         manager
-            .publish_match("match_test_1".into(), None, "de_mirage".into(), 10.0, 10, None)
+            .publish_match(
+                "match_test_1".into(),
+                None,
+                "de_mirage".into(),
+                10.0,
+                10,
+                None,
+            )
             .await;
 
         let req = Request::builder()

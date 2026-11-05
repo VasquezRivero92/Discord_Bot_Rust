@@ -155,6 +155,7 @@ impl Front {
             cs2: None,
             lobby: None,
             docs: None,
+            source: None,
             notifier: Default::default(),
             wallet: None,
         }))
@@ -325,6 +326,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
         cs2: None,
         lobby: None,
         docs: None,
+        source: None,
         notifier: Default::default(),
         wallet: None,
     }))

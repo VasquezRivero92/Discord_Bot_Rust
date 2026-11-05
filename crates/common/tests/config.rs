@@ -591,16 +591,45 @@ fn aws_and_cs2_config_parsing_and_debug_redaction() {
     .unwrap();
     assert_eq!(cfg.aws_region, "sa-east-1");
     assert_eq!(cfg.aws_access_key_id.as_deref(), Some("AKIA123"));
-    assert_eq!(cfg.aws_secret_access_key.as_deref(), Some("super-secret-aws-key"));
-    assert_eq!(cfg.aws_ec2_instance_id.as_deref(), Some("i-1234567890abcdef0"));
+    assert_eq!(
+        cfg.aws_secret_access_key.as_deref(),
+        Some("super-secret-aws-key")
+    );
+    assert_eq!(
+        cfg.aws_ec2_instance_id.as_deref(),
+        Some("i-1234567890abcdef0")
+    );
     assert_eq!(cfg.cs2_server_ip, "10.0.0.1");
     assert_eq!(cfg.cs2_ssh_user, "cs2user");
     assert_eq!(cfg.cs2_ssh_key_path, Some(PathBuf::from("/keys/test.pem")));
-    assert_eq!(cfg.cs2_server_api_key.as_deref(), Some("cs2-secret-api-key"));
+    assert_eq!(
+        cfg.cs2_server_api_key.as_deref(),
+        Some("cs2-secret-api-key")
+    );
 
     let dbg = format!("{cfg:?}");
     assert!(!dbg.contains("super-secret-aws-key"));
     assert!(!dbg.contains("cs2-secret-api-key"));
     assert!(dbg.contains("aws_secret_access_key: \"<redacted>\""));
     assert!(dbg.contains("cs2_server_api_key: \"<redacted>\""));
+}
+
+#[test]
+fn cs2_api_secret_parsing_and_debug_redaction() {
+    // 1. Ausente por defecto -> None
+    let cfg_default = Config::from_map(&base()).unwrap();
+    assert_eq!(cfg_default.cs2_api_secret, None);
+    let dbg_default = format!("{cfg_default:?}");
+    assert!(dbg_default.contains("cs2_api_secret: None"));
+
+    // 2. Cadena vacía o solo espacios -> None
+    let cfg_empty = Config::from_map(&with(&[("CS2_API_SECRET", "   ")])).unwrap();
+    assert_eq!(cfg_empty.cs2_api_secret, None);
+
+    // 3. Valor válido -> Some y redactado en Debug
+    let cfg = Config::from_map(&with(&[("CS2_API_SECRET", "mi_super_secreto_cs2")])).unwrap();
+    assert_eq!(cfg.cs2_api_secret.as_deref(), Some("mi_super_secreto_cs2"));
+    let dbg = format!("{cfg:?}");
+    assert!(!dbg.contains("mi_super_secreto_cs2"));
+    assert!(dbg.contains("cs2_api_secret: Some(\"<redacted>\")"));
 }

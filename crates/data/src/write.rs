@@ -2,12 +2,15 @@
 
 use crate::error::DataError;
 use crate::firestore::FirestoreClient;
+use crate::source::DocSource;
 use async_trait::async_trait;
 use firestore::gcloud_sdk::google::firestore::v1::{
     value::ValueType, ArrayValue as PbArrayValue, Document, MapValue as PbMapValue,
     Value as PbValue,
 };
 use firestore::gcloud_sdk::prost_types::Timestamp;
+use firestore::{FirestoreDocument, FirestoreTransactionOps};
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -117,6 +120,15 @@ pub trait DocSink: Send + Sync {
         id: &str,
         fields: &[&str],
     ) -> Result<(), DataError>;
+
+    /// Lee y borra de forma atómica el documento en `collection/id`.
+    /// Si existe, lo borra y devuelve su contenido decodificado sin campos sintéticos.
+    /// Si no existe, devuelve `Ok(None)`.
+    async fn take_doc(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, DataError>;
 }
 
 impl FirestoreClient {
@@ -238,6 +250,54 @@ impl FirestoreClient {
             },
         }
     }
+
+    /// Lee y borra de forma atómica el documento en `collection/id` dentro de una transacción.
+    /// Si existe, lo borra y devuelve su contenido decodificado sin campos sintéticos.
+    /// Si no existe, devuelve `Ok(None)`.
+    pub async fn take_doc(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, DataError> {
+        let collection = collection.to_string();
+        let id = id.to_string();
+        let res = self
+            .db
+            .run_transaction(|db, transaction| {
+                let collection = collection.clone();
+                let id = id.clone();
+                async move {
+                    let doc: Option<FirestoreDocument> =
+                        db.fluent().select().by_id_in(&collection).one(&id).await?;
+
+                    if let Some(doc) = doc {
+                        transaction.delete_by_id(&collection, &id, None)?;
+                        let val =
+                            firestore::FirestoreDb::deserialize_doc_to::<serde_json::Value>(&doc)?;
+                        let clean = crate::source::strip_synthetic(val);
+                        Ok(Some(clean))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                .boxed()
+            })
+            .await;
+
+        match res {
+            Ok(v) => Ok(v),
+            Err(err) => match err {
+                firestore::errors::FirestoreError::ErrorInTransaction(e) => {
+                    if let Some(de) = e.source.downcast_ref::<DataError>() {
+                        Err(de.clone())
+                    } else {
+                        Err(DataError::Firestore(e.to_string()))
+                    }
+                }
+                other => Err(DataError::from(other)),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -271,6 +331,14 @@ impl DocSink for FirestoreClient {
         fields: &[&str],
     ) -> Result<(), DataError> {
         self.delete_fields(collection, id, fields).await
+    }
+
+    async fn take_doc(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, DataError> {
+        self.take_doc(collection, id).await
     }
 }
 
@@ -391,6 +459,44 @@ impl DocSink for FakeDocSink {
             }
         }
         Ok(())
+    }
+
+    async fn take_doc(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, DataError> {
+        self.check_error()?;
+        let mut docs = self.docs.lock().expect("mutex envenenado");
+        let key = (collection.to_string(), id.to_string());
+        Ok(docs.remove(&key))
+    }
+}
+
+#[async_trait]
+impl DocSource for FakeDocSink {
+    async fn query(
+        &self,
+        collection: &str,
+        _q: crate::firestore::Query,
+    ) -> Result<Vec<(String, serde_json::Value)>, DataError> {
+        self.check_error()?;
+        let docs = self.docs.lock().expect("mutex envenenado");
+        let out: Vec<(String, serde_json::Value)> = docs
+            .iter()
+            .filter(|((col, _), _)| col == collection)
+            .map(|((_, id), val)| (id.clone(), val.clone()))
+            .collect();
+        Ok(out)
+    }
+
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, DataError> {
+        self.check_error()?;
+        Ok(self.get(collection, id))
     }
 }
 
@@ -572,5 +678,70 @@ mod tests {
 
         let res = sink.delete_fields("faceit_users", "1", &["a"]).await;
         assert_eq!(res, Err(DataError::QuotaExceeded));
+
+        let res = sink.take_doc("faceit_users", "1").await;
+        assert_eq!(res, Err(DataError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn test_fake_doc_sink_take_doc() {
+        let sink = FakeDocSink::new();
+        let doc_val = json!({"match_id": "m123", "pot": 50});
+
+        sink.insert("faceit_active_matches", "m123", doc_val.clone());
+
+        // 1. Primer take devuelve el documento y lo borra
+        let taken = sink
+            .take_doc("faceit_active_matches", "m123")
+            .await
+            .expect("take_doc exitoso");
+        assert_eq!(taken, Some(doc_val));
+        assert_eq!(sink.get("faceit_active_matches", "m123"), None);
+
+        // 2. Segundo take devuelve None
+        let taken_again = sink
+            .take_doc("faceit_active_matches", "m123")
+            .await
+            .expect("segundo take_doc");
+        assert_eq!(taken_again, None);
+    }
+
+    #[tokio::test]
+    async fn test_fake_doc_sink_take_doc_concurrent_20_tasks() {
+        use std::sync::Arc;
+
+        let sink = Arc::new(FakeDocSink::new());
+        let doc_val = json!({"match_id": "concurrent_match", "bet": 10});
+        sink.insert("faceit_active_matches", "concurrent_match", doc_val.clone());
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let sink_clone = Arc::clone(&sink);
+            handles.push(tokio::spawn(async move {
+                sink_clone
+                    .take_doc("faceit_active_matches", "concurrent_match")
+                    .await
+            }));
+        }
+
+        let mut some_count = 0;
+        let mut none_count = 0;
+
+        for handle in handles {
+            let res = handle.await.expect("join handle").expect("take_doc ok");
+            match res {
+                Some(v) => {
+                    assert_eq!(v, doc_val);
+                    some_count += 1;
+                }
+                None => {
+                    none_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(some_count, 1, "exactamente 1 llamada debe obtener Some");
+        assert_eq!(none_count, 19, "exactamente 19 llamadas deben obtener None");
+        assert_eq!(sink.get("faceit_active_matches", "concurrent_match"), None);
     }
 }

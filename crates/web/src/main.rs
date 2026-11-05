@@ -122,6 +122,9 @@ async fn run() -> ExitCode {
     let docs = client
         .clone()
         .map(|c| Arc::new(c) as Arc<dyn data::DocSink>);
+    let source = client
+        .clone()
+        .map(|c| Arc::new(c) as Arc<dyn data::DocSource>);
     let wallet = client
         .clone()
         .map(|c| Arc::new(c) as Arc<dyn data::WalletStore>);
@@ -132,6 +135,7 @@ async fn run() -> ExitCode {
         cs2,
         lobby,
         docs,
+        source,
         notifier: notifier_slot,
         wallet,
     });
