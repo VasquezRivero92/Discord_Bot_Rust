@@ -32,6 +32,10 @@ services:
         source: ./public
         target: /srv/public
         read_only: true
+      # Única parte escribible de /srv/public: las imágenes que suben los jugadores al chat.
+      - type: volume
+        source: machupeek-uploads
+        target: /srv/public/uploads
       - type: bind
         source: ./firebase-service-account.json
         target: /run/secrets/firebase-sa.json
@@ -53,7 +57,14 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-eyJhIjoiOGJkNGE0MzkwMzJhNWY1Zjg4MDgyYWZhMTU5NTAzMTYiLCJ0IjoiYmVjODFhNjUtOGQ5OC00YjQ5LWEwZjgtODQyYzQ2YWRiM2FmIiwicyI6Ik1qZG1aVEF3TXpjdFkyUTJPQzAwTVRrNExUZ3dZekF0TWpneU1qZ3hOek00WTJJNCJ9}
+      # El token NUNCA va escrito en el repositorio ni en .env (compose pasa .env entero al
+      # contenedor web). Se exporta en la shell: export TUNNEL_TOKEN='...'
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Define TUNNEL_TOKEN en la shell antes de levantar el stack (ver docs/despliegue-docker.md)}
     depends_on:
       web:
         condition: service_healthy
+
+volumes:
+  # Imágenes subidas al chat del Mixton (/uploads/chat/*). Persisten entre reinicios y
+  # actualizaciones de la imagen; el resto del contenedor es de solo lectura.
+  machupeek-uploads:

@@ -11,6 +11,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake build-essential clang \
     && rm -rf /var/lib/apt/lists/*
 
+# Hilos de compilación: limita el pico de memoria al construir (subir si hay RAM de sobra).
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
@@ -28,6 +32,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin web
+
+# Imágenes del chat del Mixton: el contenedor es de solo lectura, así que /srv/public/uploads se
+# monta como volumen con nombre (ver docker-compose.yml). Se crea aquí con el dueño correcto para
+# que el volumen nuevo herede el permiso de escritura del usuario `web`.
+RUN mkdir -p /srv/public/uploads/chat \
+    && chown -R web:web /srv/public/uploads
 
 COPY --from=builder /usr/local/bin/web /usr/local/bin/web
 

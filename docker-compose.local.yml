@@ -30,3 +30,10 @@ services:
         source: ./clave_cs2.pem
         target: /app/clave_cs2.pem
         read_only: true
+      # Imágenes del chat del Mixton (única parte escribible de /srv/public).
+      - type: volume
+        source: machupeek-uploads-local
+        target: /srv/public/uploads
+
+volumes:
+  machupeek-uploads-local:
