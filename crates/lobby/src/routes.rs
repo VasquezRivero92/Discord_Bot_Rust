@@ -242,30 +242,11 @@ pub fn router(state: LobbyApiState) -> Router {
         )
         .route("/api/lobby/mixton-games-config", post(games_config))
         .route("/api/lobby/mixton-rounds-config", post(games_config))
-        .route("/api/lobby/mixton-toggle-command", post(toggle_command))
         // Acciones generales de partida y configuración
         .route("/api/lobby/mixton-setup", post(mixton_setup))
         .route("/api/lobby/mixton-start", post(mixton_start))
         .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
-        .route(
-            "/api/lobby/mixton-check-bet-status",
-            post(generic_lobby_user_action),
-        )
-        .route(
-            "/api/lobby/mixton-load-team",
-            post(generic_lobby_admin_action),
-        )
-        .route(
-            "/api/lobby/mixton-override-tier",
-            post(generic_lobby_admin_action),
-        )
-        .route("/api/lobby/create-match", post(mixton_create_match))
-        .route("/api/lobby/mixton-create-match", post(mixton_create_match))
-        .route(
-            "/api/lobby/sync-faceit-from-steam",
-            post(generic_lobby_user_action),
-        )
-        .route("/api/lobby/verify-faceit", post(generic_lobby_user_action))
+        // Sin implementación real en Rust todavía (no se simula éxito): mixton-check-bet-status, mixton-load-team, mixton-override-tier, sync-faceit-from-steam, verify-faceit, mixton-toggle-command, create-match. Caen al proxy del legado.
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route(
@@ -1180,22 +1161,6 @@ async fn games_config(
         .into_response()
 }
 
-async fn toggle_command(
-    admin: RequireAdmin,
-    RawQuery(raw): RawQuery,
-    State(manager): State<Arc<LobbyManager>>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
-        Ok(g) => g,
-        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
-    };
-    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let state = manager.get_state(guild_id).await;
-    let available_players = partition_available_players(&state);
-    Json(json!({ "success": true, "commandEnabled": true, "state": state, "availablePlayers": available_players })).into_response()
-}
-
 async fn mixton_setup(
     admin: RequireAdmin,
     RawQuery(raw): RawQuery,
@@ -1348,97 +1313,6 @@ async fn mixton_pick_order(
             (status, Json(json!({ "error": msg }))).into_response()
         }
     }
-}
-
-async fn mixton_create_match(
-    user: RequireUser,
-    RawQuery(raw): RawQuery,
-    State(manager): State<Arc<LobbyManager>>,
-    Json(payload): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
-        Ok(g) => g,
-        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
-    };
-    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let mut state = manager.get_state(guild_id).await;
-
-    let match_id = format!("match_{}", chrono::Utc::now().timestamp_millis());
-
-    let team_a_id = payload
-        .get("teamIdA")
-        .and_then(|v| v.as_str())
-        .unwrap_or("team_1");
-    let team_b_id = payload
-        .get("teamIdB")
-        .and_then(|v| v.as_str())
-        .unwrap_or("team_2");
-
-    for t in &mut state.teams {
-        if t.id == team_a_id || t.id == team_b_id {
-            t.captain = None;
-            t.players.clear();
-        }
-    }
-
-    state.draft_started = false;
-    state.draft_finished = false;
-    state.current_pick_index = 0;
-    state.map_veto = None;
-    state.roulette_spinning = false;
-    state.roulette_winner_team_id = None;
-    state.roulette_winner_name = None;
-    state.bet_agreed = false;
-    state.captain_a_ready = false;
-    state.captain_b_ready = false;
-
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-
-    Json(json!({
-        "success": true,
-        "matchId": match_id,
-        "faceitHubUrl": serde_json::Value::Null,
-        "assignedQueue": "CS2 5v5 Oficial",
-        "gamesPerMatch": 1,
-        "roundsPerGame": 1,
-        "state": updated,
-        "availablePlayers": available_players
-    }))
-    .into_response()
-}
-
-async fn generic_lobby_admin_action(
-    admin: RequireAdmin,
-    RawQuery(raw): RawQuery,
-    State(manager): State<Arc<LobbyManager>>,
-    Json(_): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
-        Ok(g) => g,
-        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
-    };
-    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state })).into_response()
-}
-
-async fn generic_lobby_user_action(
-    user: RequireUser,
-    RawQuery(raw): RawQuery,
-    State(manager): State<Arc<LobbyManager>>,
-    Json(_): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
-        Ok(g) => g,
-        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
-    };
-    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let state = manager.get_state(guild_id).await;
-    Json(json!({ "success": true, "state": state })).into_response()
 }
 
 async fn start_veto(
