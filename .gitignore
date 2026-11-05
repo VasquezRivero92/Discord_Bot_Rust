@@ -9,4 +9,7 @@ cookies.txt
 
 *.pem
 clave_cs2.pem
+# Token del túnel de Cloudflare (ver docker-compose.yml): nunca se versiona.
+secrets/
+tunnel-token*
 public/

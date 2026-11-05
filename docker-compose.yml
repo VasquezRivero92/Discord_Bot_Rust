@@ -60,8 +60,18 @@ services:
     command: tunnel --no-autoupdate run
     environment:
       # El token NUNCA va escrito en el repositorio ni en .env (compose pasa .env entero al
-      # contenedor web). Se exporta en la shell: export TUNNEL_TOKEN='...'
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Define TUNNEL_TOKEN en la shell antes de levantar el stack (ver docs/despliegue-docker.md)}
+      # contenedor web). cloudflared lo lee de un archivo montado en solo lectura, así tampoco
+      # aparece en `docker inspect`. Guárdalo en ./secrets/tunnel-token (carpeta ignorada por git)
+      # o apunta TUNNEL_TOKEN_PATH a otro archivo. Ver docs/despliegue-docker.md.
+      TUNNEL_TOKEN_FILE: /run/secrets/tunnel-token
+    volumes:
+      - type: bind
+        source: ${TUNNEL_TOKEN_PATH:-./secrets/tunnel-token}
+        target: /run/secrets/tunnel-token
+        read_only: true
+        bind:
+          # Si el archivo no existe, falla con un error claro en vez de crear una carpeta vacía.
+          create_host_path: false
     depends_on:
       web:
         condition: service_healthy

@@ -30,20 +30,22 @@ arranca (`mkdirat ... read-only file system`).
 
 ## 2. El token del túnel (importante)
 
-`TUNNEL_TOKEN` **no** va en `.env` (compose pasa `.env` entero al contenedor web) ni en el
-repositorio. Se exporta en la shell:
+El token **no** va en `.env` (compose pasa `.env` entero al contenedor web) ni en el repositorio ni
+en una variable de entorno. `cloudflared` lo lee de un archivo que compose monta en solo lectura:
 
 ```bash
-export TUNNEL_TOKEN='<token del túnel de Cloudflare>'
+mkdir -p secrets
+printf '%s' '<token del túnel de Cloudflare>' > secrets/tunnel-token
 ```
 
-Si no está definido, `docker compose up` falla con un mensaje claro en vez de arrancar con un
-valor por defecto.
+`secrets/` está en `.gitignore`. Para usar otra ubicación: `TUNNEL_TOKEN_PATH=/ruta/al/archivo`.
+El archivo debe contener solo el token, sin saltos de línea ni comillas. Si no existe,
+`docker compose create/up` falla con un error claro en vez de crear una carpeta vacía en su lugar.
 
 > **Rotar el token.** Una versión anterior de `docker-compose.yml` llevaba un token escrito como
 > valor por defecto y esa versión estuvo publicada en la rama `fix/lobby-parity` de GitHub. Hay
 > que invalidarlo: Cloudflare Zero Trust > Networks > Tunnels > *túnel* > Configure > refrescar el
-> token, y usar el nuevo en `export TUNNEL_TOKEN`.
+> token, y guardar el nuevo en `secrets/tunnel-token`.
 
 ## 3. Variables que importan para machupeek.com
 
@@ -62,7 +64,7 @@ En Cloudflare, el *Public Hostname* de `machupeek.com` debe apuntar a `http://we
 ## 4. Encender
 
 ```bash
-export TUNNEL_TOKEN='...'
+mkdir -p public/uploads secrets     # y guardar el token en secrets/tunnel-token (sección 2)
 docker compose up -d --build        # la primera vez compila Rust: tarda varios minutos
 docker compose ps                   # web debe quedar (healthy)
 curl -s http://127.0.0.1:15633/api/ping
