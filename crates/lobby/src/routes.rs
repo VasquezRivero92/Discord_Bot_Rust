@@ -196,11 +196,7 @@ pub fn router(state: LobbyApiState) -> Router {
             get(map_catalog).post(update_map_catalog),
         )
         .route("/api/lobby/mixton-queues", get(mixton_queues))
-        .route("/api/lobby/wallet", get(wallet))
-        .route(
-            "/api/lobby/player-balance/{discord_id}",
-            get(player_balance),
-        )
+        // Dinero (wallet, player-balance, quick-add-balance, recharge-yape): sin escritura a Firestore en Rust todavía; se dejan sin registrar para que el proxy las envíe al legado Node. NO simular saldo.
         .route("/api/lobby/users", get(users))
         .route("/api/lobby/steam-avatars", get(steam_avatars))
         .route("/api/lobby/steam-avatar/{steam_id}", get(steam_avatar))
@@ -280,9 +276,6 @@ pub fn router(state: LobbyApiState) -> Router {
             "/api/lobby/mixton-chat-send",
             post(chat_message).layer(DefaultBodyLimit::max(9 * 1024 * 1024)),
         )
-        // Billetera / Recargas
-        .route("/api/lobby/quick-add-balance", post(quick_add_balance))
-        .route("/api/lobby/wallet/recharge-yape", post(recharge_yape))
         .with_state(ctx)
 }
 
@@ -337,10 +330,6 @@ async fn mixton_queues(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "queues": [] }))
 }
 
-async fn wallet(_user: RequireUser) -> impl IntoResponse {
-    Json(json!({ "balance": 0.0 }))
-}
-
 async fn guilds(_user: RequireUser, State(manager): State<Arc<LobbyManager>>) -> impl IntoResponse {
     let g_id = manager.resolve_guild_id(None);
     Json(json!({
@@ -355,24 +344,6 @@ async fn guilds(_user: RequireUser, State(manager): State<Arc<LobbyManager>>) ->
     }))
 }
 
-async fn player_balance(
-    user: RequireUser,
-    RawQuery(raw): RawQuery,
-    Path(discord_id): Path<String>,
-) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
-    if let Err(msg) = resolve_guild_for_user(&user, g_opt.as_deref(), false) {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response();
-    }
-    Json(json!({
-        "discordId": discord_id,
-        "balance": 100.0,
-        "hasEnough": true,
-        "deficit": 0.0
-    }))
-    .into_response()
-}
-
 async fn users(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "users": [] }))
 }
@@ -383,25 +354,6 @@ async fn steam_avatars() -> impl IntoResponse {
 
 async fn steam_avatar(Path(_): Path<String>) -> impl IntoResponse {
     Json(json!({ "avatar": "https://cdn.discordapp.com/embed/avatars/0.png" }))
-}
-
-async fn quick_add_balance(
-    _admin: RequireAdmin,
-    Json(_): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    Json(json!({
-        "success": true,
-        "balance": 100.0,
-        "message": "Saldo procesado exitosamente."
-    }))
-}
-
-async fn recharge_yape(_user: RequireUser, Json(_): Json<serde_json::Value>) -> impl IntoResponse {
-    Json(json!({
-        "success": true,
-        "balance": 100.0,
-        "message": "Saldo procesado exitosamente."
-    }))
 }
 
 async fn get_state(
