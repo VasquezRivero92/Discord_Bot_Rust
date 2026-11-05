@@ -32,6 +32,8 @@ impl EventHandler for BotHandler {
             commands::panels::register_setup_recargas(),
             commands::panels::register_setup_soporte(),
             commands::desvincular::register(),
+            commands::sincronizar::register(),
+            commands::llamar_admin::register(),
         ];
 
         match Command::set_global_commands(&ctx.http, commands).await {
@@ -134,6 +136,24 @@ impl EventHandler for BotHandler {
                         )
                         .await
                     }
+                    "sincronizar_fc" => {
+                        commands::sincronizar::run(
+                            &ctx,
+                            &command,
+                            self.faceit.as_ref(),
+                            self.firestore.as_ref(),
+                        )
+                        .await
+                    }
+                    "llamar_admin" => {
+                        commands::llamar_admin::run(
+                            &ctx,
+                            &command,
+                            &self.config,
+                            self.firestore.as_ref(),
+                        )
+                        .await
+                    }
                     unknown => {
                         warn!("Comando desconocido recibido: {}", unknown);
                         let msg = CreateInteractionResponseMessage::new()
@@ -201,34 +221,21 @@ impl EventHandler for BotHandler {
                         }
                     }
                     "llamar_admin_btn" => {
-                        // Enviar alerta a canal de admin alerts si está configurado
-                        if let Some(chan_str) =
-                            &self.config.env_defaults.discord_admin_alerts_channel_id
-                        {
-                            if let Ok(chan_id) = chan_str.parse::<u64>() {
-                                let alert_chan = ChannelId::new(chan_id);
-                                let alert_embed = CreateEmbed::new()
-                                    .title("🚨 Solicitud de Soporte / Admin")
-                                    .description(format!(
-                                        "El usuario <@{}> ha solicitado asistencia de un administrador.",
-                                        component.user.id
-                                    ))
-                                    .color(0xFF0000)
-                                    .field("Usuario", format!("{} (<@{}>)", component.user.name, component.user.id), true)
-                                    .footer(CreateEmbedFooter::new("Machupeek Soporte"));
-
-                                let msg = CreateMessage::new().embed(alert_embed);
-                                let _ = alert_chan.send_message(&ctx.http, msg).await;
-                            }
-                        }
-
-                        let resp = CreateInteractionResponseMessage::new()
-                            .content("✅ Se ha enviado una notificación de llamado a los administradores de guardia.")
-                            .ephemeral(true);
-
-                        component
-                            .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
-                            .await
+                        commands::llamar_admin::handle_llamar_admin_button(
+                            &ctx,
+                            &component,
+                            self.firestore.as_ref(),
+                        )
+                        .await
+                    }
+                    custom if custom.starts_with("admin_respond_btn_") => {
+                        commands::llamar_admin::handle_admin_respond_button(
+                            &ctx,
+                            &component,
+                            &self.config,
+                            self.firestore.as_ref(),
+                        )
+                        .await
                     }
                     "iniciar_recarga_btn" => {
                         let resp = CreateInteractionResponseMessage::new()
@@ -262,6 +269,36 @@ impl EventHandler for BotHandler {
                 if let Err(err) = result {
                     error!(
                         "Error procesando interacción de botón {}: {}",
+                        custom_id, err
+                    );
+                }
+            }
+
+            Interaction::Modal(modal) => {
+                let custom_id = modal.data.custom_id.as_str();
+                info!("Modal enviado por <@{}>: {}", modal.user.id, custom_id);
+
+                let result = if custom_id.starts_with("support_call_modal_") {
+                    commands::llamar_admin::handle_support_call_modal(
+                        &ctx,
+                        &modal,
+                        &self.config,
+                        self.firestore.as_ref(),
+                    )
+                    .await
+                } else {
+                    warn!("Modal no reconocido: {}", custom_id);
+                    let resp = CreateInteractionResponseMessage::new()
+                        .content("Modal no reconocido")
+                        .ephemeral(true);
+                    modal
+                        .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
+                        .await
+                };
+
+                if let Err(err) = result {
+                    error!(
+                        "Error procesando interacción de modal {}: {}",
                         custom_id, err
                     );
                 }

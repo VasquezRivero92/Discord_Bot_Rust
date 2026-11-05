@@ -7,8 +7,16 @@ use firestore::gcloud_sdk::google::firestore::v1::{
     value::ValueType, ArrayValue as PbArrayValue, Document, MapValue as PbMapValue,
     Value as PbValue,
 };
+use firestore::gcloud_sdk::prost_types::Timestamp;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// Construye un centinela JSON `{"$timestamp": "<RFC3339>"}` con la fecha y hora actual en UTC.
+pub fn timestamp_now() -> serde_json::Value {
+    serde_json::json!({
+        "$timestamp": chrono::Utc::now().to_rfc3339()
+    })
+}
 
 /// Convierte un valor de [`serde_json::Value`] al tipo protobuf nativo de Firestore ([`PbValue`]).
 ///
@@ -18,7 +26,7 @@ use std::sync::Mutex;
 /// - `Number` -> `IntegerValue(i)` si cabe en entero, de lo contrario `DoubleValue(f)`
 /// - `String` -> `StringValue(s)`
 /// - `Array` -> `ArrayValue` recursivo
-/// - `Object` -> `MapValue` recursivo
+/// - `Object` -> Si coincide con el centinela `{"$timestamp": "<RFC3339>"}`, se codifica como `TimestampValue`, de lo contrario `MapValue` recursivo
 pub fn json_to_firestore_value(val: &serde_json::Value) -> PbValue {
     let value_type = match val {
         serde_json::Value::Null => ValueType::NullValue(0),
@@ -40,6 +48,19 @@ pub fn json_to_firestore_value(val: &serde_json::Value) -> PbValue {
             ValueType::ArrayValue(PbArrayValue { values })
         }
         serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(serde_json::Value::String(ts_str)) = map.get("$timestamp") {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        let dt_utc = dt.with_timezone(&chrono::Utc);
+                        return PbValue {
+                            value_type: Some(ValueType::TimestampValue(Timestamp {
+                                seconds: dt_utc.timestamp(),
+                                nanos: dt_utc.timestamp_subsec_nanos() as i32,
+                            })),
+                        };
+                    }
+                }
+            }
             let fields = map
                 .iter()
                 .map(|(k, v)| (k.clone(), json_to_firestore_value(v)))
@@ -433,6 +454,45 @@ mod tests {
         assert_eq!(id, "u123");
         let clean = strip_synthetic(decoded);
         assert_eq!(clean, original);
+    }
+
+    #[test]
+    fn test_timestamp_sentinel_roundtrip() {
+        let now_val = timestamp_now();
+        let pb = json_to_firestore_value(&now_val);
+        match &pb.value_type {
+            Some(ValueType::TimestampValue(ts)) => {
+                assert!(ts.seconds > 0);
+            }
+            other => panic!("Esperaba TimestampValue, se obtuvo {:?}", other),
+        }
+
+        let original = json!({
+            "faceit_nickname": "player_ts",
+            "updatedAt": now_val
+        });
+
+        let fields = json_to_document_fields(&original).unwrap();
+        let doc = Document {
+            name: "projects/test/databases/(default)/documents/faceit_users/u_ts".into(),
+            fields,
+            create_time: None,
+            update_time: None,
+        };
+
+        let (id, decoded): (String, serde_json::Value) = decode_document(&doc).unwrap();
+        assert_eq!(id, "u_ts");
+        let updated_at_str = decoded["updatedAt"]
+            .as_str()
+            .expect("TimestampValue debe decodificarse como texto RFC3339");
+        let parsed = chrono::DateTime::parse_from_rfc3339(updated_at_str).expect("RFC3339 valido");
+        let orig_str = now_val["$timestamp"].as_str().unwrap();
+        let orig_parsed = chrono::DateTime::parse_from_rfc3339(orig_str).unwrap();
+        assert_eq!(parsed.timestamp(), orig_parsed.timestamp());
+        assert_eq!(
+            parsed.timestamp_subsec_nanos(),
+            orig_parsed.timestamp_subsec_nanos()
+        );
     }
 
     #[tokio::test]

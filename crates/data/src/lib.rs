@@ -50,4 +50,4 @@ pub use crate::users::{
     FaceitUser, FakeUsersRepo, FirestoreUsersRepo, UsersRepo, USERS_ALL_TTL, USER_TTL,
 };
 pub use crate::watch::WatcherHandle;
-pub use crate::write::{json_to_firestore_value, DocSink, FakeDocSink};
+pub use crate::write::{json_to_firestore_value, timestamp_now, DocSink, FakeDocSink};

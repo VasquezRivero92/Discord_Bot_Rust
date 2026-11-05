@@ -1,9 +1,11 @@
 pub mod desvincular;
 pub mod info;
 pub mod leaderboard;
+pub mod llamar_admin;
 pub mod mixton;
 pub mod mixton_logic;
 pub mod panels;
 pub mod sanciones;
+pub mod sincronizar;
 pub mod stats;
 pub mod verificar;
