@@ -21,6 +21,6 @@ pub use roulette::{
     decide_roulette, random_unit, start_draft_after_roulette, RouletteTimings,
     ROULETTE_DRAFT_DELAY_MS,
 };
-pub use routes::{router, LobbyApiState};
+pub use routes::{resolve_discord_avatar_url, router, LobbyApiState};
 pub use state::{ChatMessage, LobbyManager, LobbyState, LobbyTeam, MapVetoState, Player};
 pub use ws::mixton_ws_handler;

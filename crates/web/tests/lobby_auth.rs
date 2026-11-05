@@ -63,9 +63,13 @@ fn test_router() -> Router {
         ..Default::default()
     });
     let manager = Arc::new(LobbyManager::new("default").with_initial_state("default", initial));
+    let tmp_uploads = tempfile::tempdir().expect("tempdir");
+    let uploads_dir = tmp_uploads.path().to_path_buf();
+    std::mem::forget(tmp_uploads);
     lobby::router(LobbyApiState {
         manager,
         auth: Arc::new(session),
+        uploads_dir,
     })
 }
 

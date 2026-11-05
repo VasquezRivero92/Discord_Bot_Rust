@@ -9,7 +9,7 @@ use crate::state::{
     LobbyManager, LobbyTeam, MapVetoState, Player,
 };
 use axum::{
-    extract::{Path, RawQuery, State},
+    extract::{DefaultBodyLimit, Path, RawQuery, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -23,12 +23,14 @@ use std::sync::Arc;
 pub struct LobbyApiState {
     pub manager: Arc<LobbyManager>,
     pub auth: Arc<dyn SessionVerifier>,
+    pub uploads_dir: std::path::PathBuf,
 }
 
 #[derive(Clone)]
 pub(crate) struct LobbyCtx {
     pub manager: Arc<LobbyManager>,
     pub auth: Arc<dyn SessionVerifier>,
+    pub uploads_dir: std::path::PathBuf,
 }
 
 impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
@@ -40,6 +42,12 @@ impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
 impl axum::extract::FromRef<LobbyCtx> for Arc<dyn SessionVerifier> {
     fn from_ref(ctx: &LobbyCtx) -> Self {
         ctx.auth.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for std::path::PathBuf {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.uploads_dir.clone()
     }
 }
 
@@ -92,24 +100,10 @@ pub struct MapActionPayload {
 pub struct SendChatPayload {
     #[serde(rename = "guildId", default)]
     pub guild_id: Option<String>,
-    #[serde(rename = "authorId", default)]
-    pub author_id: Option<String>,
-    #[serde(rename = "discordId", default)]
-    pub discord_id: Option<String>,
-    #[serde(rename = "authorName", default)]
-    pub author_name: Option<String>,
-    #[serde(rename = "author", default)]
-    pub author: Option<String>,
-    #[serde(rename = "authorAvatar", default)]
-    pub author_avatar: Option<String>,
-    #[serde(rename = "avatar", default)]
-    pub avatar: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(rename = "imageUrl", default)]
-    pub image_url: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -185,6 +179,7 @@ pub fn router(state: LobbyApiState) -> Router {
     let ctx = LobbyCtx {
         manager: state.manager,
         auth: state.auth,
+        uploads_dir: state.uploads_dir,
     };
     Router::new()
         // Estado y lecturas básicas
@@ -277,8 +272,14 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/sync-steam", post(link_steam))
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
-        .route("/api/lobby/mixton-chat-message", post(chat_message))
-        .route("/api/lobby/mixton-chat-send", post(chat_message))
+        .route(
+            "/api/lobby/mixton-chat-message",
+            post(chat_message).layer(DefaultBodyLimit::max(9 * 1024 * 1024)),
+        )
+        .route(
+            "/api/lobby/mixton-chat-send",
+            post(chat_message).layer(DefaultBodyLimit::max(9 * 1024 * 1024)),
+        )
         // Billetera / Recargas
         .route("/api/lobby/quick-add-balance", post(quick_add_balance))
         .route("/api/lobby/wallet/recharge-yape", post(recharge_yape))
@@ -1719,112 +1720,331 @@ async fn chat_history(
     .into_response()
 }
 
+/// Resuelve la URL del avatar de Discord según la lógica del legado de Mixtón:
+/// 1. Si `avatar` empieza por `http://` o `https://`, se devuelve tal cual.
+/// 2. Si `avatar` es hexadecimal/guion bajo (`^[0-9a-fA-F_]+$`) y hay `user_id`, devuelve CDN de Discord.
+/// 3. Si hay `user_id` numérico, calcula el avatar por defecto `(user_id >> 22) % 6`.
+/// 4. En cualquier otro caso, devuelve avatar por defecto 0.
+pub fn resolve_discord_avatar_url(user_id: Option<&str>, avatar: Option<&str>) -> String {
+    if let Some(av) = avatar {
+        if av.starts_with("http://") || av.starts_with("https://") {
+            return av.to_string();
+        }
+        if !av.is_empty() && av.chars().all(|c| c.is_ascii_hexdigit() || c == '_') {
+            if let Some(uid) = user_id {
+                let uid = uid.trim();
+                if !uid.is_empty() {
+                    return format!("https://cdn.discordapp.com/avatars/{uid}/{av}.png?size=128");
+                }
+            }
+        }
+    }
+
+    if let Some(uid) = user_id {
+        let uid = uid.trim();
+        if let Ok(num) = uid.parse::<u128>() {
+            let default_index = ((num >> 22) % 6) as u32;
+            return format!("https://cdn.discordapp.com/embed/avatars/{default_index}.png");
+        }
+    }
+
+    "https://cdn.discordapp.com/embed/avatars/0.png".to_string()
+}
+
+/// Genera una cadena alfanumérica pseudoaleatoria reutilizando `random_unit()` sin dependencias nuevas.
+pub fn random_alphanumeric(len: usize) -> String {
+    const CHARSET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut result = String::with_capacity(len);
+    for _ in 0..len {
+        let u = crate::roulette::random_unit();
+        let idx = (u * CHARSET.len() as f64).floor() as usize % CHARSET.len();
+        result.push(CHARSET[idx] as char);
+    }
+    result
+}
+
 async fn chat_message(
     user: RequireUser,
     State(manager): State<Arc<LobbyManager>>,
+    State(uploads_dir): State<std::path::PathBuf>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
     use axum::extract::FromRequest;
 
     let (parts, body) = req.into_parts();
-    let headers = &parts.headers;
-    let query_str = parts.uri.query();
-    let query_guild = extract_guild_id(query_str);
+    let query_guild = extract_guild_id(parts.uri.query());
 
-    let is_admin = user.is_admin_like();
-
-    let is_multipart = headers
+    let content_type = parts
+        .headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with("multipart/form-data"))
-        .unwrap_or(false);
+        .unwrap_or("");
+    let is_multipart = content_type.starts_with("multipart/form-data");
 
     let mut message_text = String::new();
-    let mut image_url: Option<String> = None;
     let mut body_guild_id: Option<String> = None;
+    let mut saved_image_filename: Option<String> = None;
+    let mut saved_image_path: Option<std::path::PathBuf> = None;
 
     if is_multipart {
         let req_again = axum::extract::Request::from_parts(parts, body);
-        if let Ok(mut multipart) = axum::extract::Multipart::from_request(req_again, &manager).await
+        let mut multipart = match axum::extract::Multipart::from_request(req_again, &manager).await
         {
-            while let Ok(Some(field)) = multipart.next_field().await {
-                let name = field.name().unwrap_or("").to_string();
-                if name == "message" || name == "content" {
-                    if let Ok(text) = field.text().await {
-                        message_text = text;
+            Ok(m) => m,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Solo se permiten archivos de imagen (PNG, JPG, WEBP, GIF)." })),
+                ).into_response();
+            }
+        };
+
+        loop {
+            let field_opt = match multipart.next_field().await {
+                Ok(f) => f,
+                Err(_) => {
+                    // Si falla por límite de tamaño de Axum o error de red
+                    if let Some(ref path) = saved_image_path {
+                        let _ = tokio::fs::remove_file(path).await;
                     }
-                } else if name == "guildId" || name == "guild_id" {
-                    if let Ok(gid) = field.text().await {
-                        body_guild_id = Some(gid);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "El archivo supera el máximo de 8 MB." })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let mut field = match field_opt {
+                Some(f) => f,
+                None => break,
+            };
+
+            let name = field.name().unwrap_or("").to_string();
+            if name == "message" || name == "content" {
+                match field.text().await {
+                    Ok(text) => message_text = text,
+                    Err(_) => {
+                        if let Some(ref path) = saved_image_path {
+                            let _ = tokio::fs::remove_file(path).await;
+                        }
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "El mensaje no puede superar los 400 caracteres." })),
+                        ).into_response();
                     }
-                } else if name == "image" {
-                    let file_name = field.file_name().unwrap_or("image.png").to_string();
-                    let ext = std::path::Path::new(&file_name)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("png");
-                    if let Ok(bytes) = field.bytes().await {
-                        if !bytes.is_empty() {
-                            let filename = format!(
-                                "chat_{}.{}",
-                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                                ext
-                            );
-                            let target_path = format!("public/uploads/{}", filename);
-                            let srv_path = format!("/srv/public/uploads/{}", filename);
-                            let _ = tokio::fs::create_dir_all("public/uploads").await;
-                            let _ = tokio::fs::create_dir_all("/srv/public/uploads").await;
-                            let _ = tokio::fs::write(&target_path, &bytes).await;
-                            let _ = tokio::fs::write(&srv_path, &bytes).await;
-                            image_url = Some(format!("/uploads/{}", filename));
+                }
+            } else if name == "guildId" || name == "guild_id" {
+                if let Ok(gid) = field.text().await {
+                    body_guild_id = Some(gid);
+                }
+            } else if name == "image" {
+                let file_name = field.file_name().unwrap_or("").to_string();
+                let field_ct = field.content_type().unwrap_or("").to_string();
+
+                // Si no hay nombre de archivo ni content-type, puede ser un campo file vacío del formulario
+                if file_name.trim().is_empty() && field_ct.is_empty() {
+                    continue;
+                }
+
+                // 1. Content-type debe empezar por image/
+                if !field_ct.starts_with("image/") {
+                    if let Some(ref path) = saved_image_path {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "Solo se permiten archivos de imagen (PNG, JPG, WEBP, GIF)." })),
+                    ).into_response();
+                }
+
+                // 2. Extensión debe ser png, jpg, jpeg, webp o gif (por defecto png)
+                let ext = std::path::Path::new(&file_name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_else(|| "png".to_string());
+
+                if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
+                    if let Some(ref path) = saved_image_path {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "Solo se permiten archivos de imagen (PNG, JPG, WEBP, GIF)." })),
+                    ).into_response();
+                }
+
+                // 3. Tamaño máximo 8 MiB (8 * 1024 * 1024)
+                const MAX_IMAGE_SIZE: usize = 8 * 1024 * 1024;
+                let mut bytes = Vec::new();
+                let mut exceeded = false;
+
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if bytes.len() + chunk.len() > MAX_IMAGE_SIZE {
+                                exceeded = true;
+                                break;
+                            }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            exceeded = true;
+                            break;
                         }
                     }
+                }
+
+                if exceeded {
+                    if let Some(ref path) = saved_image_path {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "El archivo supera el máximo de 8 MB." })),
+                    )
+                        .into_response();
+                }
+
+                if !bytes.is_empty() {
+                    if let Err(e) = tokio::fs::create_dir_all(&uploads_dir).await {
+                        tracing::error!("Error al crear uploads_dir: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "Error interno del servidor al procesar el archivo." })),
+                        ).into_response();
+                    }
+
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let rand_suffix = random_alphanumeric(6);
+                    let safe_name = format!("chat_{}_{}.{}", now_ms, rand_suffix, ext);
+                    let target = uploads_dir.join(&safe_name);
+
+                    if let Err(e) = tokio::fs::write(&target, &bytes).await {
+                        tracing::error!("Error al escribir imagen en disco: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "Error interno del servidor al guardar el archivo." })),
+                        ).into_response();
+                    }
+
+                    if let Some(ref prev_path) = saved_image_path {
+                        let _ = tokio::fs::remove_file(prev_path).await;
+                    }
+
+                    saved_image_path = Some(target);
+                    saved_image_filename = Some(safe_name);
                 }
             }
         }
     } else {
-        let bytes = axum::body::to_bytes(body, 1024 * 64)
-            .await
-            .unwrap_or_default();
+        let bytes = match axum::body::to_bytes(body, 1024 * 64).await {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Cuerpo de solicitud inválido." })),
+                )
+                    .into_response();
+            }
+        };
+
         if let Ok(payload) = serde_json::from_slice::<SendChatPayload>(&bytes) {
-            message_text = payload
-                .message
-                .or(payload.content)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            message_text = payload.message.or(payload.content).unwrap_or_default();
             body_guild_id = payload.guild_id;
-            image_url = payload.image_url;
         }
     }
 
-    let did = user.user_id.clone();
-    let name = user.username.clone();
-    let avatar = format_discord_avatar(&did, user.avatar.as_deref());
+    let text = message_text.trim();
+    let has_image = saved_image_filename.is_some();
 
-    if message_text.is_empty() && image_url.is_none() {
+    // Validación de texto o imagen
+    if text.is_empty() && !has_image {
+        if let Some(ref path) = saved_image_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "El mensaje no puede estar vacío." })),
+            Json(json!({ "error": "El mensaje debe contener texto o una imagen." })),
         )
             .into_response();
     }
 
+    // Validación de longitud máxima (conteo de caracteres, no bytes)
+    if text.chars().count() > 400 {
+        if let Some(ref path) = saved_image_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "El mensaje no puede superar los 400 caracteres." })),
+        )
+            .into_response();
+    }
+
+    // Límite de frecuencia: máximo 1 mensaje por segundo por usuario
+    if !manager
+        .check_and_update_chat_rate_limit(&user.user_id)
+        .await
+    {
+        if let Some(ref path) = saved_image_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Por favor espera un segundo antes de enviar otro mensaje." })),
+        )
+            .into_response();
+    }
+
+    // Resolución del servidor/guild
     let effective_gid = body_guild_id.or(query_guild);
     let guild_opt = match resolve_guild_for_user(&user, effective_gid.as_deref(), false) {
         Ok(g) => g,
-        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            if let Some(ref path) = saved_image_path {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response();
+        }
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    // Identidad asegurada desde el usuario autenticado
+    let did = user.user_id.clone();
+    let author_name = if let Some(nick) = user.nickname.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        nick.to_string()
+    } else if let Some(fnick) = user
+        .faceit_nickname
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        fnick.to_string()
+    } else if !user.username.trim().is_empty() {
+        user.username.clone()
+    } else {
+        "Jugador".to_string()
+    };
+
+    let avatar_url = resolve_discord_avatar_url(Some(&did), user.avatar.as_deref());
     let now = chrono::Utc::now().timestamp_millis();
+    let id = format!("web_{}_{}", now, random_alphanumeric(5));
+    let image_url = saved_image_filename.map(|f| format!("/uploads/chat/{f}"));
+    let is_admin = user.is_admin_like();
+
+    // TODO: reenviar a Discord (requiere crates/bot)
+
     let msg = ChatMessage {
-        id: format!("msg_{now}"),
+        id,
         discord_id: did,
-        author: name,
-        avatar: Some(avatar),
+        author: author_name,
+        avatar: Some(avatar_url),
         is_admin,
         source: "web".to_string(),
-        content: message_text,
+        content: text.to_string(),
         image_url,
         timestamp: now,
     };
@@ -1852,4 +2072,56 @@ async fn link_steam(
         "steamId64": "76561198000000000"
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_random_alphanumeric_length_and_chars() {
+        let s = random_alphanumeric(6);
+        assert_eq!(s.len(), 6);
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        let s5 = random_alphanumeric(5);
+        assert_eq!(s5.len(), 5);
+        assert!(s5.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_resolve_discord_avatar_url_all_branches() {
+        // 1. HTTP / HTTPS
+        assert_eq!(
+            resolve_discord_avatar_url(Some("1"), Some("https://example.com/a.png")),
+            "https://example.com/a.png"
+        );
+        assert_eq!(
+            resolve_discord_avatar_url(Some("1"), Some("http://example.com/a.png")),
+            "http://example.com/a.png"
+        );
+
+        // 2. Hex/underscore con user_id
+        assert_eq!(
+            resolve_discord_avatar_url(Some("123"), Some("a_feedface_01")),
+            "https://cdn.discordapp.com/avatars/123/a_feedface_01.png?size=128"
+        );
+
+        // 3. user_id numérico sin avatar
+        // (803378680482594817 >> 22) % 6 = 1
+        assert_eq!(
+            resolve_discord_avatar_url(Some("803378680482594817"), None),
+            "https://cdn.discordapp.com/embed/avatars/1.png"
+        );
+
+        // 4. Fallback default 0
+        assert_eq!(
+            resolve_discord_avatar_url(None, None),
+            "https://cdn.discordapp.com/embed/avatars/0.png"
+        );
+        assert_eq!(
+            resolve_discord_avatar_url(Some("no_es_numero"), None),
+            "https://cdn.discordapp.com/embed/avatars/0.png"
+        );
+    }
 }

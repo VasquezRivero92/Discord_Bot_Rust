@@ -439,6 +439,16 @@ impl lobby::auth::SessionVerifier for SessionState {
             },
             servidor: claims.servidor,
             is_admin: claims.is_admin,
+            nickname: claims
+                .extra
+                .get("nickname")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            faceit_nickname: claims
+                .extra
+                .get("faceit_nickname")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
     }
 }

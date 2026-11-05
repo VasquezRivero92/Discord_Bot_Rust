@@ -15,7 +15,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 /// Representación del usuario autenticado en el contexto del lobby.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LobbyUser {
     pub user_id: String,
     pub username: String,
@@ -23,6 +23,10 @@ pub struct LobbyUser {
     pub role: Option<String>,
     pub servidor: Option<String>,
     pub is_admin: bool,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub faceit_nickname: Option<String>,
 }
 
 impl LobbyUser {
@@ -264,6 +268,7 @@ mod tests {
                     role: None,
                     servidor: None,
                     is_admin: false,
+                    ..Default::default()
                 }),
                 "admin-guild-token" => Some(LobbyUser {
                     user_id: "u2".to_string(),
@@ -272,6 +277,7 @@ mod tests {
                     role: Some("admin".to_string()),
                     servidor: Some("guild-123".to_string()),
                     is_admin: false,
+                    ..Default::default()
                 }),
                 "global-admin-token" => Some(LobbyUser {
                     user_id: "u3".to_string(),
@@ -280,6 +286,7 @@ mod tests {
                     role: Some("global_admin".to_string()),
                     servidor: None,
                     is_admin: false,
+                    ..Default::default()
                 }),
                 _ => None,
             }
@@ -304,6 +311,7 @@ mod tests {
             role: None,
             servidor: None,
             is_admin: false,
+            ..Default::default()
         };
         assert!(!user_normal.is_admin_like());
 
@@ -335,6 +343,7 @@ mod tests {
             role: Some("admin".into()),
             servidor: Some("guild_official".into()),
             is_admin: false,
+            ..Default::default()
         };
 
         // Mismo servidor que servidor asignado -> Ok
@@ -375,6 +384,7 @@ mod tests {
             role: None,
             servidor: None,
             is_admin: false,
+            ..Default::default()
         };
         assert_eq!(
             resolve_guild_for_user(&normal_user, Some("any_guild"), false),
@@ -389,6 +399,7 @@ mod tests {
             role: Some("global_admin".into()),
             servidor: None,
             is_admin: false,
+            ..Default::default()
         };
         assert_eq!(
             resolve_guild_for_user(&global_admin, Some("any_guild"), true),

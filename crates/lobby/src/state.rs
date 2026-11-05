@@ -463,6 +463,7 @@ pub struct LobbyManager {
     chats: Arc<RwLock<HashMap<String, Vec<ChatMessage>>>>,
     channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
     roulette_tasks: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    user_last_message_time: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
     default_guild_id: String,
 }
 
@@ -473,6 +474,7 @@ impl LobbyManager {
             chats: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             roulette_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            user_last_message_time: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             default_guild_id: default_guild_id.into(),
         }
     }
@@ -811,7 +813,7 @@ impl LobbyManager {
         let mut chats = self.chats.write().await;
         let history = chats.entry(guild_id.to_string()).or_default();
         history.push(msg.clone());
-        if history.len() > 100 {
+        if history.len() > 60 {
             history.remove(0);
         }
         drop(chats);
@@ -824,6 +826,21 @@ impl LobbyManager {
 
         let tx = self.get_broadcast_channel(guild_id).await;
         let _ = tx.send(payload);
+    }
+
+    /// Comprueba el límite de frecuencia de mensajes (máximo 1 mensaje por segundo por usuario).
+    /// Si ha transcurrido al menos un segundo desde el último mensaje, actualiza la marca temporal
+    /// y devuelve `true`. Si no ha transcurrido un segundo, devuelve `false`.
+    pub async fn check_and_update_chat_rate_limit(&self, user_id: &str) -> bool {
+        let mut times = self.user_last_message_time.lock().await;
+        let now = std::time::Instant::now();
+        if let Some(last) = times.get(user_id) {
+            if now.duration_since(*last) < std::time::Duration::from_secs(1) {
+                return false;
+            }
+        }
+        times.insert(user_id.to_string(), now);
+        true
     }
 }
 
@@ -874,5 +891,42 @@ mod tests {
         let veto = s.map_veto.unwrap();
         assert!(veto.banned_maps.contains(&"de_mirage".to_string()));
         assert_eq!(veto.turn, "team_2");
+    }
+
+    #[tokio::test]
+    async fn test_chat_history_caps_at_60_messages() {
+        let mgr = LobbyManager::new("guild_1");
+        for i in 0..70 {
+            mgr.add_chat_message(
+                "guild_1",
+                ChatMessage {
+                    id: format!("msg_{i}"),
+                    discord_id: "u1".into(),
+                    author: "Tester".into(),
+                    avatar: None,
+                    is_admin: false,
+                    source: "web".into(),
+                    content: format!("msg {i}"),
+                    image_url: None,
+                    timestamp: i as i64,
+                },
+            )
+            .await;
+        }
+
+        let history = mgr.get_chat_history("guild_1").await;
+        assert_eq!(history.len(), 60);
+        assert_eq!(history.first().unwrap().id, "msg_10");
+        assert_eq!(history.last().unwrap().id, "msg_69");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_enforces_one_second() {
+        let mgr = LobbyManager::new("guild_1");
+        assert!(mgr.check_and_update_chat_rate_limit("u1").await);
+        // Segundo intento inmediato -> rechazado
+        assert!(!mgr.check_and_update_chat_rate_limit("u1").await);
+        // Otro usuario -> aceptado
+        assert!(mgr.check_and_update_chat_rate_limit("u2").await);
     }
 }

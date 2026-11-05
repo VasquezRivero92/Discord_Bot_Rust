@@ -135,6 +135,7 @@ pub fn build_app(deps: AppDeps) -> Router {
         migrated = migrated.merge(lobby::router(lobby::LobbyApiState {
             manager: lobby_mgr,
             auth: lobby_auth,
+            uploads_dir: cfg.static_dir.join("uploads").join("chat"),
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
