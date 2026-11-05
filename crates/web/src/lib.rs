@@ -148,6 +148,10 @@ pub fn build_app(deps: AppDeps) -> Router {
                     Arc::new(lobby::auth::DenyAllVerifier)
                 }
             };
+        let bets_enabled = deps.wallet.is_some()
+            && deps.docs.is_some()
+            && deps.source.is_some()
+            && cfg.cs2_api_secret.is_some();
         migrated = migrated.merge(lobby::router(lobby::LobbyApiState {
             manager: lobby_mgr,
             auth: lobby_auth,
@@ -156,6 +160,7 @@ pub fn build_app(deps: AppDeps) -> Router {
             docs: deps.docs,
             notifier: deps.notifier,
             wallet: deps.wallet,
+            bets_enabled,
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before

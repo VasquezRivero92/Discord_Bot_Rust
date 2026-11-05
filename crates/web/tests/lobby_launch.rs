@@ -91,6 +91,7 @@ fn test_router_with_notifier(
         docs,
         notifier,
         wallet: None,
+        bets_enabled: false,
     })
 }
 

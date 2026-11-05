@@ -28,6 +28,7 @@ pub struct LobbyApiState {
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
     pub notifier: crate::notify::NotifierSlot,
     pub wallet: Option<std::sync::Arc<dyn data::WalletStore>>,
+    pub bets_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -39,6 +40,7 @@ pub(crate) struct LobbyCtx {
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
     pub notifier: crate::notify::NotifierSlot,
     pub wallet: Option<std::sync::Arc<dyn data::WalletStore>>,
+    pub bets_enabled: bool,
 }
 
 impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
@@ -80,6 +82,12 @@ impl axum::extract::FromRef<LobbyCtx> for crate::notify::NotifierSlot {
 impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<dyn data::WalletStore>> {
     fn from_ref(ctx: &LobbyCtx) -> Self {
         ctx.wallet.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for bool {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.bets_enabled
     }
 }
 
@@ -218,6 +226,7 @@ pub fn router(state: LobbyApiState) -> Router {
         docs: state.docs,
         notifier: state.notifier,
         wallet: state.wallet,
+        bets_enabled: state.bets_enabled,
     };
     Router::new()
         // Estado y lecturas básicas
@@ -2001,6 +2010,8 @@ async fn mixton_create_match(
     State(manager): State<Arc<LobbyManager>>,
     State(cs2): State<Option<Arc<cs2::Cs2ServerManager>>>,
     State(docs): State<Option<Arc<dyn data::DocSink>>>,
+    State(wallet): State<Option<Arc<dyn data::WalletStore>>>,
+    State(bets_enabled): State<bool>,
     State(notifier_slot): State<crate::notify::NotifierSlot>,
     Json(payload): Json<crate::launch::LaunchRequest>,
 ) -> impl IntoResponse {
@@ -2028,7 +2039,7 @@ async fn mixton_create_match(
 
     let state = manager.get_state(guild_id).await;
 
-    let plan = match crate::launch::validate_launch(&state, &payload, &user) {
+    let plan = match crate::launch::validate_launch(&state, &payload, &user, bets_enabled) {
         Ok(plan) => plan,
         Err((code, msg)) => {
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
@@ -2073,6 +2084,281 @@ async fn mixton_create_match(
         }
     };
 
+    let server_ip = cs2.get_server_ip_for_port(port);
+
+    let faction1_roster: Vec<serde_json::Value> = plan
+        .full_roster_a
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.faceit_player_id.as_deref(),
+                "nickname": crate::launch::player_display_name(p),
+                "discord_id": p.discord_id,
+                "steam_id_64": p.steam_id_64,
+            })
+        })
+        .collect();
+
+    let faction2_roster: Vec<serde_json::Value> = plan
+        .full_roster_b
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.faceit_player_id.as_deref(),
+                "nickname": crate::launch::player_display_name(p),
+                "discord_id": p.discord_id,
+                "steam_id_64": p.steam_id_64,
+            })
+        })
+        .collect();
+
+    let entity_custom_name = if plan.bet_per_player > 0.0 {
+        format!("Mixton Apuesta (S/ {:.2})", plan.bet_per_player)
+    } else {
+        "Mixton / Web".to_string()
+    };
+
+    let active_match_doc = json!({
+        "id": match_id,
+        "entity_custom_name": entity_custom_name,
+        "game": "cs2",
+        "map": plan.map_name,
+        "chosen_map": plan.map_name,
+        "location": "Mixton",
+        "faction1_name": plan.team_a_name,
+        "faction2_name": plan.team_b_name,
+        "faction1_roster": faction1_roster,
+        "faction2_roster": faction2_roster,
+        "faction1_vc_id": serde_json::Value::Null,
+        "faction2_vc_id": serde_json::Value::Null,
+        "message_id": serde_json::Value::Null,
+        "matches_channel_id": serde_json::Value::Null,
+        "waiting_room_id": serde_json::Value::Null,
+        "queue_id": "steam",
+        "queue_name": "Servidor CS2 Dedicado",
+        "launch_mode": "steam",
+        "original_voice_states": json!({}),
+        "creator_id": user.user_id,
+        "guild_id": guild_id,
+        "bet_amount_per_player": plan.bet_per_player,
+        "total_pot": data::round2(plan.bet_per_player * 10.0),
+        "manual_paid_players": plan.manual_paid,
+        "games_per_match": plan.games_per_match,
+        "rounds_per_game": plan.games_per_match,
+        "tournament_match_id": serde_json::Value::Null,
+        "assignedPort": port,
+        "serverIp": server_ip,
+        "startedAt": now_ms,
+        "createdAt": data::timestamp_now(),
+    });
+
+    let all_players: Vec<&Player> = plan
+        .full_roster_a
+        .iter()
+        .chain(plan.full_roster_b.iter())
+        .collect();
+
+    let manual_paid_set: std::collections::HashSet<&str> =
+        plan.manual_paid.iter().map(|s| s.as_str()).collect();
+
+    if plan.bet_per_player > 0.0 {
+        let bet = plan.bet_per_player;
+        let (wallet_store, doc_sink) = match (wallet.as_ref(), docs.as_ref()) {
+            (Some(w), Some(d)) => (w, d),
+            _ => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "El servicio de monedero o base de datos no está disponible." })),
+                )
+                    .into_response();
+            }
+        };
+
+        // 3.a) Verificación previa de saldos para todos los jugadores no manuales
+        let all_discord_ids: Vec<String> =
+            all_players.iter().map(|p| p.discord_id.clone()).collect();
+        // Si la lectura falla NO se asume saldo 0: se responde error y no se cobra a nadie.
+        let users_data_map = match wallet_store
+            .users_map(Some(guild_id), &all_discord_ids)
+            .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!("[mixton_create_match] No se pudieron leer los saldos: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Error al verificar los saldos de los jugadores." })),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut unpaid_players = Vec::new();
+        for p in &all_players {
+            if manual_paid_set.contains(p.discord_id.as_str()) {
+                continue;
+            }
+
+            let balance = users_data_map
+                .get(&p.discord_id)
+                .and_then(|u| {
+                    u.get("wallet_balance").and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_i64().map(|i| i as f64))
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    })
+                })
+                .unwrap_or(0.0);
+            let balance = data::round2(balance);
+
+            if balance < bet {
+                let nick = crate::launch::player_bet_display_nick(p);
+                let deficit = data::round2(bet - balance);
+                unpaid_players.push(json!({
+                    "discordId": p.discord_id,
+                    "nickname": nick,
+                    "balance": balance,
+                    "deficit": deficit,
+                }));
+            }
+        }
+
+        if !unpaid_players.is_empty() {
+            let names = unpaid_players
+                .iter()
+                .map(|u| {
+                    let nick = u["nickname"].as_str().unwrap_or("Jugador");
+                    let balance = u["balance"].as_f64().unwrap_or(0.0);
+                    let deficit = u["deficit"].as_f64().unwrap_or(0.0);
+                    format!("{nick} (Saldo: S/ {balance:.2}, Falta: S/ {deficit:.2})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let count = unpaid_players.len();
+            let error_msg = format!(
+                "No se puede lanzar el encuentro: Faltan {count} jugador(es) por completar su cuota: {names}"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": error_msg,
+                    "unpaidPlayers": unpaid_players,
+                })),
+            )
+                .into_response();
+        }
+
+        // 3.b) Cobro de cuotas para jugadores no manuales
+        let debit_reason = format!(
+            "Entrada cuota de apuesta mixton: {} vs {}",
+            plan.team_a_name, plan.team_b_name
+        );
+        let mut charged_discord_ids: Vec<String> = Vec::new();
+
+        for p in &all_players {
+            if manual_paid_set.contains(p.discord_id.as_str()) {
+                continue;
+            }
+
+            match wallet_store
+                .debit_exact(Some(guild_id), &p.discord_id, bet, &debit_reason)
+                .await
+            {
+                Ok(_) => {
+                    charged_discord_ids.push(p.discord_id.clone());
+                }
+                Err(e) => {
+                    // Reembolsar a todos los cobrados antes de responder
+                    let refund_reason = "Reembolso por fallo al lanzar partida mixton";
+                    for id in &charged_discord_ids {
+                        if let Err(re) = wallet_store
+                            .adjust(Some(guild_id), id, bet, refund_reason)
+                            .await
+                        {
+                            tracing::error!(
+                                "[mixton_create_match] Fallo al reembolsar cuota a {id} por monto {bet}: {re}"
+                            );
+                        }
+                    }
+
+                    match e {
+                        data::WalletError::Insufficient { balance } => {
+                            let nick = crate::launch::player_bet_display_nick(p);
+                            let balance = data::round2(balance);
+                            let deficit = data::round2(bet - balance);
+                            let names =
+                                format!("{nick} (Saldo: S/ {balance:.2}, Falta: S/ {deficit:.2})");
+                            let error_msg = format!(
+                                "No se puede lanzar el encuentro: Faltan 1 jugador(es) por completar su cuota: {names}"
+                            );
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": error_msg,
+                                    "unpaidPlayers": [{
+                                        "discordId": p.discord_id,
+                                        "nickname": nick,
+                                        "balance": balance,
+                                        "deficit": deficit,
+                                    }],
+                                })),
+                            )
+                                .into_response();
+                        }
+                        data::WalletError::Store(_) | data::WalletError::Invalid(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({ "error": "Error al cobrar la cuota de apuesta." })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3.c) Registro en Firestore ANTES de publish_match
+        if let Err(e) = doc_sink
+            .set_doc("faceit_active_matches", &match_id, &active_match_doc)
+            .await
+        {
+            tracing::error!(
+                "[mixton_create_match] Error al escribir en Firestore faceit_active_matches: {e}"
+            );
+            let refund_reason = "Reembolso por fallo al lanzar partida mixton";
+            for id in &charged_discord_ids {
+                if let Err(re) = wallet_store
+                    .adjust(Some(guild_id), id, bet, refund_reason)
+                    .await
+                {
+                    tracing::error!(
+                        "[mixton_create_match] Fallo al reembolsar cuota a {id} por monto {bet}: {re}"
+                    );
+                }
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "No se pudo registrar la partida. Se reembolsó la cuota."
+                })),
+            )
+                .into_response();
+        }
+    } else {
+        // Con bet == 0 se mantiene el comportamiento actual: error solo en log
+        if let Some(ref doc_sink) = docs {
+            if let Err(e) = doc_sink
+                .set_doc("faceit_active_matches", &match_id, &active_match_doc)
+                .await
+            {
+                tracing::error!(
+                    "[mixton_create_match] Error al escribir en Firestore faceit_active_matches: {e}"
+                );
+            }
+        }
+    }
+
+    // 3.d) Solo entonces publish_match, configure_match y el spawn de start_server como hoy
     cs2.publish_match(
         match_id.clone(),
         Some(port),
@@ -2116,73 +2402,6 @@ async fn mixton_create_match(
         }
     });
 
-    if let Some(ref doc_sink) = docs {
-        let entity_custom_name = if plan.bet_per_player > 0.0 {
-            format!("Mixton Apuesta (S/ {:.2})", plan.bet_per_player)
-        } else {
-            "Mixton / Web".to_string()
-        };
-
-        let faction1_roster: Vec<serde_json::Value> = plan
-            .full_roster_a
-            .iter()
-            .map(|p| {
-                json!({
-                    "id": p.faceit_player_id.as_deref(),
-                    "nickname": crate::launch::player_display_name(p),
-                    "discord_id": p.discord_id,
-                    "steam_id_64": p.steam_id_64,
-                })
-            })
-            .collect();
-
-        let faction2_roster: Vec<serde_json::Value> = plan
-            .full_roster_b
-            .iter()
-            .map(|p| {
-                json!({
-                    "id": p.faceit_player_id.as_deref(),
-                    "nickname": crate::launch::player_display_name(p),
-                    "discord_id": p.discord_id,
-                    "steam_id_64": p.steam_id_64,
-                })
-            })
-            .collect();
-
-        let doc = json!({
-            "id": match_id,
-            "entity_custom_name": entity_custom_name,
-            "game": "cs2",
-            "map": plan.map_name,
-            "location": "Mixton",
-            "faction1_name": plan.team_a_name,
-            "faction2_name": plan.team_b_name,
-            "faction1_roster": faction1_roster,
-            "faction2_roster": faction2_roster,
-            "faction1_vc_id": serde_json::Value::Null,
-            "faction2_vc_id": serde_json::Value::Null,
-            "message_id": serde_json::Value::Null,
-            "matches_channel_id": serde_json::Value::Null,
-            "waiting_room_id": serde_json::Value::Null,
-            "queue_id": "steam",
-            "queue_name": "Servidor CS2 Dedicado",
-            "original_voice_states": json!({}),
-            "creator_id": user.user_id,
-            "guild_id": guild_id,
-            "startedAt": now_ms,
-            "createdAt": data::timestamp_now(),
-        });
-
-        if let Err(e) = doc_sink
-            .set_doc("faceit_active_matches", &match_id, &doc)
-            .await
-        {
-            tracing::error!(
-                "[mixton_create_match] Error al escribir en Firestore faceit_active_matches: {e}"
-            );
-        }
-    }
-
     // Lee el estado fresco del lobby para evitar pisar cambios concurrentes
     let mut fresh_state = manager.get_state(guild_id).await;
     let fresh_team_a = fresh_state.teams.iter().find(|t| t.id == plan.team_a_id);
@@ -2210,8 +2429,6 @@ async fn mixton_create_match(
             "[mixton_create_match] Los capitanes del lobby cambiaron o los equipos ya no existen en guild {guild_id}; se omite el reinicio del lobby"
         );
     }
-
-    let server_ip = cs2.get_server_ip_for_port(port);
 
     // Notificación en Discord si hay un notificador registrado
     if let Some(notifier) = notifier_slot.get().cloned() {

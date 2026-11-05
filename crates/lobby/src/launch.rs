@@ -127,6 +127,24 @@ pub fn player_display_name(p: &Player) -> String {
     p.discord_id.clone()
 }
 
+/// Retorna el nickname visible para reportar faltantes de saldo en apuestas.
+/// Sigue la jerarquía del legado: `faceit_nickname` -> `discord_user.display_name` -> "Jugador".
+pub fn player_bet_display_nick(p: &Player) -> &str {
+    if let Some(ref fnick) = p.faceit_nickname {
+        let trimmed = fnick.trim();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    if let Some(ref du) = p.discord_user {
+        let trimmed = du.display_name.trim();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    "Jugador"
+}
+
 /// Genera el tag del equipo a partir del nombre del capitán:
 /// caracteres alfanuméricos en mayúsculas (máximo 4 letras), o un fallback ("EQ1"/"EQ2").
 pub fn derive_team_tag(name: &str, fallback: &str) -> String {
@@ -160,6 +178,7 @@ pub fn validate_launch(
     state: &LobbyState,
     req: &LaunchRequest,
     user: &LobbyUser,
+    bets_enabled: bool,
 ) -> Result<LaunchPlan, (u16, String)> {
     // 1. Falta teamIdA o teamIdB -> 400 "Debes seleccionar dos equipos."
     let team_a_id = match req
@@ -251,6 +270,14 @@ pub fn validate_launch(
     }
     roster_b.extend(team_b.players.iter().cloned());
 
+    // Validación defensiva: discord_id repetidos entre los 10 jugadores -> 400 "Hay jugadores repetidos en los equipos."
+    let mut seen_discord_ids = std::collections::HashSet::new();
+    for p in roster_a.iter().chain(roster_b.iter()) {
+        if !seen_discord_ids.insert(p.discord_id.as_str()) {
+            return Err((400, "Hay jugadores repetidos en los equipos.".to_string()));
+        }
+    }
+
     // 7. Apuesta efectiva: admin -> max(0, bet_amount); no admin -> apuesta acordada
     // (state.bet_agreed && agreed_bet_amount.is_some() -> agreed; si no effective_bet_amount; si no veto.bet_amount; si no 0).
     // Si apuesta > 0 y NO todos los 10 jugadores están en manual_paid_discord_ids (solo cuenta si es admin) -> 400
@@ -276,7 +303,7 @@ pub fn validate_launch(
         std::collections::HashSet::new()
     };
 
-    if effective_bet > 0.0 {
+    if effective_bet > 0.0 && !bets_enabled {
         let all_paid = roster_a
             .iter()
             .chain(roster_b.iter())
@@ -596,7 +623,7 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(err, (400, "Debes seleccionar dos equipos.".to_string()));
 
         let req2 = LaunchRequest {
@@ -604,7 +631,7 @@ mod tests {
             team_id_b: Some("   ".into()),
             ..Default::default()
         };
-        let err2 = validate_launch(&state, &req2, &user).unwrap_err();
+        let err2 = validate_launch(&state, &req2, &user, false).unwrap_err();
         assert_eq!(err2, (400, "Debes seleccionar dos equipos.".to_string()));
     }
 
@@ -619,7 +646,7 @@ mod tests {
             match_mode: "custom".into(),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(
             err,
             (
@@ -639,7 +666,7 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(err, (404, "Equipos no encontrados.".to_string()));
     }
 
@@ -653,7 +680,7 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(
             err,
             (
@@ -675,8 +702,8 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        assert!(validate_launch(&state, &req, &cap).is_ok());
-        assert!(validate_launch(&state, &req, &admin).is_ok());
+        assert!(validate_launch(&state, &req, &cap, false).is_ok());
+        assert!(validate_launch(&state, &req, &admin, false).is_ok());
     }
 
     #[test]
@@ -690,7 +717,7 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(
             err,
             (
@@ -711,7 +738,7 @@ mod tests {
             match_mode: "faceit".into(),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(
             err,
             (
@@ -734,7 +761,7 @@ mod tests {
             team_id_b: Some("team_2".into()),
             ..Default::default()
         };
-        let err = validate_launch(&state, &req, &user).unwrap_err();
+        let err = validate_launch(&state, &req, &user, false).unwrap_err();
         assert_eq!(
             err,
             (
@@ -758,7 +785,7 @@ mod tests {
             manual_paid_discord_ids: vec!["cap_a".into()],
             ..Default::default()
         };
-        let err1 = validate_launch(&state, &req1, &admin).unwrap_err();
+        let err1 = validate_launch(&state, &req1, &admin, false).unwrap_err();
         assert_eq!(
             err1,
             (
@@ -789,7 +816,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err2 = validate_launch(&state_with_agreed_bet, &req2, &cap).unwrap_err();
+        let err2 = validate_launch(&state_with_agreed_bet, &req2, &cap, false).unwrap_err();
         assert_eq!(
             err2,
             (
@@ -799,7 +826,7 @@ mod tests {
         );
 
         // Admin marca a los 10 jugadores como pagados -> Ok
-        let res3 = validate_launch(&state, &req2, &admin).unwrap();
+        let res3 = validate_launch(&state, &req2, &admin, false).unwrap();
         assert_eq!(res3.bet_per_player, 10.0);
         assert_eq!(res3.manual_paid.len(), 10);
     }
@@ -816,7 +843,7 @@ mod tests {
             chosen_map: Some(serde_json::json!({ "id": "de_inferno", "name": "Inferno" })),
             ..Default::default()
         };
-        let plan = validate_launch(&state, &req, &admin).unwrap();
+        let plan = validate_launch(&state, &req, &admin, false).unwrap();
         assert_eq!(plan.map_name, "Inferno");
         assert_eq!(plan.map_id, "de_inferno");
 
@@ -857,7 +884,7 @@ mod tests {
             chosen_map: None,
             ..Default::default()
         };
-        let plan2 = validate_launch(&state, &req2, &admin).unwrap();
+        let plan2 = validate_launch(&state, &req2, &admin, false).unwrap();
         assert_eq!(plan2.map_name, "Dust II");
         assert_eq!(plan2.map_id, "de_dust2");
 
@@ -871,13 +898,13 @@ mod tests {
             active: true,
             is_official_premier: true,
         }];
-        let plan3 = validate_launch(&state, &req2, &admin).unwrap();
+        let plan3 = validate_launch(&state, &req2, &admin, false).unwrap();
         assert_eq!(plan3.map_name, "Nuke");
         assert_eq!(plan3.map_id, "de_nuke");
 
         // 4. Fallback de_mirage cuando catalog vacío
         state.map_catalog.clear();
-        let plan4 = validate_launch(&state, &req2, &admin).unwrap();
+        let plan4 = validate_launch(&state, &req2, &admin, false).unwrap();
         assert_eq!(plan4.map_name, "Mirage");
         assert_eq!(plan4.map_id, "de_mirage");
     }
@@ -894,7 +921,7 @@ mod tests {
 
         state.games_per_match = 3;
         assert_eq!(
-            validate_launch(&state, &req, &admin)
+            validate_launch(&state, &req, &admin, false)
                 .unwrap()
                 .games_per_match,
             3
@@ -902,11 +929,94 @@ mod tests {
 
         state.games_per_match = 7; // No permitido -> 1
         assert_eq!(
-            validate_launch(&state, &req, &admin)
+            validate_launch(&state, &req, &admin, false)
                 .unwrap()
                 .games_per_match,
             1
         );
+    }
+
+    #[test]
+    fn test_default_bet_amount_is_zero() {
+        let req = LaunchRequest::default();
+        assert_eq!(req.bet_amount, 0.0);
+    }
+
+    #[test]
+    fn test_validate_launch_repeated_players_error() {
+        let mut state = complete_state_with_steams();
+        let admin = admin_user();
+        // Repetir el jugador cap_a dentro del mismo equipo
+        state.teams[0].players[0].discord_id = "cap_a".into();
+        let req = LaunchRequest {
+            team_id_a: Some("team_1".into()),
+            team_id_b: Some("team_2".into()),
+            ..Default::default()
+        };
+        let err = validate_launch(&state, &req, &admin, false).unwrap_err();
+        assert_eq!(
+            err,
+            (400, "Hay jugadores repetidos en los equipos.".to_string())
+        );
+
+        // Repetido entre equipo A y equipo B
+        let mut state2 = complete_state_with_steams();
+        state2.teams[1].players[0].discord_id = "cap_a".into();
+        let err2 = validate_launch(&state2, &req, &admin, true).unwrap_err();
+        assert_eq!(
+            err2,
+            (400, "Hay jugadores repetidos en los equipos.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_launch_bets_enabled_flag() {
+        let state = complete_state_with_steams();
+        let admin = admin_user();
+        let req = LaunchRequest {
+            team_id_a: Some("team_1".into()),
+            team_id_b: Some("team_2".into()),
+            bet_amount: 10.0,
+            ..Default::default()
+        };
+
+        // Con bets_enabled = false y sin manual_paid -> rechaza
+        let err = validate_launch(&state, &req, &admin, false).unwrap_err();
+        assert_eq!(
+            err,
+            (
+                400,
+                "Las apuestas con saldo aún no están disponibles en esta versión. Un administrador debe marcar a todos los jugadores como pagados manualmente o lanzar sin apuesta.".to_string()
+            )
+        );
+
+        // Con bets_enabled = true y sin manual_paid -> pasa
+        let plan = validate_launch(&state, &req, &admin, true).unwrap();
+        assert_eq!(plan.bet_per_player, 10.0);
+        assert!(plan.manual_paid.is_empty());
+
+        // Con bets_enabled = false pero admin marca a los 10 -> pasa
+        let req_all_paid = LaunchRequest {
+            team_id_a: Some("team_1".into()),
+            team_id_b: Some("team_2".into()),
+            bet_amount: 10.0,
+            manual_paid_discord_ids: vec![
+                "cap_a".into(),
+                "a1".into(),
+                "a2".into(),
+                "a3".into(),
+                "a4".into(),
+                "cap_b".into(),
+                "b1".into(),
+                "b2".into(),
+                "b3".into(),
+                "b4".into(),
+            ],
+            ..Default::default()
+        };
+        let plan2 = validate_launch(&state, &req_all_paid, &admin, false).unwrap();
+        assert_eq!(plan2.bet_per_player, 10.0);
+        assert_eq!(plan2.manual_paid.len(), 10);
     }
 
     #[test]

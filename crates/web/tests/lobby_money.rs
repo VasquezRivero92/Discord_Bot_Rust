@@ -57,6 +57,7 @@ fn test_router(wallet: Option<Arc<dyn data::WalletStore>>) -> Router {
         docs: None,
         notifier: Default::default(),
         wallet,
+        bets_enabled: false,
     })
 }
 

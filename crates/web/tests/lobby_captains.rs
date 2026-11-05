@@ -54,6 +54,7 @@ fn test_router(manager: Arc<LobbyManager>) -> Router {
         docs: None,
         notifier: Default::default(),
         wallet: None,
+        bets_enabled: false,
     })
 }
 

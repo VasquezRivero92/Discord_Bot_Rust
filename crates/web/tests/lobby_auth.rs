@@ -74,6 +74,7 @@ fn test_router() -> Router {
         docs: None,
         notifier: Default::default(),
         wallet: None,
+        bets_enabled: false,
     })
 }
 

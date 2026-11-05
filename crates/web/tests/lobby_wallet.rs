@@ -55,6 +55,7 @@ fn test_router(manager: Arc<LobbyManager>, wallet: Option<Arc<dyn WalletStore>>)
         docs: None,
         notifier: Default::default(),
         wallet,
+        bets_enabled: false,
     })
 }
 

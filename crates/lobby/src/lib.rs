@@ -21,7 +21,10 @@ pub use draft::{
     is_captain_eligible, pick_player, player_tier, proposal_to_f64, set_captain_proposal,
     set_captain_ready, set_pick_order, start_draft,
 };
-pub use launch::{reset_lobby_after_launch, validate_launch, LaunchPlan, LaunchRequest};
+pub use launch::{
+    player_bet_display_nick, player_display_name, reset_lobby_after_launch, validate_launch,
+    LaunchPlan, LaunchRequest,
+};
 pub use maps::{default_catalog, MapInfo};
 pub use notify::{FakeNotifier, MatchLaunchInfo, MatchNotifier, NotifierSlot, TeamNotice};
 pub use roulette::{
