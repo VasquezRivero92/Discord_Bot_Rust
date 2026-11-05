@@ -365,9 +365,7 @@ async fn get_state(
     let effective_guild = if let Some(ref u) = user_opt {
         match resolve_guild_for_user(u, g_opt.as_deref(), false) {
             Ok(g) => g,
-            Err(msg) => {
-                return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
-            }
+            Err(_) => g_opt,
         }
     } else {
         g_opt
@@ -1728,9 +1726,7 @@ async fn chat_history(
     let effective_guild = if let Some(ref u) = user_opt {
         match resolve_guild_for_user(u, g_opt.as_deref(), false) {
             Ok(g) => g,
-            Err(msg) => {
-                return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
-            }
+            Err(_) => g_opt,
         }
     } else {
         g_opt

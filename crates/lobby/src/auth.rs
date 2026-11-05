@@ -238,16 +238,20 @@ pub fn resolve_guild_for_user(
     admin_route: bool,
 ) -> Result<Option<String>, &'static str> {
     if user.role.as_deref() == Some("admin") {
-        if let Some(req) = requested {
-            if user.servidor.as_deref() != Some(req) {
-                return Err(if admin_route {
-                    "No tienes permisos para gestionar este servidor."
-                } else {
-                    "No tienes permisos para acceder a este servidor."
-                });
+        if let Some(srv) = user.servidor.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Some(req) = requested.filter(|s| !s.trim().is_empty()) {
+                if srv != req {
+                    return Err(if admin_route {
+                        "No tienes permisos para gestionar este servidor."
+                    } else {
+                        "No tienes permisos para acceder a este servidor."
+                    });
+                }
             }
+            Ok(Some(srv.to_string()))
+        } else {
+            Ok(requested.map(str::to_string))
         }
-        Ok(user.servidor.clone())
     } else {
         Ok(requested.map(str::to_string))
     }
@@ -372,6 +376,29 @@ mod tests {
         assert_eq!(
             resolve_guild_for_user(&admin_user, Some("other_guild"), false),
             Err("No tienes permisos para acceder a este servidor.")
+        );
+
+        // Admin sin servidor específico -> no se restringe a un servidor único
+        let admin_unrestricted = LobbyUser {
+            user_id: "a2".into(),
+            username: "AdminUnrestricted".into(),
+            avatar: None,
+            role: Some("admin".into()),
+            servidor: None,
+            is_admin: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_guild_for_user(&admin_unrestricted, Some("guild_official"), true),
+            Ok(Some("guild_official".into()))
+        );
+        assert_eq!(
+            resolve_guild_for_user(&admin_unrestricted, Some("guild_official"), false),
+            Ok(Some("guild_official".into()))
+        );
+        assert_eq!(
+            resolve_guild_for_user(&admin_unrestricted, None, false),
+            Ok(None)
         );
     }
 
