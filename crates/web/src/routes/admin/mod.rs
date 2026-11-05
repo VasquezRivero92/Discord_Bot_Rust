@@ -20,7 +20,6 @@
 //! se montan con [`AdminRepos`], es decir, con Firestore configurado; sin él
 //! siguen en el proxy.
 
-pub mod admin_actions;
 pub mod auth;
 pub mod derived_reads;
 mod js;
@@ -107,9 +106,7 @@ impl AdminRepos {
 /// fallback propio: el llamador lo fusiona antes del proxy. Sin `repos`
 /// (Firestore desactivado) no se monta ninguna lectura.
 pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
-    let mut router = routes()
-        .with_state(state.clone())
-        .merge(admin_actions::router(state.session.clone()));
+    let mut router = routes().with_state(state.clone());
     if let Some(repos) = repos {
         router = router
             .merge(simple_reads::router(state.session.clone(), repos.clone()))

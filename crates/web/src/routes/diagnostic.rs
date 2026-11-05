@@ -15,17 +15,8 @@ use super::json_response;
 /// Rutas de diagnostico (`/api/ping`, con o sin barra final como Express).
 pub fn router() -> Router {
     Router::new()
-        .route("/health", get(health))
         .route("/api/ping", get(ping))
         .route("/api/ping/", get(ping))
-        .route("/api/halloween/status", get(halloween_status))
-        .route("/api/halloween/toggle", axum::routing::post(halloween_toggle))
-        .route("/api/halloween/reset", axum::routing::post(halloween_reset))
-        .route("/api/halloween/stream", get(halloween_status))
-        .route("/api/matchmaking/status", get(matchmaking_status))
-        .route("/api/matchmaking/launch", axum::routing::post(matchmaking_launch))
-        .route("/api/checkout/purchase", axum::routing::post(checkout_purchase))
-        .route("/api/reclamaciones", axum::routing::post(create_reclamacion))
 }
 
 async fn ping(headers: HeaderMap) -> Response {
@@ -101,70 +92,4 @@ fn js_key_order(names: Vec<&str>) -> Vec<&str> {
     let mut out: Vec<&str> = indices.into_iter().map(|(_, n)| n).collect();
     out.extend(names.into_iter().filter(|n| is_array_index(n).is_none()));
     out
-}
-
-async fn health() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({
-            "status": "healthy",
-            "bot": "online",
-            "uptime": 1000
-        }),
-    )
-}
-
-async fn halloween_status() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({ "active": false }),
-    )
-}
-
-async fn halloween_toggle() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({ "active": false }),
-    )
-}
-
-async fn halloween_reset() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({ "success": true }),
-    )
-}
-
-async fn matchmaking_status() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({ "status": "idle" }),
-    )
-}
-
-async fn matchmaking_launch() -> Response {
-    json_response(
-        axum::http::StatusCode::OK,
-        &json!({ "success": true }),
-    )
-}
-
-async fn checkout_purchase() -> Response {
-    json_response(
-        axum::http::StatusCode::CREATED,
-        &json!({
-            "success": true,
-            "orderId": format!("ORD-{}", Utc::now().timestamp_millis())
-        }),
-    )
-}
-
-async fn create_reclamacion() -> Response {
-    json_response(
-        axum::http::StatusCode::CREATED,
-        &json!({
-            "success": true,
-            "claimCode": format!("LR-{}", Utc::now().timestamp_millis())
-        }),
-    )
 }

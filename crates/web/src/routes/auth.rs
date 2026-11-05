@@ -80,8 +80,6 @@ pub fn router(state: AuthState) -> Router {
         .route("/auth/me", get(auth_me))
         .route("/api/lobby/me", get(lobby_me))
         .route("/api/me", get(auth_me))
-        .route("/auth/steam", get(steam))
-        .route("/auth/steam/callback", get(steam_callback))
         .with_state(state)
 }
 
@@ -382,43 +380,4 @@ async fn lobby_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
         },
         None => Json(json!({ "user": null })).into_response(),
     }
-}
-
-async fn steam(
-    State(st): State<AuthState>,
-    OptionalUser(user): OptionalUser,
-) -> Response {
-    if user.is_none() {
-        return found("/auth/discord?redirect=/auth/steam", vec![]);
-    }
-    let base_url = st.redirect_uri.replace("/auth/discord/callback", "");
-    let return_to = format!("{base_url}/auth/steam/callback");
-    let realm = format!("{base_url}/");
-    let steam_url = format!(
-        "https://steamcommunity.com/openid/login?openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.mode=checkid_setup&openid.return_to={}&openid.realm={}&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select",
-        url::form_urlencoded::byte_serialize(return_to.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(realm.as_bytes()).collect::<String>()
-    );
-    found(&steam_url, vec![])
-}
-
-async fn steam_callback(
-    RawQuery(raw): RawQuery,
-) -> Response {
-    let claimed_id = raw.as_deref().and_then(|r| {
-        for pair in r.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "openid.claimed_id" {
-                    return Some(v.to_string());
-                }
-            }
-        }
-        None
-    });
-    let steam_id = claimed_id.as_deref().and_then(|cid| {
-        cid.split('/').last()
-    }).unwrap_or("unknown");
-
-    tracing::info!("[STEAM AUTH] SteamID64 recibido en callback: {steam_id}");
-    found("/lobby?steam_linked=true", vec![])
 }
