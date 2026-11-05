@@ -33,6 +33,8 @@ services:
         target: /srv/public
         read_only: true
       # Única parte escribible de /srv/public: las imágenes que suben los jugadores al chat.
+      # Requiere que exista ./public/uploads en el host (mkdir -p public/uploads): public/ se
+      # monta en solo lectura y Docker no puede crear el punto de montaje por su cuenta.
       - type: volume
         source: machupeek-uploads
         target: /srv/public/uploads

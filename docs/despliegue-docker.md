@@ -18,6 +18,16 @@ visitante -> Cloudflare -> cloudflared (tunnel) -> web (Rust, :15633)
 
 Nada de lo anterior va dentro de la imagen: se monta en solo lectura al arrancar.
 
+**Crear la carpeta de subidas antes del primer arranque:**
+
+```bash
+mkdir -p public/uploads
+```
+
+`public/` se monta en solo lectura y las imágenes del chat van a un volumen que se monta encima en
+`public/uploads`. Docker necesita que esa carpeta exista en el host: sin ella el contenedor no
+arranca (`mkdirat ... read-only file system`).
+
 ## 2. El token del túnel (importante)
 
 `TUNNEL_TOKEN` **no** va en `.env` (compose pasa `.env` entero al contenedor web) ni en el
