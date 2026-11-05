@@ -11,9 +11,13 @@ use serde_json::json;
 use std::sync::Arc;
 use tracing::info;
 
+use super::cs2_api::check_auth;
+
 #[derive(Clone)]
 pub struct WebhooksState {
     pub cs2_manager: Arc<Cs2ServerManager>,
+    pub settle: Option<Arc<lobby::settle::SettleDeps>>,
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,39 +76,135 @@ async fn faceit_event(
 
 async fn matchzy_event(
     State(state): State<WebhooksState>,
+    headers: HeaderMap,
     Json(payload): Json<MatchZyPayload>,
 ) -> impl IntoResponse {
+    let authenticated = match check_auth(state.secret.as_deref(), &headers) {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
     let event = payload.event.as_deref().unwrap_or("unknown");
     let match_id = payload.matchid.as_deref().unwrap_or("unknown");
 
-    info!("[MatchZy Webhook Rust] Evento: '{event}' para match: '{match_id}'");
+    info!(
+        "[MatchZy Webhook Rust] Evento: '{event}' para match: '{match_id}', Autenticado: {authenticated}"
+    );
 
-    if event == "series_end" || event == "map_end" {
-        info!("[MatchZy Webhook Rust] Serie o mapa finalizado. Resolviendo partida {match_id}...");
-
-        // 1. Limpiar match de la memoria RAM del servidor CS2
-        state.cs2_manager.clear_match(match_id).await;
-
-        // 2. Comprobar auto-apagado de máquina virtual en AWS EC2 (Ahorro de costos)
-        let _ = state.cs2_manager.auto_shutdown_if_idle().await;
+    if event != "series_end" {
+        if event == "map_end" {
+            info!(
+                "[MatchZy Webhook Rust] Mapa finalizado para match: '{match_id}'. En series de mapas no se cierra la partida hasta series_end."
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "event": event,
+            })),
+        )
+            .into_response();
     }
 
-    Json(json!({
-        "success": true,
-        "event": event,
-        "matchId": match_id
-    }))
+    // Extracción del ganador: puede ser un objeto {"team":"team1"} o una cadena "team1"/"team2"
+    let winner_str = match &payload.winner {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Object(obj)) => obj.get("team").and_then(|v| v.as_str()),
+        _ => None,
+    };
+
+    let score1 = payload.team1_series_score.map(|s| s as i64);
+    let score2 = payload.team2_series_score.map(|s| s as i64);
+
+    let action = lobby::settle::MatchAction::from_winner(winner_str, score1, score2);
+
+    info!(
+        "[MatchZy Webhook Rust] Serie finalizada para match: '{match_id}'. Ganador reportado: {:?} -> {:?}, Marcador: {:?} - {:?}",
+        winner_str, action, score1, score2
+    );
+
+    if let Some(ref settle) = state.settle {
+        match lobby::settle::resolve_match_end(
+            settle,
+            match_id,
+            action,
+            score1,
+            score2,
+            authenticated,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "event": "series_end",
+                    "resolved": true,
+                    "payoutsApplied": outcome.payouts_applied,
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::NotFound) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "event": "series_end",
+                    "resolved": false,
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Unauthorized) => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "No autorizado."
+                })),
+            )
+                .into_response(),
+            Err(lobby::settle::ResolveError::Store(msg)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Error interno: {msg}")
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        // Sin settle (Firestore deshabilitado) conserva el comportamiento actual de limpiar memoria y auto_shutdown_if_idle
+        state.cs2_manager.clear_match(match_id).await;
+        let _ = state.cs2_manager.auto_shutdown_if_idle().await;
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "event": "series_end",
+                "resolved": true,
+                "payoutsApplied": 0,
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn yape_transaction(
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
-    let auth = headers.get("x-yape-signature").and_then(|h| h.to_str().ok());
-    info!("[Yape Webhook Rust] Recibida notificación de transacción Yape. Auth: {:?}", auth);
+    let auth = headers
+        .get("x-yape-signature")
+        .and_then(|h| h.to_str().ok());
+    info!(
+        "[Yape Webhook Rust] Recibida notificación de transacción Yape. Auth: {:?}",
+        auth
+    );
 
     if let Some(Json(b)) = body {
-        info!("[Yape Webhook Rust] Datos recibidos de transacción: {:?}", b);
+        info!(
+            "[Yape Webhook Rust] Datos recibidos de transacción: {:?}",
+            b
+        );
     }
 
     Json(json!({ "success": true, "status": "processed" }))
@@ -134,7 +234,11 @@ mod tests {
     #[tokio::test]
     async fn faceit_verify_get_returns_200() {
         let mgr = test_manager();
-        let app = router(WebhooksState { cs2_manager: mgr });
+        let app = router(WebhooksState {
+            cs2_manager: mgr,
+            settle: None,
+            secret: None,
+        });
 
         let req = Request::builder()
             .uri("/webhook/faceit")
@@ -147,11 +251,22 @@ mod tests {
     #[tokio::test]
     async fn matchzy_event_handles_series_end() {
         let mgr = test_manager();
-        mgr.publish_match("test_match_99".into(), None, "de_nuke".into(), 5.0, 10, None)
-            .await;
+        mgr.publish_match(
+            "test_match_99".into(),
+            None,
+            "de_nuke".into(),
+            5.0,
+            10,
+            None,
+        )
+        .await;
         assert_eq!(mgr.get_all_active_matches().await.len(), 1);
 
-        let app = router(WebhooksState { cs2_manager: mgr.clone() });
+        let app = router(WebhooksState {
+            cs2_manager: mgr.clone(),
+            settle: None,
+            secret: None,
+        });
 
         let payload = json!({
             "event": "series_end",

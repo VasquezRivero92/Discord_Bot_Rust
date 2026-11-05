@@ -16,7 +16,12 @@ impl MatchAction {
     /// Sigue la lógica del legado (`cs2Api.js:138-140`):
     /// - "team1" o "faction1" -> `WinA`
     /// - "team2" o "faction2" -> `WinB`
-    /// - Si no: si score_a > score_b -> `WinA`, si score_b > score_a -> `WinB`, empate o ausente -> `WinA`.
+    /// - Si no: si score_a > score_b -> `WinA`, si score_b > score_a -> `WinB`.
+    ///
+    /// Diferencia deliberada con el legado: ante empate o marcador ausente el legado daba la
+    /// victoria al equipo A (y le pagaba el pozo). Con dinero en juego eso paga a un equipo al
+    /// azar si el reporte llega corrupto o la partida se aborta; aquí se cancela (`Cancel`) y se
+    /// reembolsa la cuota a todos.
     pub fn from_winner(
         winner: Option<&str>,
         score_a: Option<i64>,
@@ -25,17 +30,11 @@ impl MatchAction {
         match winner {
             Some("team1") | Some("faction1") => MatchAction::WinA,
             Some("team2") | Some("faction2") => MatchAction::WinB,
-            _ => {
-                let a = score_a.unwrap_or(0);
-                let b = score_b.unwrap_or(0);
-                if a > b {
-                    MatchAction::WinA
-                } else if b > a {
-                    MatchAction::WinB
-                } else {
-                    MatchAction::WinA
-                }
-            }
+            _ => match (score_a, score_b) {
+                (Some(a), Some(b)) if a > b => MatchAction::WinA,
+                (Some(a), Some(b)) if b > a => MatchAction::WinB,
+                _ => MatchAction::Cancel,
+            },
         }
     }
 
@@ -576,12 +575,27 @@ mod tests {
             MatchAction::from_winner(None, Some(9), Some(13)),
             MatchAction::WinB
         );
+        // Empate, marcador ausente o incompleto sin winner: se cancela (reembolso), no se adivina
+        // un ganador (diferencia deliberada con el legado, que pagaba al equipo A).
         assert_eq!(
             MatchAction::from_winner(None, Some(12), Some(12)),
-            MatchAction::WinA
+            MatchAction::Cancel
         );
         assert_eq!(
             MatchAction::from_winner(None, None, None),
+            MatchAction::Cancel
+        );
+        assert_eq!(
+            MatchAction::from_winner(None, Some(13), None),
+            MatchAction::Cancel
+        );
+        // Un winner con texto desconocido tampoco decide: cae al marcador, y sin marcador cancela.
+        assert_eq!(
+            MatchAction::from_winner(Some("otro"), None, None),
+            MatchAction::Cancel
+        );
+        assert_eq!(
+            MatchAction::from_winner(Some("otro"), Some(13), Some(2)),
             MatchAction::WinA
         );
     }

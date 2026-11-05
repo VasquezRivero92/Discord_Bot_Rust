@@ -74,7 +74,7 @@ async fn current_match(State(state): State<Cs2ApiState>) -> impl IntoResponse {
 }
 
 /// Comparación byte a byte en tiempo constante sin cortocircuito para evitar ataques de temporización.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
     if a_bytes.len() != b_bytes.len() {
@@ -92,7 +92,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// Si hay secreto configurado y la cabecera falta o no coincide -> 401 Unauthorized sin tocar nada.
 /// Si hay secreto y coincide -> Ok(true).
 /// Si no hay secreto configurado -> Ok(false).
-fn check_auth(
+pub(crate) fn check_auth(
     state_secret: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<bool, axum::response::Response> {

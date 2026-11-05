@@ -130,11 +130,13 @@ pub fn build_app(deps: AppDeps) -> Router {
         migrated = migrated
             .merge(routes::cs2_api::router(routes::cs2_api::Cs2ApiState {
                 manager: cs2_mgr.clone(),
-                settle,
+                settle: settle.clone(),
                 secret: cfg.cs2_api_secret.clone(),
             }))
             .merge(routes::webhooks::router(routes::webhooks::WebhooksState {
                 cs2_manager: cs2_mgr,
+                settle,
+                secret: cfg.cs2_api_secret.clone(),
             }));
     }
     if let Some(lobby_mgr) = deps.lobby {
