@@ -15,7 +15,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -575,6 +574,7 @@ async fn reset(
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    manager.cancel_roulette(guild_id);
     let state = manager.reset_lobby(guild_id).await;
     Json(json!({ "success": true, "state": state })).into_response()
 }
@@ -611,23 +611,20 @@ async fn auto_assign_captains(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    state
-        .available_players
-        .sort_by_key(|a| std::cmp::Reverse(a.faceit_elo));
-
-    for team in &mut state.teams {
-        if team.captain.is_none() && !state.available_players.is_empty() {
-            let mut cap = state.available_players.remove(0);
-            cap.ensure_discord_user();
-            team.captain = Some(cap);
+    let ready = state.available_players.clone();
+    match crate::draft::auto_assign_captains(&mut state, ready) {
+        Ok(_) => {
+            manager.cancel_roulette(guild_id);
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
         }
+        Err(msg) => (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response(),
     }
-
-    state.sanitize();
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
 }
 
 async fn auto_assign_players(
@@ -919,56 +916,75 @@ async fn assign_captain(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if let Some(ref tid) = payload.team_id {
-        match payload.discord_id {
-            Some(ref did) if !did.is_empty() => {
-                let mut player = if let Some(pos) = state
-                    .available_players
-                    .iter()
-                    .position(|p| p.discord_id == *did)
-                {
-                    state.available_players.remove(pos)
-                } else if let Some(ref p) = payload.player {
-                    p.clone()
-                } else {
-                    let mut found = None;
-                    for other in &mut state.teams {
-                        if let Some(pos) = other.players.iter().position(|p| p.discord_id == *did) {
-                            found = Some(other.players.remove(pos));
-                            break;
+    let team_id = match payload.team_id.as_deref() {
+        Some(tid) if !tid.is_empty() => tid,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Equipo no encontrado." })),
+            )
+                .into_response();
+        }
+    };
+
+    let did_opt = payload
+        .discord_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let player_opt = match did_opt {
+        None => None,
+        Some(did) => {
+            let found = state
+                .available_players
+                .iter()
+                .find(|p| p.discord_id == did)
+                .cloned()
+                .or_else(|| {
+                    for t in &state.teams {
+                        if let Some(p) = t.players.iter().find(|p| p.discord_id == did) {
+                            return Some(p.clone());
+                        }
+                        if let Some(ref c) = t.captain {
+                            if c.discord_id == did {
+                                return Some(c.clone());
+                            }
                         }
                     }
-                    found.unwrap_or_else(|| Player {
-                        discord_id: did.clone(),
-                        nickname: "Capitán".to_string(),
-                        faceit_nickname: Some("Capitán".to_string()),
-                        faceit_elo: 1000,
-                        ready: true,
-                        tier: "C".to_string(),
-                        ..Default::default()
-                    })
-                };
-                player.ensure_discord_user();
-                if let Some(t) = state.teams.iter_mut().find(|t| t.id == *tid) {
-                    t.captain = Some(player);
-                }
-            }
-            _ => {
-                if let Some(t) = state.teams.iter_mut().find(|t| t.id == *tid) {
-                    if let Some(mut cap) = t.captain.take() {
-                        cap.ensure_discord_user();
-                        state.available_players.push(cap);
-                    }
+                    None
+                })
+                .or_else(|| payload.player.filter(|p| p.discord_id == did));
+
+            match found {
+                Some(p) => Some(p),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "Jugador no registrado." })),
+                    )
+                        .into_response();
                 }
             }
         }
-    }
+    };
 
-    state.sanitize();
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
+    match crate::draft::assign_captain(&mut state, team_id, player_opt) {
+        Ok(()) => {
+            manager.cancel_roulette(guild_id);
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
+    }
 }
 
 async fn pick_player(
@@ -1038,7 +1054,11 @@ async fn captain_proposal(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
+    let g_opt = payload
+        .get("guildId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
         Ok(g) => g,
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
@@ -1046,25 +1066,42 @@ async fn captain_proposal(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
-        let bet = payload
-            .get("betAmount")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if team_id.contains("1") || team_id.to_lowercase().contains('a') {
-            state.captain_a_proposal = Some(json!(bet));
-        } else {
-            state.captain_b_proposal = Some(json!(bet));
+    let team_id = match payload.get("teamId").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Equipo no válido para proponer apuesta." })),
+            )
+                .into_response();
         }
-        state.bet_agreed = true;
-        state.agreed_bet_amount = Some(bet);
-        state.effective_bet_amount = bet;
-    }
+    };
 
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
+    let bet = match payload.get("betAmount") {
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+
+    let actor_id = &user.user_id;
+    let is_admin = user.is_admin_like();
+
+    match crate::draft::set_captain_proposal(&mut state, team_id, actor_id, is_admin, bet) {
+        Ok(()) => {
+            manager.cancel_roulette(guild_id);
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
+    }
 }
 
 async fn captain_ready(
@@ -1073,7 +1110,11 @@ async fn captain_ready(
     State(manager): State<Arc<LobbyManager>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let g_opt = extract_guild_id(raw.as_deref());
+    let g_opt = payload
+        .get("guildId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| extract_guild_id(raw.as_deref()));
     let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
         Ok(g) => g,
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
@@ -1081,22 +1122,55 @@ async fn captain_ready(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if let Some(team_id) = payload.get("teamId").and_then(|v| v.as_str()) {
-        let is_ready = payload
-            .get("isReady")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        if team_id.contains("1") || team_id.to_lowercase().contains('a') {
-            state.captain_a_ready = is_ready;
-        } else {
-            state.captain_b_ready = is_ready;
+    let team_id = match payload.get("teamId").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Equipo no válido para confirmar estado." })),
+            )
+                .into_response();
+        }
+    };
+
+    let is_ready = payload
+        .get("isReady")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let bet = match payload.get("betAmount") {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().ok(),
+        _ => None,
+    };
+
+    let actor_id = &user.user_id;
+    let is_admin = user.is_admin_like();
+
+    match crate::draft::set_captain_ready(&mut state, team_id, actor_id, is_admin, is_ready, bet) {
+        Ok(should_start_roulette) => {
+            if should_start_roulette {
+                manager.schedule_roulette(
+                    guild_id,
+                    7000,
+                    crate::roulette::RouletteTimings::default(),
+                );
+            } else {
+                manager.cancel_roulette(guild_id);
+            }
+            state.sanitize();
+            let updated = manager.update_state(guild_id, state).await;
+            let available_players = partition_available_players(&updated);
+            Json(
+                json!({ "success": true, "state": updated, "availablePlayers": available_players }),
+            )
+            .into_response()
+        }
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": msg }))).into_response()
         }
     }
-
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
 }
 
 async fn force_roulette(
@@ -1112,19 +1186,43 @@ async fn force_roulette(
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
     let mut state = manager.get_state(guild_id).await;
 
-    if !state.teams.is_empty() {
-        let winner = &state.teams[0];
-        state.roulette_spinning = true;
-        state.roulette_winner_team_id = Some(winner.id.clone());
-        state.roulette_winner_name = Some(winner.name.clone());
-        state.roulette_started_at = Some(Utc::now().timestamp_millis());
-        state.bet_agreed = true;
+    if state.teams.len() < 2 || state.teams[0].captain.is_none() || state.teams[1].captain.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Se requieren al menos 2 equipos con capitanes asignados." })),
+        )
+            .into_response();
     }
 
-    let updated = manager.update_state(guild_id, state).await;
-    let available_players = partition_available_players(&updated);
-    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
-        .into_response()
+    state.captain_a_ready = true;
+    state.captain_b_ready = true;
+
+    let prop_a = crate::draft::proposal_to_f64(&state.captain_a_proposal);
+    let prop_b = crate::draft::proposal_to_f64(&state.captain_b_proposal);
+
+    let differing = match (prop_a, prop_b) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    };
+
+    let default_bet = if differing {
+        let chosen = prop_a.or(prop_b).unwrap_or(0.0);
+        state.captain_a_proposal = Some(json!(chosen));
+        state.captain_b_proposal = Some(json!(chosen));
+        chosen
+    } else {
+        prop_a.unwrap_or(0.0)
+    };
+
+    state.bet_agreed = true;
+    state.agreed_bet_amount = Some(default_bet);
+
+    state.sanitize();
+    manager.update_state(guild_id, state).await;
+    manager.schedule_roulette(guild_id, 400, crate::roulette::RouletteTimings::default());
+
+    Json(json!({ "success": true, "message": "Ruleta iniciada de inmediato." })).into_response()
 }
 
 async fn tournament_config(
@@ -1234,6 +1332,7 @@ async fn mixton_setup(
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    manager.cancel_roulette(guild_id);
     let mut state = manager.get_state(guild_id).await;
 
     let num_teams = payload

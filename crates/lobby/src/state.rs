@@ -462,6 +462,7 @@ pub struct LobbyManager {
     states: Arc<RwLock<HashMap<String, LobbyState>>>,
     chats: Arc<RwLock<HashMap<String, Vec<ChatMessage>>>>,
     channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
+    roulette_tasks: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     default_guild_id: String,
 }
 
@@ -471,8 +472,69 @@ impl LobbyManager {
             states: Arc::new(RwLock::new(HashMap::new())),
             chats: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            roulette_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             default_guild_id: default_guild_id.into(),
         }
+    }
+
+    pub fn with_initial_state(self, guild_id: &str, state: LobbyState) -> Self {
+        if let Ok(mut states) = self.states.try_write() {
+            states.insert(guild_id.to_string(), state);
+        }
+        self
+    }
+
+    /// Cancela la tarea de ruleta automática activa para el guild si existiera.
+    pub fn cancel_roulette(&self, guild_id: &str) {
+        let mut tasks = match self.roulette_tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(handle) = tasks.remove(guild_id) {
+            handle.abort();
+        }
+    }
+
+    /// Programa la ejecución de la ruleta automática y el posterior inicio del draft.
+    pub fn schedule_roulette(
+        &self,
+        guild_id: &str,
+        delay_ms: u64,
+        timings: crate::roulette::RouletteTimings,
+    ) {
+        self.cancel_roulette(guild_id);
+        let manager = self.clone();
+        let gid = guild_id.to_string();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+            let mut state = manager.get_state(&gid).await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let coin = crate::roulette::random_unit();
+            let slice_rand = crate::roulette::random_unit();
+
+            if let Err(err) = crate::roulette::decide_roulette(&mut state, coin, slice_rand, now_ms)
+            {
+                tracing::warn!("[AutoRoulette] Cancelado para guild {}: {}", gid, err);
+                return;
+            }
+
+            manager.update_state(&gid, state).await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(timings.draft_delay_ms)).await;
+
+            let mut curr_state = manager.get_state(&gid).await;
+            if crate::roulette::start_draft_after_roulette(&mut curr_state) {
+                manager.update_state(&gid, curr_state).await;
+            }
+        });
+
+        let mut tasks = match self.roulette_tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tasks.insert(guild_id.to_string(), handle);
     }
 
     pub fn resolve_guild_id<'a>(&'a self, requested: Option<&'a str>) -> &'a str {
@@ -624,6 +686,7 @@ impl LobbyManager {
 
     /// Reinicia la sala de Mixton al estado inicial.
     pub async fn reset_lobby(&self, guild_id: &str) -> LobbyState {
+        self.cancel_roulette(guild_id);
         let mut states = self.states.write().await;
         let state = states.entry(guild_id.to_string()).or_default();
         let current_catalog = state.map_catalog.clone();

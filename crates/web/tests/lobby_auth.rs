@@ -45,7 +45,24 @@ fn make_token(role: &str, is_admin: bool, servidor: Option<&str>) -> String {
 
 fn test_router() -> Router {
     let session = SessionState::new(SECRET.as_bytes(), false).unwrap();
-    let manager = Arc::new(LobbyManager::new("default"));
+    let mut initial = lobby::LobbyState::default();
+    initial.teams[0].captain = Some(lobby::Player {
+        discord_id: "user_123".into(),
+        nickname: "CapA".into(),
+        faceit_level: Some(10),
+        tier: "S".into(),
+        ready: true,
+        ..Default::default()
+    });
+    initial.teams[1].captain = Some(lobby::Player {
+        discord_id: "user_456".into(),
+        nickname: "CapB".into(),
+        faceit_level: Some(9),
+        tier: "A".into(),
+        ready: true,
+        ..Default::default()
+    });
+    let manager = Arc::new(LobbyManager::new("default").with_initial_state("default", initial));
     lobby::router(LobbyApiState {
         manager,
         auth: Arc::new(session),
