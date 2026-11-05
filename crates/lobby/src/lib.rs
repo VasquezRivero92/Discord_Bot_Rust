@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod draft;
+pub mod launch;
 pub mod maps;
 pub mod roulette;
 pub mod routes;
@@ -18,13 +19,16 @@ pub use draft::{
     is_captain_eligible, pick_player, player_tier, proposal_to_f64, set_captain_proposal,
     set_captain_ready, set_pick_order, start_draft,
 };
+pub use launch::{reset_lobby_after_launch, validate_launch, LaunchPlan, LaunchRequest};
 pub use maps::{default_catalog, MapInfo};
 pub use roulette::{
     decide_roulette, random_unit, start_draft_after_roulette, RouletteTimings,
     ROULETTE_DRAFT_DELAY_MS,
 };
 pub use routes::{resolve_discord_avatar_url, router, LobbyApiState};
-pub use state::{ChatMessage, LobbyManager, LobbyState, LobbyTeam, MapVetoState, Player};
+pub use state::{
+    ChatMessage, LaunchGuard, LobbyManager, LobbyState, LobbyTeam, MapVetoState, Player,
+};
 pub use veto::{
     apply_veto_map_action, cancel_veto, generate_map_ban_sequence, generate_map_veto_plan,
     init_map_veto_state, verify_veto_turn, VetoActionResult, VetoPlan, VetoStep, VetoTurnContext,

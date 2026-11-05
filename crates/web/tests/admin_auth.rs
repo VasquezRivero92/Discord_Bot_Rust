@@ -473,6 +473,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
         admin: None,
         cs2: None,
         lobby: None,
+        docs: None,
     }))
     .await;
 

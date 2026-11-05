@@ -53,6 +53,8 @@ fn test_router(manager: Arc<LobbyManager>) -> Router {
         manager,
         auth: Arc::new(session),
         uploads_dir,
+        cs2: None,
+        docs: None,
     })
 }
 
@@ -67,6 +69,7 @@ fn make_player(id: &str, elo: u32, level: Option<u32>, tier: &str) -> Player {
     Player {
         discord_id: id.to_string(),
         nickname: format!("Nick_{id}"),
+        faceit_player_id: None,
         faceit_nickname: Some(format!("Faceit_{id}")),
         steam_id_64: None,
         avatar: None,

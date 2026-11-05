@@ -3,7 +3,7 @@
 use crate::maps::{default_catalog, MapInfo};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -21,6 +21,8 @@ pub struct Player {
     #[serde(rename = "discordId")]
     pub discord_id: String,
     pub nickname: String,
+    #[serde(rename = "faceit_player_id", default)]
+    pub faceit_player_id: Option<String>,
     #[serde(rename = "faceit_nickname", default)]
     pub faceit_nickname: Option<String>,
     #[serde(rename = "steam_id_64", default)]
@@ -466,6 +468,24 @@ impl Default for LobbyState {
     }
 }
 
+/// Guardián RAII para prevenir lanzamientos simultáneos en el mismo servidor/guild.
+/// Al destruirse (`Drop`), remueve el identificador del guild del conjunto de lanzamientos activos.
+#[derive(Debug)]
+pub struct LaunchGuard {
+    guild_id: String,
+    active_set: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        let mut set = match self.active_set.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        set.remove(&self.guild_id);
+    }
+}
+
 /// Gestor del lobby en memoria para todas las comunidades/servidores de Discord.
 #[derive(Clone)]
 pub struct LobbyManager {
@@ -474,6 +494,7 @@ pub struct LobbyManager {
     channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
     roulette_tasks: Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     user_last_message_time: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    launching_guilds: Arc<std::sync::Mutex<HashSet<String>>>,
     default_guild_id: String,
 }
 
@@ -485,6 +506,7 @@ impl LobbyManager {
             channels: Arc::new(RwLock::new(HashMap::new())),
             roulette_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             user_last_message_time: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            launching_guilds: Arc::new(std::sync::Mutex::new(HashSet::new())),
             default_guild_id: default_guild_id.into(),
         }
     }
@@ -553,6 +575,24 @@ impl LobbyManager {
         match requested {
             Some(g) if !g.trim().is_empty() => g.trim(),
             _ => &self.default_guild_id,
+        }
+    }
+
+    /// Intenta registrar el inicio de un lanzamiento para el guild indicado.
+    /// Devuelve `Some(LaunchGuard)` si ningún lanzamiento estaba en curso, o `None`
+    /// si ya se está lanzando una partida en este servidor.
+    pub fn try_begin_launch(&self, guild_id: &str) -> Option<LaunchGuard> {
+        let mut set = match self.launching_guilds.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if set.insert(guild_id.to_string()) {
+            Some(LaunchGuard {
+                guild_id: guild_id.to_string(),
+                active_set: Arc::clone(&self.launching_guilds),
+            })
+        } else {
+            None
         }
     }
 
@@ -626,6 +666,9 @@ impl LobbyManager {
             }
             if player.faceit_nickname.is_none() && existing.faceit_nickname.is_some() {
                 player.faceit_nickname = existing.faceit_nickname.clone();
+            }
+            if player.faceit_player_id.is_none() && existing.faceit_player_id.is_some() {
+                player.faceit_player_id = existing.faceit_player_id.clone();
             }
             state.available_players.remove(pos);
         }
@@ -831,6 +874,7 @@ mod tests {
         let player = Player {
             discord_id: "user_1".into(),
             nickname: "Gamer1".into(),
+            faceit_player_id: None,
             faceit_nickname: Some("gamer_1".into()),
             steam_id_64: Some("76561198000000001".into()),
             avatar: None,
@@ -905,5 +949,27 @@ mod tests {
         assert!(!mgr.check_and_update_chat_rate_limit("u1").await);
         // Otro usuario -> aceptado
         assert!(mgr.check_and_update_chat_rate_limit("u2").await);
+    }
+
+    #[test]
+    fn test_try_begin_launch_concurrency_and_guards() {
+        let mgr = LobbyManager::new("guild_1");
+
+        // 1. Primer intento en guild_1 tiene éxito y devuelve un LaunchGuard
+        let guard1 = mgr.try_begin_launch("guild_1");
+        assert!(guard1.is_some());
+
+        // 2. Segundo intento en el mismo guild mientras vive el guard devuelve None
+        let guard1_retry = mgr.try_begin_launch("guild_1");
+        assert!(guard1_retry.is_none());
+
+        // 3. Guilds distintos no se bloquean entre sí
+        let guard2 = mgr.try_begin_launch("guild_2");
+        assert!(guard2.is_some());
+
+        // 4. Tras drop del guard de guild_1, vuelve a permitir el inicio de lanzamiento
+        drop(guard1);
+        let guard1_after_drop = mgr.try_begin_launch("guild_1");
+        assert!(guard1_after_drop.is_some());
     }
 }

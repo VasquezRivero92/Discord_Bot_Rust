@@ -883,6 +883,7 @@ mod tests {
         Player {
             discord_id: id.to_string(),
             nickname: format!("Nick_{id}"),
+            faceit_player_id: None,
             faceit_nickname: Some(format!("Faceit_{id}")),
             steam_id_64: None,
             avatar: None,

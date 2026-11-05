@@ -49,7 +49,11 @@ async fn main() -> ExitCode {
 
 async fn run() -> ExitCode {
     init_tracing();
-    for var in ["FIRESTORE_EMULATOR_HOST", "FIRESTORE_USE_ADC", "FIREBASE_SERVICE_ACCOUNT_PATH"] {
+    for var in [
+        "FIRESTORE_EMULATOR_HOST",
+        "FIRESTORE_USE_ADC",
+        "FIREBASE_SERVICE_ACCOUNT_PATH",
+    ] {
         if let Ok(val) = std::env::var(var) {
             if val.trim().is_empty() {
                 std::env::remove_var(var);
@@ -113,12 +117,16 @@ async fn run() -> ExitCode {
         });
     }
 
+    let docs = client
+        .clone()
+        .map(|c| Arc::new(c) as Arc<dyn data::DocSink>);
     let app = build_app(AppDeps {
         config: cfg,
         claims,
         admin,
         cs2,
         lobby,
+        docs,
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(

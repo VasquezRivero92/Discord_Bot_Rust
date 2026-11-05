@@ -53,6 +53,8 @@ fn test_router() -> Router {
         manager,
         auth: Arc::new(session),
         uploads_dir,
+        cs2: None,
+        docs: None,
     })
 }
 
@@ -69,7 +71,6 @@ async fn test_rutas_stub_no_son_respondidas_por_el_lobby_admin_autenticado() {
         "/api/lobby/verify-faceit",
         "/api/lobby/mixton-toggle-command",
         "/api/lobby/create-match",
-        "/api/lobby/mixton-create-match",
     ];
 
     for uri in stubs {

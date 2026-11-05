@@ -24,6 +24,8 @@ pub struct LobbyApiState {
     pub manager: Arc<LobbyManager>,
     pub auth: Arc<dyn SessionVerifier>,
     pub uploads_dir: std::path::PathBuf,
+    pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
+    pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
 }
 
 #[derive(Clone)]
@@ -31,6 +33,8 @@ pub(crate) struct LobbyCtx {
     pub manager: Arc<LobbyManager>,
     pub auth: Arc<dyn SessionVerifier>,
     pub uploads_dir: std::path::PathBuf,
+    pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
+    pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
 }
 
 impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
@@ -48,6 +52,18 @@ impl axum::extract::FromRef<LobbyCtx> for Arc<dyn SessionVerifier> {
 impl axum::extract::FromRef<LobbyCtx> for std::path::PathBuf {
     fn from_ref(ctx: &LobbyCtx) -> Self {
         ctx.uploads_dir.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<cs2::Cs2ServerManager>> {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.cs2.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<dyn data::DocSink>> {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.docs.clone()
     }
 }
 
@@ -182,6 +198,8 @@ pub fn router(state: LobbyApiState) -> Router {
         manager: state.manager,
         auth: state.auth,
         uploads_dir: state.uploads_dir,
+        cs2: state.cs2,
+        docs: state.docs,
     };
     Router::new()
         // Estado y lecturas básicas
@@ -246,7 +264,8 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-setup", post(mixton_setup))
         .route("/api/lobby/mixton-start", post(mixton_start))
         .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
-        // Sin implementación real en Rust todavía (no se simula éxito): mixton-check-bet-status, mixton-load-team, mixton-override-tier, sync-faceit-from-steam, verify-faceit, mixton-toggle-command, create-match. Caen al proxy del legado.
+        .route("/api/lobby/mixton-create-match", post(mixton_create_match))
+        // Sin implementación real en Rust todavía (no se simula éxito): mixton-check-bet-status, mixton-load-team, mixton-override-tier, sync-faceit-from-steam, verify-faceit, mixton-toggle-command. Caen al proxy del legado.
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route(
@@ -420,6 +439,7 @@ async fn player_ready(
         let mut player = Player {
             discord_id: discord_id.clone(),
             nickname: username.clone(),
+            faceit_player_id: None,
             faceit_nickname: Some(username.clone()),
             steam_id_64: None,
             avatar: avatar.clone(),
@@ -1945,6 +1965,238 @@ async fn chat_message(
 
     manager.add_chat_message(guild_id, msg.clone()).await;
     Json(json!({ "success": true, "message": msg })).into_response()
+}
+
+async fn mixton_create_match(
+    user: RequireUser,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    State(cs2): State<Option<Arc<cs2::Cs2ServerManager>>>,
+    State(docs): State<Option<Arc<dyn data::DocSink>>>,
+    Json(payload): Json<crate::launch::LaunchRequest>,
+) -> impl IntoResponse {
+    let g_opt = payload
+        .guild_id
+        .clone()
+        .or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    // Evita carreras de doble lanzamiento en el mismo servidor/guild
+    let _launch_guard = match manager.try_begin_launch(guild_id) {
+        Some(guard) => guard,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Ya se está lanzando una partida en este servidor." })),
+            )
+                .into_response();
+        }
+    };
+
+    let state = manager.get_state(guild_id).await;
+
+    let plan = match crate::launch::validate_launch(&state, &payload, &user) {
+        Ok(plan) => plan,
+        Err((code, msg)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            return (status, Json(json!({ "error": msg }))).into_response();
+        }
+    };
+
+    let launched_cap_a = state
+        .teams
+        .iter()
+        .find(|t| t.id == plan.team_a_id)
+        .and_then(|t| t.captain.as_ref().map(|c| c.discord_id.clone()));
+    let launched_cap_b = state
+        .teams
+        .iter()
+        .find(|t| t.id == plan.team_b_id)
+        .and_then(|t| t.captain.as_ref().map(|c| c.discord_id.clone()));
+
+    let cs2 = match cs2 {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "El gestor de servidores CS2 no está configurado." })),
+            )
+                .into_response();
+        }
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let rand_suffix = random_alphanumeric(6);
+    let match_id = format!("mixton_{}_{}", now_ms, rand_suffix);
+
+    let port = match cs2.allocate_port(&match_id).await {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "No hay puertos libres para lanzar la partida." })),
+            )
+                .into_response();
+        }
+    };
+
+    cs2.publish_match(
+        match_id.clone(),
+        Some(port),
+        plan.map_name.clone(),
+        plan.bet_per_player,
+        10,
+        None,
+    )
+    .await;
+
+    let match_params = cs2::matchzy::MatchParams {
+        match_id: match_id.clone(),
+        chosen_maps: plan.chosen_map_ids(),
+        team1_name: plan.team_a_name.clone(),
+        team1_tag: plan.team_a_tag.clone(),
+        team1_players: plan.team_a_roster.clone(),
+        team2_name: plan.team_b_name.clone(),
+        team2_tag: plan.team_b_tag.clone(),
+        team2_players: plan.team_b_roster.clone(),
+        num_maps: plan.games_per_match,
+        spectators: vec![
+            ("76561198675781576".into(), "Admin 1".into()),
+            ("76561198042296985".into(), "Admin 2".into()),
+        ]
+        .into_iter()
+        .filter(|(s64, _)| {
+            !plan.team_a_roster.iter().any(|(s, _)| s == s64)
+                && !plan.team_b_roster.iter().any(|(s, _)| s == s64)
+        })
+        .collect(),
+    };
+
+    if let Err(e) = cs2.configure_match(match_params).await {
+        tracing::warn!("[mixton_create_match] configure_match falló: {e}");
+    }
+
+    let cs2_clone = cs2.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cs2_clone.start_server(port).await {
+            tracing::warn!("[mixton_create_match] start_server falló en puerto {port}: {e}");
+        }
+    });
+
+    if let Some(ref doc_sink) = docs {
+        let entity_custom_name = if plan.bet_per_player > 0.0 {
+            format!("Mixton Apuesta (S/ {:.2})", plan.bet_per_player)
+        } else {
+            "Mixton / Web".to_string()
+        };
+
+        let faction1_roster: Vec<serde_json::Value> = plan
+            .full_roster_a
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.faceit_player_id.as_deref(),
+                    "nickname": crate::launch::player_display_name(p),
+                    "discord_id": p.discord_id,
+                    "steam_id_64": p.steam_id_64,
+                })
+            })
+            .collect();
+
+        let faction2_roster: Vec<serde_json::Value> = plan
+            .full_roster_b
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.faceit_player_id.as_deref(),
+                    "nickname": crate::launch::player_display_name(p),
+                    "discord_id": p.discord_id,
+                    "steam_id_64": p.steam_id_64,
+                })
+            })
+            .collect();
+
+        let doc = json!({
+            "id": match_id,
+            "entity_custom_name": entity_custom_name,
+            "game": "cs2",
+            "map": plan.map_name,
+            "location": "Mixton",
+            "faction1_name": plan.team_a_name,
+            "faction2_name": plan.team_b_name,
+            "faction1_roster": faction1_roster,
+            "faction2_roster": faction2_roster,
+            "faction1_vc_id": serde_json::Value::Null,
+            "faction2_vc_id": serde_json::Value::Null,
+            "message_id": serde_json::Value::Null,
+            "matches_channel_id": serde_json::Value::Null,
+            "waiting_room_id": serde_json::Value::Null,
+            "queue_id": "steam",
+            "queue_name": "Servidor CS2 Dedicado",
+            "original_voice_states": json!({}),
+            "creator_id": user.user_id,
+            "guild_id": guild_id,
+            "startedAt": now_ms,
+            "createdAt": data::timestamp_now(),
+        });
+
+        if let Err(e) = doc_sink
+            .set_doc("faceit_active_matches", &match_id, &doc)
+            .await
+        {
+            tracing::error!(
+                "[mixton_create_match] Error al escribir en Firestore faceit_active_matches: {e}"
+            );
+        }
+    }
+
+    // Lee el estado fresco del lobby para evitar pisar cambios concurrentes
+    let mut fresh_state = manager.get_state(guild_id).await;
+    let fresh_team_a = fresh_state.teams.iter().find(|t| t.id == plan.team_a_id);
+    let fresh_team_b = fresh_state.teams.iter().find(|t| t.id == plan.team_b_id);
+
+    let same_captains = match (fresh_team_a, fresh_team_b) {
+        (Some(ta), Some(tb)) => {
+            let cap_a = ta.captain.as_ref().map(|c| &c.discord_id);
+            let cap_b = tb.captain.as_ref().map(|c| &c.discord_id);
+            cap_a.is_some()
+                && cap_a == launched_cap_a.as_ref()
+                && cap_b.is_some()
+                && cap_b == launched_cap_b.as_ref()
+        }
+        _ => false,
+    };
+
+    if same_captains {
+        crate::launch::reset_lobby_after_launch(&mut fresh_state, &plan.team_a_id, &plan.team_b_id);
+        manager.cancel_roulette(guild_id);
+        fresh_state.sanitize();
+        let _ = manager.update_state(guild_id, fresh_state).await;
+    } else {
+        tracing::warn!(
+            "[mixton_create_match] Los capitanes del lobby cambiaron o los equipos ya no existen en guild {guild_id}; se omite el reinicio del lobby"
+        );
+    }
+
+    let server_ip = cs2.get_server_ip_for_port(port);
+    Json(json!({
+        "success": true,
+        "matchId": match_id,
+        "faceitHubUrl": serde_json::Value::Null,
+        "assignedQueue": {
+            "id": "steam",
+            "queueId": "steam",
+            "name": "Servidor CS2 Dedicado"
+        },
+        "gamesPerMatch": plan.games_per_match,
+        "roundsPerGame": plan.games_per_match,
+        "serverIp": server_ip
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

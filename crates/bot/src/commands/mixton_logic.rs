@@ -53,6 +53,12 @@ pub fn build_player_from_doc(
     avatar_url: Option<String>,
     doc: &Map<String, Value>,
 ) -> Player {
+    let faceit_player_id = doc
+        .get("faceit_player_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let faceit_nick = doc
         .get("faceit_nickname")
         .and_then(Value::as_str)
@@ -97,6 +103,7 @@ pub fn build_player_from_doc(
     let mut player = Player {
         discord_id: discord_id.to_string(),
         nickname: display_name.to_string(),
+        faceit_player_id,
         faceit_nickname: faceit_nick,
         steam_id_64: steam_id,
         avatar: avatar_url,
@@ -278,6 +285,7 @@ mod tests {
             Some("https://avatar.url/1.png".to_string()),
             &doc_tier_s,
         );
+        assert_eq!(player_s.faceit_player_id, Some("p-s".to_string()));
         assert_eq!(player_s.faceit_elo, 2100);
         assert_eq!(player_s.faceit_level, Some(10));
         assert_eq!(player_s.tier, "S");
@@ -295,6 +303,7 @@ mod tests {
         .unwrap();
 
         let player_a = build_player_from_doc("discord_2", "DiscordName2", None, &doc_tier_a);
+        assert_eq!(player_a.faceit_player_id, Some("p-a".to_string()));
         assert_eq!(player_a.faceit_elo, 1600);
         assert_eq!(player_a.faceit_level, Some(8));
         assert_eq!(player_a.tier, "A");
@@ -310,6 +319,7 @@ mod tests {
         .unwrap();
 
         let player_b = build_player_from_doc("discord_3", "DiscordName3", None, &doc_tier_b);
+        assert_eq!(player_b.faceit_player_id, Some("p-b".to_string()));
         assert_eq!(player_b.faceit_elo, 1250);
         assert_eq!(player_b.faceit_level, Some(6));
         assert_eq!(player_b.tier, "B");
@@ -325,6 +335,7 @@ mod tests {
         .unwrap();
 
         let player_c = build_player_from_doc("discord_4", "DiscordName4", None, &doc_tier_c);
+        assert_eq!(player_c.faceit_player_id, Some("p-c".to_string()));
         assert_eq!(player_c.faceit_elo, 800);
         assert_eq!(player_c.faceit_level, Some(3));
         assert_eq!(player_c.tier, "C");
@@ -342,6 +353,7 @@ mod tests {
         .unwrap();
 
         let player_ov = build_player_from_doc("discord_5", "DiscordName5", None, &doc_override);
+        assert_eq!(player_ov.faceit_player_id, Some("p-ov".to_string()));
         assert_eq!(player_ov.faceit_elo, 500);
         assert_eq!(player_ov.faceit_level, Some(1));
         assert_eq!(player_ov.mixton_tier_override, Some("A".to_string()));
@@ -356,9 +368,20 @@ mod tests {
         .unwrap();
 
         let player_def = build_player_from_doc("discord_6", "DiscordName6", None, &doc_default);
+        assert_eq!(player_def.faceit_player_id, Some("p-def".to_string()));
         assert_eq!(player_def.faceit_elo, 1000);
         assert_eq!(player_def.faceit_level, Some(4));
         assert_eq!(player_def.tier, "C");
+
+        // Caso 7: Sin faceit_player_id en el doc
+        let doc_no_id = json!({
+            "faceit_nickname": "NoIdPlayer"
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let player_no_id = build_player_from_doc("discord_7", "DiscordName7", None, &doc_no_id);
+        assert_eq!(player_no_id.faceit_player_id, None);
     }
 
     #[test]
@@ -373,6 +396,7 @@ mod tests {
             state.available_players.push(Player {
                 discord_id: format!("p_{}", i),
                 nickname: format!("Nick {}", i),
+                faceit_player_id: None,
                 faceit_nickname: None,
                 steam_id_64: None,
                 avatar: None,
@@ -391,6 +415,7 @@ mod tests {
         state.available_players.push(Player {
             discord_id: "p_10".to_string(),
             nickname: "Nick 10".to_string(),
+            faceit_player_id: None,
             faceit_nickname: None,
             steam_id_64: None,
             avatar: None,
@@ -431,6 +456,7 @@ mod tests {
         let cap_a = Player {
             discord_id: "cap_a".to_string(),
             nickname: "CapA".to_string(),
+            faceit_player_id: None,
             faceit_nickname: None,
             steam_id_64: None,
             avatar: None,

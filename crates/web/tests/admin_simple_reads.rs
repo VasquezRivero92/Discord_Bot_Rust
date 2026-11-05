@@ -728,7 +728,8 @@ async fn reads_mount_only_with_firestore() {
             claims: None,
             admin: with_firestore.then(|| fakes.repos()),
             cs2: None,
-        lobby: None,
+            lobby: None,
+            docs: None,
         }))
         .await;
         for (path, key) in ALL {

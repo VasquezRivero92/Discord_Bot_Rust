@@ -70,6 +70,8 @@ fn test_router() -> Router {
         manager,
         auth: Arc::new(session),
         uploads_dir,
+        cs2: None,
+        docs: None,
     })
 }
 

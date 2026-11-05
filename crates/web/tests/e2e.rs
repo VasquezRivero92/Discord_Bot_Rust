@@ -153,7 +153,8 @@ impl Front {
             claims,
             admin: None,
             cs2: None,
-        lobby: None,
+            lobby: None,
+            docs: None,
         }))
         .await;
         Front {
@@ -321,6 +322,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
         admin: None,
         cs2: None,
         lobby: None,
+        docs: None,
     }))
     .await;
     let c = client();

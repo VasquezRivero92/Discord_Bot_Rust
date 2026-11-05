@@ -42,6 +42,7 @@ pub struct AppDeps {
     pub admin: Option<routes::admin::AdminRepos>,
     pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
     pub lobby: Option<Arc<lobby::LobbyManager>>,
+    pub docs: Option<Arc<dyn data::DocSink>>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -112,6 +113,7 @@ pub fn build_app(deps: AppDeps) -> Router {
         }
         Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
     }
+    let lobby_cs2 = deps.cs2.clone();
     if let Some(cs2_mgr) = deps.cs2 {
         migrated = migrated
             .merge(routes::cs2_api::router(routes::cs2_api::Cs2ApiState {
@@ -136,6 +138,8 @@ pub fn build_app(deps: AppDeps) -> Router {
             manager: lobby_mgr,
             auth: lobby_auth,
             uploads_dir: cfg.static_dir.join("uploads").join("chat"),
+            cs2: lobby_cs2,
+            docs: deps.docs,
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before

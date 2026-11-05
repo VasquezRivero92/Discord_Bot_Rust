@@ -65,6 +65,8 @@ fn setup_test_app() -> (Router, PathBuf, Arc<LobbyManager>) {
         manager: manager.clone(),
         auth: Arc::new(session),
         uploads_dir: uploads_dir.clone(),
+        cs2: None,
+        docs: None,
     });
     (router, uploads_dir, manager)
 }
