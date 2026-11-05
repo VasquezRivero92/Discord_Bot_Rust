@@ -967,4 +967,12 @@ mod tests {
         assert_eq!(state.available_players[0].discord_id, "extra_1");
         assert_eq!(state.available_players[1].discord_id, "extra_2");
     }
+
+    #[test]
+    fn test_lobby_state_default_bet_values() {
+        let state = crate::state::LobbyState::default();
+        assert_eq!(state.effective_bet_amount, 0.0);
+        assert_eq!(state.agreed_bet_amount, None);
+        assert_eq!(state.bet_agreed, false);
+    }
 }

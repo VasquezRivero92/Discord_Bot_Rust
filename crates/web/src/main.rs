@@ -122,6 +122,9 @@ async fn run() -> ExitCode {
     let docs = client
         .clone()
         .map(|c| Arc::new(c) as Arc<dyn data::DocSink>);
+    let wallet = client
+        .clone()
+        .map(|c| Arc::new(c) as Arc<dyn data::WalletStore>);
     let app = build_app(AppDeps {
         config: cfg,
         claims,
@@ -130,6 +133,7 @@ async fn run() -> ExitCode {
         lobby,
         docs,
         notifier: notifier_slot,
+        wallet,
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(

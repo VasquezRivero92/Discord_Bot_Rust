@@ -156,6 +156,7 @@ impl Front {
             lobby: None,
             docs: None,
             notifier: Default::default(),
+            wallet: None,
         }))
         .await;
         Front {
@@ -325,6 +326,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
         lobby: None,
         docs: None,
         notifier: Default::default(),
+        wallet: None,
     }))
     .await;
     let c = client();

@@ -16,6 +16,7 @@ mod orders;
 mod source;
 mod support_calls;
 mod users;
+mod wallet;
 mod watch;
 mod write;
 
@@ -49,5 +50,6 @@ pub use crate::support_calls::{
 pub use crate::users::{
     FaceitUser, FakeUsersRepo, FirestoreUsersRepo, UsersRepo, USERS_ALL_TTL, USER_TTL,
 };
+pub use crate::wallet::{round2, FakeWalletStore, WalletError, WalletStore};
 pub use crate::watch::WatcherHandle;
 pub use crate::write::{json_to_firestore_value, timestamp_now, DocSink, FakeDocSink};

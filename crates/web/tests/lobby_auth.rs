@@ -73,6 +73,7 @@ fn test_router() -> Router {
         cs2: None,
         docs: None,
         notifier: Default::default(),
+        wallet: None,
     })
 }
 

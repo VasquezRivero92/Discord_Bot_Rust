@@ -27,6 +27,7 @@ pub struct LobbyApiState {
     pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
     pub notifier: crate::notify::NotifierSlot,
+    pub wallet: Option<std::sync::Arc<dyn data::WalletStore>>,
 }
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ pub(crate) struct LobbyCtx {
     pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
     pub notifier: crate::notify::NotifierSlot,
+    pub wallet: Option<std::sync::Arc<dyn data::WalletStore>>,
 }
 
 impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
@@ -72,6 +74,12 @@ impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<dyn data::DocSin
 impl axum::extract::FromRef<LobbyCtx> for crate::notify::NotifierSlot {
     fn from_ref(ctx: &LobbyCtx) -> Self {
         ctx.notifier.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<dyn data::WalletStore>> {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.wallet.clone()
     }
 }
 
@@ -209,6 +217,7 @@ pub fn router(state: LobbyApiState) -> Router {
         cs2: state.cs2,
         docs: state.docs,
         notifier: state.notifier,
+        wallet: state.wallet,
     };
     Router::new()
         // Estado y lecturas básicas
@@ -225,7 +234,17 @@ pub fn router(state: LobbyApiState) -> Router {
             get(map_catalog).post(update_map_catalog),
         )
         .route("/api/lobby/mixton-queues", get(mixton_queues))
-        // Dinero (wallet, player-balance, quick-add-balance, recharge-yape): sin escritura a Firestore en Rust todavía; se dejan sin registrar para que el proxy las envíe al legado Node. NO simular saldo.
+        // Monedero y saldo (Tarea B15)
+        .route(
+            "/api/lobby/player-balance/{discord_id}",
+            get(player_balance),
+        )
+        .route("/api/lobby/quick-add-balance", post(quick_add_balance))
+        .route(
+            "/api/lobby/mixton-check-bet-status",
+            post(mixton_check_bet_status),
+        )
+        // Rutas wallet y wallet/recharge-yape: sin implementar aún en Rust; caen al proxy del legado Node.
         .route("/api/lobby/users", get(users))
         .route("/api/lobby/steam-avatars", get(steam_avatars))
         .route("/api/lobby/steam-avatar/{steam_id}", get(steam_avatar))
@@ -274,7 +293,7 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-start", post(mixton_start))
         .route("/api/lobby/mixton-pick-order", post(mixton_pick_order))
         .route("/api/lobby/mixton-create-match", post(mixton_create_match))
-        // Sin implementación real en Rust todavía (no se simula éxito): mixton-check-bet-status, mixton-load-team, mixton-override-tier, sync-faceit-from-steam, verify-faceit, mixton-toggle-command. Caen al proxy del legado.
+        // Sin implementación real en Rust todavía (no se simula éxito): mixton-load-team, mixton-override-tier, sync-faceit-from-steam, verify-faceit, mixton-toggle-command, wallet, wallet/recharge-yape. Caen al proxy del legado.
         // Chat
         .route("/api/lobby/mixton-chat-history", get(chat_history))
         .route(
@@ -2251,6 +2270,435 @@ async fn mixton_create_match(
         "gamesPerMatch": plan.games_per_match,
         "roundsPerGame": plan.games_per_match,
         "serverIp": server_ip
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Debug)]
+pub struct QuickAddBalancePayload {
+    #[serde(rename = "discordId")]
+    pub discord_id: Option<String>,
+    pub amount: Option<serde_json::Value>,
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MixtonCheckBetStatusPayload {
+    #[serde(rename = "teamIdA")]
+    pub team_id_a: Option<String>,
+    #[serde(rename = "teamIdB")]
+    pub team_id_b: Option<String>,
+    #[serde(rename = "betAmount", default)]
+    pub bet_amount: Option<serde_json::Value>,
+}
+
+/// Consulta individual de saldo de jugador para el servidor actual (o global).
+async fn player_balance(
+    user: RequireUser,
+    Path(discord_id): Path<String>,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    State(wallet): State<Option<Arc<dyn data::WalletStore>>>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    let Some(wallet) = wallet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "El monedero no está configurado." })),
+        )
+            .into_response();
+    };
+
+    match wallet.balance(Some(guild_id), &discord_id).await {
+        Ok(balance) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "discordId": discord_id,
+                "balance": balance
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Error al consultar saldo." })),
+        )
+            .into_response(),
+    }
+}
+
+/// Recarga manual de saldo por parte de un administrador con difusión por WebSockets.
+async fn quick_add_balance(
+    admin: RequireAdmin,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    State(wallet): State<Option<Arc<dyn data::WalletStore>>>,
+    Json(payload): Json<QuickAddBalancePayload>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    let Some(wallet) = wallet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "El monedero no está configurado." })),
+        )
+            .into_response();
+    };
+
+    let discord_id = match payload
+        .discord_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Faltan discordId o monto." })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(amount_val) = payload.amount.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Faltan discordId o monto." })),
+        )
+            .into_response();
+    };
+
+    let parsed_amount = match amount_val {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+
+    let amount = match parsed_amount {
+        Some(a) if a.is_finite() && a > 0.0 => a,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "El monto debe ser un número positivo." })),
+            )
+                .into_response();
+        }
+    };
+
+    let default_reason = format!("Recarga manual por admin {}", admin.username);
+    let reason = payload
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&default_reason);
+
+    match wallet
+        .adjust(Some(guild_id), &discord_id, amount, reason)
+        .await
+    {
+        Ok(new_balance) => {
+            let ws_payload = json!({
+                "type": "player_balance_update",
+                "data": {
+                    "discordId": discord_id,
+                    "newBalance": new_balance,
+                    "guildId": guild_id
+                }
+            });
+            manager.broadcast_json(guild_id, &ws_payload).await;
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "discordId": discord_id,
+                    "newBalance": new_balance
+                })),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Error al recargar saldo." })),
+        )
+            .into_response(),
+    }
+}
+
+/// Verifica estado de apuestas y saldos de los 10 jugadores antes de lanzar partida.
+async fn mixton_check_bet_status(
+    user: RequireUser,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    State(wallet): State<Option<Arc<dyn data::WalletStore>>>,
+    Json(payload): Json<MixtonCheckBetStatusPayload>,
+) -> impl IntoResponse {
+    let g_opt = extract_guild_id(raw.as_deref());
+    let guild_opt = match resolve_guild_for_user(&user, g_opt.as_deref(), false) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+
+    let Some(wallet) = wallet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "El monedero no está configurado." })),
+        )
+            .into_response();
+    };
+
+    let team_id_a = match payload
+        .team_id_a
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Debes seleccionar dos equipos." })),
+            )
+                .into_response();
+        }
+    };
+
+    let team_id_b = match payload
+        .team_id_b
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Debes seleccionar dos equipos." })),
+            )
+                .into_response();
+        }
+    };
+
+    let state = manager.get_state(guild_id).await;
+    let team_a = state.teams.iter().find(|t| t.id == team_id_a);
+    let team_b = state.teams.iter().find(|t| t.id == team_id_b);
+
+    let (Some(team_a), Some(team_b)) = (team_a, team_b) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Equipos no encontrados." })),
+        )
+            .into_response();
+    };
+
+    if team_a.captain.is_none()
+        || team_a.players.len() != 4
+        || team_b.captain.is_none()
+        || team_b.players.len() != 4
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Ambos equipos deben estar completos (5 jugadores c/u)."
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(ref cap_a) = team_a.captain else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Ambos equipos deben estar completos (5 jugadores c/u)."
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref cap_b) = team_b.captain else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Ambos equipos deben estar completos (5 jugadores c/u)."
+            })),
+        )
+            .into_response();
+    };
+
+    let roster_a: Vec<&Player> = std::iter::once(cap_a)
+        .chain(team_a.players.iter())
+        .collect();
+    let roster_b: Vec<&Player> = std::iter::once(cap_b)
+        .chain(team_b.players.iter())
+        .collect();
+
+    let parsed_bet_amount = match &payload.bet_amount {
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0).max(0.0),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0).max(0.0),
+        _ => 0.0,
+    };
+    let parsed_bet_amount = data::round2(parsed_bet_amount);
+
+    let all_player_ids: Vec<String> = roster_a
+        .iter()
+        .chain(roster_b.iter())
+        .map(|p| p.discord_id.clone())
+        .collect();
+
+    let users_data_map = match wallet.users_map(Some(guild_id), &all_player_ids).await {
+        Ok(m) => m,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Error al verificar saldos de los jugadores." })),
+            )
+                .into_response();
+        }
+    };
+
+    let build_player = |p: &Player, team_letter: &str, team_obj: &LobbyTeam| {
+        let empty_obj = serde_json::json!({});
+        let u = users_data_map.get(&p.discord_id).unwrap_or(&empty_obj);
+        let balance = u
+            .get("wallet_balance")
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+            .unwrap_or(0.0);
+        let balance = data::round2(balance);
+
+        let has_saved_phone = u
+            .get("phoneNumber")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+        let steam_from_p = p.steam_id_64.as_deref().unwrap_or("").trim();
+        let steam_from_u = u
+            .get("steam_id_64")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let candidate_steam = if !steam_from_p.is_empty() {
+            steam_from_p
+        } else {
+            steam_from_u
+        };
+
+        let has_steam =
+            candidate_steam.len() == 17 && candidate_steam.chars().all(|c| c.is_ascii_digit());
+        let steam_id_64 = if has_steam {
+            serde_json::Value::String(candidate_steam.to_string())
+        } else {
+            serde_json::Value::Null
+        };
+
+        let display_name = p
+            .discord_user
+            .as_ref()
+            .map(|du| {
+                if !du.display_name.trim().is_empty() {
+                    du.display_name.as_str()
+                } else {
+                    du.username.as_str()
+                }
+            })
+            .filter(|s| !s.trim().is_empty())
+            .or(p.faceit_nickname.as_deref())
+            .unwrap_or(&p.nickname);
+
+        let avatar_url = p
+            .discord_user
+            .as_ref()
+            .map(|du| du.avatar_url.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                p.avatar
+                    .as_deref()
+                    .map(|av| format_discord_avatar(&p.discord_id, Some(av)))
+            });
+
+        let is_captain = team_obj
+            .captain
+            .as_ref()
+            .map(|c| c.discord_id == p.discord_id)
+            .unwrap_or(false);
+
+        let has_enough = parsed_bet_amount == 0.0 || balance >= parsed_bet_amount;
+        let deficit = if parsed_bet_amount <= balance {
+            0.0
+        } else {
+            data::round2(parsed_bet_amount - balance)
+        };
+
+        json!({
+            "discordId": p.discord_id,
+            "faceit_nickname": p.faceit_nickname,
+            "displayName": display_name,
+            "avatarURL": avatar_url,
+            "hasSavedPhone": has_saved_phone,
+            "hasSteam": has_steam,
+            "steam_id_64": steam_id_64,
+            "team": team_letter,
+            "teamName": team_obj.name,
+            "isCaptain": is_captain,
+            "balance": balance,
+            "hasEnough": has_enough,
+            "deficit": deficit
+        })
+    };
+
+    let mut players_list = Vec::with_capacity(10);
+    for p in &roster_a {
+        players_list.push(build_player(p, "A", team_a));
+    }
+    for p in &roster_b {
+        players_list.push(build_player(p, "B", team_b));
+    }
+
+    let mut missing_steam_players = Vec::new();
+    for pl in &players_list {
+        if pl.get("hasSteam").and_then(|v| v.as_bool()) != Some(true) {
+            missing_steam_players.push(json!({
+                "discordId": pl["discordId"],
+                "faceit_nickname": pl["faceit_nickname"],
+                "displayName": pl["displayName"]
+            }));
+        }
+    }
+
+    let all_ready = missing_steam_players.is_empty()
+        && players_list
+            .iter()
+            .all(|pl| pl.get("hasEnough").and_then(|v| v.as_bool()) == Some(true));
+
+    let total_pot = data::round2(parsed_bet_amount * 10.0);
+
+    Json(json!({
+        "betAmount": parsed_bet_amount,
+        "totalPot": total_pot,
+        "allReady": all_ready,
+        "teamA": {
+            "id": team_a.id,
+            "name": team_a.name
+        },
+        "teamB": {
+            "id": team_b.id,
+            "name": team_b.name
+        },
+        "players": players_list,
+        "missingSteamPlayers": missing_steam_players
     }))
     .into_response()
 }

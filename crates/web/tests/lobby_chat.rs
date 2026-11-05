@@ -68,6 +68,7 @@ fn setup_test_app() -> (Router, PathBuf, Arc<LobbyManager>) {
         cs2: None,
         docs: None,
         notifier: Default::default(),
+        wallet: None,
     });
     (router, uploads_dir, manager)
 }

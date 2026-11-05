@@ -647,6 +647,13 @@ impl LobbyManager {
         let _ = tx.send(payload);
     }
 
+    /// Difunde un mensaje JSON arbitrario por WebSockets a todos los navegadores conectados en este servidor.
+    pub async fn broadcast_json(&self, guild_id: &str, payload: &serde_json::Value) {
+        let msg = payload.to_string();
+        let tx = self.get_broadcast_channel(guild_id).await;
+        let _ = tx.send(msg);
+    }
+
     /// Jugador ingresa a la sala de Mixton.
     pub async fn join_queue(&self, guild_id: &str, mut player: Player) -> LobbyState {
         let mut states = self.states.write().await;

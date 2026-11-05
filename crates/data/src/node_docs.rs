@@ -77,7 +77,7 @@ fn reference_path(r: &str) -> &str {
     r.split_once("/documents/").map_or(r, |(_, path)| path)
 }
 
-fn node_fields(fields: &HashMap<String, PbValue>) -> Map<String, Value> {
+pub(crate) fn node_fields(fields: &HashMap<String, PbValue>) -> Map<String, Value> {
     fields
         .iter()
         .map(|(k, v)| (k.clone(), node_json(v)))

@@ -553,6 +553,7 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             lobby: None,
             docs: None,
             notifier: Default::default(),
+            wallet: None,
         }))
         .await;
         for path in ALL {
@@ -612,6 +613,7 @@ async fn legacy_panel_writes_clear_the_rust_caches() {
         lobby: None,
         docs: None,
         notifier: Default::default(),
+        wallet: None,
     }))
     .await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();

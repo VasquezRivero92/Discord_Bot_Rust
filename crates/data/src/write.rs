@@ -74,7 +74,9 @@ pub fn json_to_firestore_value(val: &serde_json::Value) -> PbValue {
 }
 
 /// Extrae y convierte los campos de un objeto JSON a un mapa de campos de Firestore.
-fn json_to_document_fields(val: &serde_json::Value) -> Result<HashMap<String, PbValue>, DataError> {
+pub(crate) fn json_to_document_fields(
+    val: &serde_json::Value,
+) -> Result<HashMap<String, PbValue>, DataError> {
     match val {
         serde_json::Value::Object(map) => Ok(map
             .iter()

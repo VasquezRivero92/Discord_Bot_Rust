@@ -90,6 +90,7 @@ fn test_router_with_notifier(
         cs2,
         docs,
         notifier,
+        wallet: None,
     })
 }
 

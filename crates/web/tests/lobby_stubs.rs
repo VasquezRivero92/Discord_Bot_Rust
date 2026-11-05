@@ -56,6 +56,7 @@ fn test_router() -> Router {
         cs2: None,
         docs: None,
         notifier: Default::default(),
+        wallet: None,
     })
 }
 
@@ -65,7 +66,6 @@ async fn test_rutas_stub_no_son_respondidas_por_el_lobby_admin_autenticado() {
     let admin_token = make_token("admin", true, Some("default"));
 
     let stubs = [
-        "/api/lobby/mixton-check-bet-status",
         "/api/lobby/mixton-load-team",
         "/api/lobby/mixton-override-tier",
         "/api/lobby/sync-faceit-from-steam",

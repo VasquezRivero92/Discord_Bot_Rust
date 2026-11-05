@@ -44,6 +44,7 @@ pub struct AppDeps {
     pub lobby: Option<Arc<lobby::LobbyManager>>,
     pub docs: Option<Arc<dyn data::DocSink>>,
     pub notifier: lobby::notify::NotifierSlot,
+    pub wallet: Option<Arc<dyn data::WalletStore>>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -142,6 +143,7 @@ pub fn build_app(deps: AppDeps) -> Router {
             cs2: lobby_cs2,
             docs: deps.docs,
             notifier: deps.notifier,
+            wallet: deps.wallet,
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
