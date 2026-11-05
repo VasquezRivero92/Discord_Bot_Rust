@@ -474,6 +474,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
         cs2: None,
         lobby: None,
         docs: None,
+        notifier: Default::default(),
     }))
     .await;
 

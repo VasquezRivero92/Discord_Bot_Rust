@@ -55,6 +55,7 @@ fn test_router() -> Router {
         uploads_dir,
         cs2: None,
         docs: None,
+        notifier: Default::default(),
     })
 }
 

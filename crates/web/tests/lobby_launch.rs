@@ -70,6 +70,15 @@ fn test_router(
     cs2: Option<Arc<Cs2ServerManager>>,
     docs: Option<Arc<dyn DocSink>>,
 ) -> Router {
+    test_router_with_notifier(manager, cs2, docs, Default::default())
+}
+
+fn test_router_with_notifier(
+    manager: Arc<LobbyManager>,
+    cs2: Option<Arc<Cs2ServerManager>>,
+    docs: Option<Arc<dyn DocSink>>,
+    notifier: lobby::notify::NotifierSlot,
+) -> Router {
     let session = SessionState::new(SECRET.as_bytes(), false).unwrap();
     let tmp_uploads = tempfile::tempdir().expect("tempdir");
     let uploads_dir = tmp_uploads.path().to_path_buf();
@@ -80,6 +89,7 @@ fn test_router(
         uploads_dir,
         cs2,
         docs,
+        notifier,
     })
 }
 
@@ -518,4 +528,98 @@ async fn test_launch_409_carrera_doble_lanzamiento() {
     assert_eq!(res2.status(), StatusCode::OK);
     let body2 = body_json(res2).await;
     assert_eq!(body2["success"], true);
+}
+
+#[tokio::test]
+async fn test_launch_notifica_en_slot_con_fake_notifier() {
+    let manager = Arc::new(LobbyManager::new("default"));
+    let mut state = setup_ten_players_state(true);
+    for team in &state.teams {
+        if let Some(ref cap) = team.captain {
+            state.available_players.push(cap.clone());
+        }
+        state.available_players.extend(team.players.iter().cloned());
+    }
+    manager.update_state("default", state).await;
+
+    let cs2 = make_cs2_manager();
+    let fake_docs = Arc::new(FakeDocSink::new());
+
+    let slot: lobby::notify::NotifierSlot = Default::default();
+    let fake_notifier = Arc::new(lobby::notify::FakeNotifier::new());
+    assert!(slot.set(fake_notifier.clone()).is_ok());
+
+    let app = test_router_with_notifier(
+        manager.clone(),
+        Some(cs2.clone()),
+        Some(fake_docs.clone()),
+        slot,
+    );
+
+    let cap_token = make_token("cap_a", "user", false, Some("default"));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/lobby/mixton-create-match")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("auth_token={cap_token}"))
+        .body(Body::from(
+            json!({
+                "teamIdA": "team_1",
+                "teamIdB": "team_2",
+                "matchMode": "steam",
+                "chosenMap": { "id": "de_dust2", "name": "Dust II" }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert_eq!(body["success"], true);
+    let match_id = body["matchId"].as_str().unwrap().to_string();
+    let server_ip = body["serverIp"].as_str().unwrap().to_string();
+
+    // Espera hasta 1 segundo porque la notificación se despacha en tokio::spawn
+    let mut received = Vec::new();
+    for _ in 0..50 {
+        received = fake_notifier.matches();
+        if !received.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        received.len(),
+        1,
+        "FakeNotifier debe recibir exactamente 1 MatchLaunchInfo"
+    );
+    let info = &received[0];
+    assert_eq!(info.match_id, match_id);
+    assert_eq!(info.server_ip, server_ip);
+    assert_eq!(info.map_name, "Dust II");
+    assert_eq!(info.team_a.name, "Equipo FC_cap_a");
+    assert_eq!(info.team_b.name, "Equipo FC_cap_b");
+    assert_eq!(info.team_a.captain_discord_id, "cap_a");
+    assert_eq!(info.team_b.captain_discord_id, "cap_b");
+    assert_eq!(info.team_a.players.len(), 5);
+    assert_eq!(info.team_b.players.len(), 5);
+
+    // Los 10 jugadores deben estar presentes con sus discord_id
+    let all_players: Vec<String> = info
+        .team_a
+        .players
+        .iter()
+        .chain(info.team_b.players.iter())
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(all_players.len(), 10);
+    assert!(all_players.contains(&"cap_a".to_string()));
+    assert!(all_players.contains(&"cap_b".to_string()));
+    for i in 1..=4 {
+        assert!(all_players.contains(&format!("a{i}")));
+        assert!(all_players.contains(&format!("b{i}")));
+    }
 }

@@ -67,6 +67,7 @@ fn setup_test_app() -> (Router, PathBuf, Arc<LobbyManager>) {
         uploads_dir: uploads_dir.clone(),
         cs2: None,
         docs: None,
+        notifier: Default::default(),
     });
     (router, uploads_dir, manager)
 }

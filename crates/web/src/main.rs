@@ -104,14 +104,16 @@ async fn run() -> ExitCode {
         .map(|a| a.claims.clone() as Arc<dyn ClaimsRepo>);
     let cs2 = Some(Arc::new(cs2::Cs2ServerManager::new(&cfg)));
     let lobby = Some(Arc::new(lobby::LobbyManager::new(&cfg.discord_guild_id)));
+    let notifier_slot: lobby::notify::NotifierSlot = Default::default();
 
     // Arrancar el bot nativo de Discord si hay token configurado
     if let Some(lobby_mgr) = lobby.clone() {
         let bot_cfg = cfg.clone();
         let bot_fs = client.clone();
+        let bot_slot = notifier_slot.clone();
         tokio::spawn(async move {
             info!("Iniciando bot nativo de Discord integrado...");
-            if let Err(e) = bot::start_bot(bot_cfg, bot_fs, lobby_mgr).await {
+            if let Err(e) = bot::start_bot(bot_cfg, bot_fs, lobby_mgr, bot_slot).await {
                 error!("El bot de Discord finalizó con error: {:?}", e);
             }
         });
@@ -127,6 +129,7 @@ async fn run() -> ExitCode {
         cs2,
         lobby,
         docs,
+        notifier: notifier_slot,
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(

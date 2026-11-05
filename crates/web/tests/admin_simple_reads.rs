@@ -730,6 +730,7 @@ async fn reads_mount_only_with_firestore() {
             cs2: None,
             lobby: None,
             docs: None,
+            notifier: Default::default(),
         }))
         .await;
         for (path, key) in ALL {

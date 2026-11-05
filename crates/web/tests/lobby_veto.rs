@@ -58,6 +58,7 @@ fn test_router(manager: Arc<LobbyManager>) -> Router {
         uploads_dir,
         cs2: None,
         docs: None,
+        notifier: Default::default(),
     })
 }
 

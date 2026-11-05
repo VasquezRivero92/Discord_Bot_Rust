@@ -26,6 +26,7 @@ pub struct LobbyApiState {
     pub uploads_dir: std::path::PathBuf,
     pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
+    pub notifier: crate::notify::NotifierSlot,
 }
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ pub(crate) struct LobbyCtx {
     pub uploads_dir: std::path::PathBuf,
     pub cs2: Option<std::sync::Arc<cs2::Cs2ServerManager>>,
     pub docs: Option<std::sync::Arc<dyn data::DocSink>>,
+    pub notifier: crate::notify::NotifierSlot,
 }
 
 impl axum::extract::FromRef<LobbyCtx> for Arc<LobbyManager> {
@@ -64,6 +66,12 @@ impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<cs2::Cs2ServerMa
 impl axum::extract::FromRef<LobbyCtx> for Option<std::sync::Arc<dyn data::DocSink>> {
     fn from_ref(ctx: &LobbyCtx) -> Self {
         ctx.docs.clone()
+    }
+}
+
+impl axum::extract::FromRef<LobbyCtx> for crate::notify::NotifierSlot {
+    fn from_ref(ctx: &LobbyCtx) -> Self {
+        ctx.notifier.clone()
     }
 }
 
@@ -200,6 +208,7 @@ pub fn router(state: LobbyApiState) -> Router {
         uploads_dir: state.uploads_dir,
         cs2: state.cs2,
         docs: state.docs,
+        notifier: state.notifier,
     };
     Router::new()
         // Estado y lecturas básicas
@@ -1973,6 +1982,7 @@ async fn mixton_create_match(
     State(manager): State<Arc<LobbyManager>>,
     State(cs2): State<Option<Arc<cs2::Cs2ServerManager>>>,
     State(docs): State<Option<Arc<dyn data::DocSink>>>,
+    State(notifier_slot): State<crate::notify::NotifierSlot>,
     Json(payload): Json<crate::launch::LaunchRequest>,
 ) -> impl IntoResponse {
     let g_opt = payload
@@ -2183,6 +2193,52 @@ async fn mixton_create_match(
     }
 
     let server_ip = cs2.get_server_ip_for_port(port);
+
+    // Notificación en Discord si hay un notificador registrado
+    if let Some(notifier) = notifier_slot.get().cloned() {
+        let launch_info = crate::notify::MatchLaunchInfo {
+            guild_id: guild_id.to_string(),
+            match_id: match_id.clone(),
+            server_ip: server_ip.clone(),
+            map_name: plan.map_name.clone(),
+            games_per_match: plan.games_per_match,
+            bet_per_player: plan.bet_per_player,
+            initiator_username: user.username.clone(),
+            team_a: crate::notify::TeamNotice {
+                name: plan.team_a_name.clone(),
+                captain_discord_id: launched_cap_a.unwrap_or_else(|| {
+                    plan.full_roster_a
+                        .first()
+                        .map(|p| p.discord_id.clone())
+                        .unwrap_or_default()
+                }),
+                players: plan
+                    .full_roster_a
+                    .iter()
+                    .map(|p| (p.discord_id.clone(), crate::launch::player_display_name(p)))
+                    .collect(),
+            },
+            team_b: crate::notify::TeamNotice {
+                name: plan.team_b_name.clone(),
+                captain_discord_id: launched_cap_b.unwrap_or_else(|| {
+                    plan.full_roster_b
+                        .first()
+                        .map(|p| p.discord_id.clone())
+                        .unwrap_or_default()
+                }),
+                players: plan
+                    .full_roster_b
+                    .iter()
+                    .map(|p| (p.discord_id.clone(), crate::launch::player_display_name(p)))
+                    .collect(),
+            },
+        };
+
+        tokio::spawn(async move {
+            notifier.match_launched(&launch_info).await;
+        });
+    }
+
     Json(json!({
         "success": true,
         "matchId": match_id,

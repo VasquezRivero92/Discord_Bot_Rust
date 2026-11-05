@@ -4,6 +4,7 @@ pub mod auth;
 pub mod draft;
 pub mod launch;
 pub mod maps;
+pub mod notify;
 pub mod roulette;
 pub mod routes;
 pub mod state;
@@ -21,6 +22,7 @@ pub use draft::{
 };
 pub use launch::{reset_lobby_after_launch, validate_launch, LaunchPlan, LaunchRequest};
 pub use maps::{default_catalog, MapInfo};
+pub use notify::{FakeNotifier, MatchLaunchInfo, MatchNotifier, NotifierSlot, TeamNotice};
 pub use roulette::{
     decide_roulette, random_unit, start_draft_after_roulette, RouletteTimings,
     ROULETTE_DRAFT_DELAY_MS,

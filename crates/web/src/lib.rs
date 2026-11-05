@@ -43,6 +43,7 @@ pub struct AppDeps {
     pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
     pub lobby: Option<Arc<lobby::LobbyManager>>,
     pub docs: Option<Arc<dyn data::DocSink>>,
+    pub notifier: lobby::notify::NotifierSlot,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -140,6 +141,7 @@ pub fn build_app(deps: AppDeps) -> Router {
             uploads_dir: cfg.static_dir.join("uploads").join("chat"),
             cs2: lobby_cs2,
             docs: deps.docs,
+            notifier: deps.notifier,
         }));
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
