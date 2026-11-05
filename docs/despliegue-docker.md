@@ -39,6 +39,10 @@ printf '%s' '<token del túnel de Cloudflare>' > secrets/tunnel-token
 ```
 
 `secrets/` está en `.gitignore`. Para usar otra ubicación: `TUNNEL_TOKEN_PATH=/ruta/al/archivo`.
+Si el túnel se reinicia en bucle con `"cloudflared tunnel run" requires the ID or name of the
+tunnel`, el archivo del token está **vacío** (comprobar: `wc -c secrets/tunnel-token` debe ser
+mayor que 0). Con un token mal copiado el mensaje es `Provided Tunnel token is not valid`.
+
 El archivo debe contener solo el token, sin saltos de línea ni comillas. Si no existe,
 `docker compose create/up` falla con un error claro en vez de crear una carpeta vacía en su lugar.
 
