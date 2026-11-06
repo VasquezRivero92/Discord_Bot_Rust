@@ -25,18 +25,21 @@ pub mod derived_reads;
 mod js;
 mod qs;
 mod route_cache;
+pub mod settings;
 pub mod simple_reads;
 pub mod target_guild;
 
 use std::sync::Arc;
 
 use axum::{extract::FromRef, response::IntoResponse, routing::get, Json, Router};
+use common::config::Config;
 use data::{
-    AdminDocsRepo, ClaimsRepo, FirestoreAdminDocsRepo, FirestoreClaimsRepo, FirestoreClient,
-    FirestoreGlobalSettingsRepo, FirestoreLogsRepo, FirestoreMatchHistoryRepo,
-    FirestoreMessagesRepo, FirestoreOrdersRepo, FirestoreSupportCallsRepo, GlobalSettingsRepo,
-    LogsRepo, MatchHistoryRepo, MessagesRepo, OrdersRepo, SupportCallsRepo, WatcherHandle,
-    GLOBAL_SETTINGS_TTL,
+    AdminDocsRepo, ClaimsRepo, DocSink, FirestoreAdminDocsRepo, FirestoreClaimsRepo,
+    FirestoreClient, FirestoreGlobalSettingsRepo, FirestoreGuildSettingsRepo, FirestoreLogsRepo,
+    FirestoreMatchHistoryRepo, FirestoreMessagesRepo, FirestoreOrdersRepo,
+    FirestoreSupportCallsRepo, GlobalSettingsRepo, GuildSettingsRepo, LogsRepo, MatchHistoryRepo,
+    MessagesRepo, OrdersRepo, SupportCallsRepo, WatcherHandle, GLOBAL_SETTINGS_TTL,
+    GUILD_SETTINGS_TTL,
 };
 
 use crate::session::SessionState;
@@ -69,8 +72,11 @@ pub struct AdminRepos {
     pub messages: Arc<dyn MessagesRepo>,
     /// `getSettings()` (para `features` de `/stats`).
     pub global_settings: Arc<dyn GlobalSettingsRepo>,
+    pub guild_settings: Arc<dyn GuildSettingsRepo>,
     /// Documentos completos: `/stats`, `/users/backup`, `/yape/transactions`.
     pub docs: Arc<dyn AdminDocsRepo>,
+    pub doc_sink: Arc<dyn DocSink>,
+    pub config: Arc<Config>,
     /// Cachés de `/stats` y `/yape/transactions`.
     pub caches: AdminCaches,
     /// Tareas que deben vivir tanto como los repos (watcher de los ajustes
@@ -79,14 +85,19 @@ pub struct AdminRepos {
 }
 
 impl AdminRepos {
-    /// Todos los repos sobre una misma conexión a Firestore. Lanza el watcher
-    /// de `faceit_config/settings` (necesita un runtime de tokio).
-    pub fn firestore(client: &FirestoreClient) -> Self {
+    /// Todos los repos sobre una misma conexión a Firestore. Lanza los watchers
+    /// de `faceit_config/settings` y `guild_settings` (necesita un runtime de tokio).
+    pub fn firestore(client: &FirestoreClient, config: Arc<Config>) -> Self {
         let global = Arc::new(FirestoreGlobalSettingsRepo::from_client(
             client.clone(),
             GLOBAL_SETTINGS_TTL,
         ));
-        let watcher = Arc::new(global.clone().spawn_watcher());
+        let global_watcher = Arc::new(global.clone().spawn_watcher());
+        let guild_settings = Arc::new(FirestoreGuildSettingsRepo::from_client(
+            client.clone(),
+            GUILD_SETTINGS_TTL,
+        ));
+        let guild_watcher = Arc::new(guild_settings.clone().spawn_watcher());
         Self {
             claims: Arc::new(FirestoreClaimsRepo::new(client.clone())),
             orders: Arc::new(FirestoreOrdersRepo::new(client.clone())),
@@ -95,9 +106,12 @@ impl AdminRepos {
             match_history: Arc::new(FirestoreMatchHistoryRepo::new(client.clone())),
             messages: Arc::new(FirestoreMessagesRepo::new(client.clone())),
             global_settings: global,
+            guild_settings,
             docs: Arc::new(FirestoreAdminDocsRepo::new(client.clone())),
+            doc_sink: Arc::new(client.clone()),
+            config,
             caches: AdminCaches::default(),
-            watchers: vec![watcher],
+            watchers: vec![global_watcher, guild_watcher],
         }
     }
 }
@@ -110,7 +124,8 @@ pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
     if let Some(repos) = repos {
         router = router
             .merge(simple_reads::router(state.session.clone(), repos.clone()))
-            .merge(derived_reads::router(state.session, repos));
+            .merge(derived_reads::router(state.session.clone(), repos.clone()))
+            .merge(settings::router(state.session, repos));
     }
     router
 }

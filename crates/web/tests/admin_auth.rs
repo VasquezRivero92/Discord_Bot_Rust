@@ -480,7 +480,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
     let t = token(&claims("global_admin", true, None));
     for (method, path) in [
         ("POST", "/api/admin/orders/x/status"),
-        ("GET", "/api/admin/guilds"),
+        ("GET", "/api/admin/leaderboard"),
         ("GET", "/api/admin/claims?status=open"),
         ("DELETE", "/api/admin/claims/LR-1"),
     ] {

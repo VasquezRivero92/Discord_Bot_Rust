@@ -18,9 +18,10 @@ use axum::{
 };
 use common::config::Config;
 use data::{
-    default_message_templates, DataError, FakeLogsRepo, FakeMatchHistoryRepo, FakeMessagesRepo,
-    FakeOrdersRepo, FakeSupportCallsRepo, FirestoreAdminDocsRepo, InMemoryClaimsRepo,
-    InMemoryGlobalSettingsRepo, InMemoryNodeDocs, LogEntry, LogsRepo,
+    default_message_templates, DataError, FakeDocSink, FakeLogsRepo, FakeMatchHistoryRepo,
+    FakeMessagesRepo, FakeOrdersRepo, FakeSupportCallsRepo, FirestoreAdminDocsRepo,
+    InMemoryClaimsRepo, InMemoryGlobalSettingsRepo, InMemoryGuildSettingsRepo, InMemoryNodeDocs,
+    LogEntry, LogsRepo,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -102,6 +103,21 @@ impl Fakes {
     }
 
     fn repos(&self) -> AdminRepos {
+        let vars: HashMap<String, String> = [
+            ("ADMIN_JWT_SECRET", SECRET),
+            ("BASE_URL", "http://localhost:15633"),
+            ("DISCORD_CLIENT_ID", "123"),
+            ("DISCORD_CLIENT_SECRET", "test-secret"),
+            ("DISCORD_TOKEN", "test-token"),
+            ("DISCORD_GUILD_ID", "456"),
+            ("LEGACY_URL", "http://localhost:3000"),
+            ("STATIC_DIR", "."),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let cfg = Arc::new(Config::from_map(&vars).unwrap());
+
         AdminRepos {
             claims: self.claims.clone(),
             orders: self.orders.clone(),
@@ -110,9 +126,12 @@ impl Fakes {
             match_history: self.history.clone(),
             messages: self.messages.clone(),
             global_settings: Arc::new(InMemoryGlobalSettingsRepo::new()),
+            guild_settings: Arc::new(InMemoryGuildSettingsRepo::new()),
             docs: Arc::new(FirestoreAdminDocsRepo::new(Arc::new(
                 InMemoryNodeDocs::new(),
             ))),
+            doc_sink: Arc::new(FakeDocSink::new()),
+            config: cfg,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         }
@@ -752,7 +771,7 @@ async fn reads_mount_only_with_firestore() {
             ("DELETE", "/api/admin/claims/LR-2026-000001"),
             ("POST", "/api/admin/messages"),
             ("GET", "/api/admin/claims/LR-1/extra"),
-            ("GET", "/api/admin/settings"),
+            ("GET", "/api/admin/leaderboard"),
         ] {
             let res = client
                 .request(method.parse().unwrap(), format!("http://{front}{path}"))

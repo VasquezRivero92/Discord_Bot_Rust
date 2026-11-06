@@ -94,7 +94,9 @@ async fn run() -> ExitCode {
     };
     info!("listening on http://{addr}");
 
-    let admin = client.as_ref().map(AdminRepos::firestore);
+    let admin = client
+        .as_ref()
+        .map(|c| AdminRepos::firestore(c, Arc::new(cfg.clone())));
     let claims = admin
         .as_ref()
         .map(|a| a.claims.clone() as Arc<dyn ClaimsRepo>);

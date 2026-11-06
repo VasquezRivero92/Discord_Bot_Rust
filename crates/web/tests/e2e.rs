@@ -326,7 +326,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
     let c = client();
 
     let res = c
-        .get(format!("http://{addr}/api/admin/guilds"))
+        .get(format!("http://{addr}/api/admin/leaderboard"))
         .send()
         .await
         .unwrap();

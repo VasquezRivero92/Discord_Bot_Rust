@@ -16,9 +16,9 @@ use axum::{
 };
 use common::config::Config;
 use data::{
-    DataError, FakeLogsRepo, FakeMatchHistoryRepo, FakeMessagesRepo, FakeOrdersRepo,
+    DataError, FakeDocSink, FakeLogsRepo, FakeMatchHistoryRepo, FakeMessagesRepo, FakeOrdersRepo,
     FakeSupportCallsRepo, FirestoreAdminDocsRepo, GlobalSettings, InMemoryClaimsRepo,
-    InMemoryGlobalSettingsRepo, InMemoryNodeDocs,
+    InMemoryGlobalSettingsRepo, InMemoryGuildSettingsRepo, InMemoryNodeDocs,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -73,6 +73,21 @@ impl Fakes {
     fn new() -> Self {
         let docs = Arc::new(InMemoryNodeDocs::new());
         let settings = Arc::new(InMemoryGlobalSettingsRepo::new());
+        let vars: HashMap<String, String> = [
+            ("ADMIN_JWT_SECRET", SECRET),
+            ("BASE_URL", "http://localhost:15633"),
+            ("DISCORD_CLIENT_ID", "123"),
+            ("DISCORD_CLIENT_SECRET", "test-secret"),
+            ("DISCORD_TOKEN", "test-token"),
+            ("DISCORD_GUILD_ID", "456"),
+            ("LEGACY_URL", "http://localhost:3000"),
+            ("STATIC_DIR", "."),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let cfg = Arc::new(Config::from_map(&vars).unwrap());
+
         let repos = AdminRepos {
             claims: Arc::new(InMemoryClaimsRepo::default()),
             orders: Arc::new(FakeOrdersRepo::default()),
@@ -81,7 +96,10 @@ impl Fakes {
             match_history: Arc::new(FakeMatchHistoryRepo::default()),
             messages: Arc::new(FakeMessagesRepo::default()),
             global_settings: settings.clone(),
+            guild_settings: Arc::new(InMemoryGuildSettingsRepo::new()),
             docs: Arc::new(FirestoreAdminDocsRepo::new(docs.clone())),
+            doc_sink: Arc::new(FakeDocSink::new()),
+            config: cfg,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         };
@@ -572,7 +590,7 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             }
         }
         for (method, path) in [
-            ("GET", "/api/admin/settings"),
+            ("GET", "/api/admin/leaderboard"),
             ("GET", "/api/admin/stats/someone"),
             ("GET", "/api/admin/matches/mixton_404/demo"),
             ("GET", "/api/admin/matches/abc/demo"),
