@@ -30,7 +30,7 @@ pub mod target_guild;
 
 use std::sync::Arc;
 
-use axum::{extract::FromRef, Router};
+use axum::{extract::FromRef, response::IntoResponse, routing::get, Json, Router};
 use data::{
     AdminDocsRepo, ClaimsRepo, FirestoreAdminDocsRepo, FirestoreClaimsRepo, FirestoreClient,
     FirestoreGlobalSettingsRepo, FirestoreLogsRepo, FirestoreMatchHistoryRepo,
@@ -115,7 +115,21 @@ pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
     router
 }
 
-/// Rutas que solo necesitan la sesión (ninguna todavía; Tarea 8).
+/// Rutas que solo necesitan la sesión.
 fn routes() -> Router<AdminState> {
-    Router::new()
+    Router::new().route("/api/admin/me", get(admin_me))
+}
+
+/// `GET /api/admin/me`: el panel lo usa para saber si hay sesión de administrador.
+async fn admin_me(ctx: AdminContext) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "user": {
+            "userId": ctx.user.user_id,
+            "username": ctx.user.username,
+            "avatar": ctx.user.avatar,
+            "role": ctx.user.role,
+            "isAdmin": true,
+            "servidor": ctx.user.servidor,
+        }
+    }))
 }

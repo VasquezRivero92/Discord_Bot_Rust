@@ -480,7 +480,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
     let t = token(&claims("global_admin", true, None));
     for (method, path) in [
         ("POST", "/api/admin/orders/x/status"),
-        ("GET", "/api/admin/me"),
+        ("GET", "/api/admin/guilds"),
         ("GET", "/api/admin/claims?status=open"),
         ("DELETE", "/api/admin/claims/LR-1"),
     ] {
@@ -503,4 +503,49 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
         .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(seen.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn admin_me_is_served_natively_from_the_session() {
+    let static_dir = tempfile::tempdir().unwrap();
+    let vars: HashMap<String, String> = [
+        ("ADMIN_JWT_SECRET", SECRET),
+        ("BASE_URL", "http://localhost:15633"),
+        ("DISCORD_CLIENT_ID", "123"),
+        ("DISCORD_CLIENT_SECRET", "x"),
+        ("DISCORD_TOKEN", "x"),
+        ("DISCORD_GUILD_ID", "456"),
+        ("LEGACY_URL", "http://127.0.0.1:1"),
+        ("STATIC_DIR", static_dir.path().to_str().unwrap()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let front = serve(build_app(AppDeps {
+        config: Config::from_map(&vars).unwrap(),
+        claims: None,
+        admin: None,
+        cs2: None,
+        lobby: None,
+    }))
+    .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let t = token(&claims("admin", true, None));
+    let res = client
+        .get(format!("http://{front}/api/admin/me"))
+        .header(header::COOKIE, format!("auth_token={t}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["user"]["isAdmin"], true);
+
+    let res = client
+        .get(format!("http://{front}/api/admin/me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
 }

@@ -257,7 +257,7 @@ async fn everything_not_migrated_reaches_node() {
         ("GET", "/auth/steam/return?openid.mode=x"),
         ("POST", "/auth/demo-login"),
         ("GET", "/health"),
-        ("GET", "/api/admin/me"),
+        ("GET", "/api/admin/guilds"),
         ("GET", "/api/cs2/server-info"),
         ("GET", "/api/lobby/state"),
         ("POST", "/api/reclamaciones"),
@@ -326,7 +326,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
     let c = client();
 
     let res = c
-        .get(format!("http://{addr}/api/admin/me"))
+        .get(format!("http://{addr}/api/admin/guilds"))
         .send()
         .await
         .unwrap();

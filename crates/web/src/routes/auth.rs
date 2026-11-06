@@ -12,7 +12,9 @@ use axum::{
 use common::config::Config;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
+use crate::discord::{check_discord_admin, AdminRoleSources, DiscordApi, RestDiscordApi};
 use crate::session::{
     clear_cookies, issue_cookies, set_cookie_values, OptionalUser, SessionClaims,
     SessionState, SESSION_SECS,
@@ -28,6 +30,22 @@ pub struct AuthState {
     pub redirect_uri: String,
     pub session: SessionState,
     pub http: reqwest::Client,
+    /// Verificación de administrador contra Discord. `None` (solo pruebas) omite la comprobación.
+    pub admin_check: Option<AdminCheck>,
+}
+
+/// Datos para comprobar que quien inicia sesión es administrador del servidor.
+#[derive(Clone)]
+pub struct AdminCheck {
+    pub api: Arc<dyn DiscordApi>,
+    pub guild_id: String,
+    pub admin_role_id: Option<String>,
+}
+
+impl std::fmt::Debug for AdminCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCheck").field("guild_id", &self.guild_id).finish()
+    }
 }
 
 impl AuthState {
@@ -43,6 +61,7 @@ impl AuthState {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            admin_check: None,
         }
     }
 
@@ -61,6 +80,11 @@ impl AuthState {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            admin_check: Some(AdminCheck {
+                api: Arc::new(RestDiscordApi::from_config(cfg)),
+                guild_id: cfg.discord_guild_id.clone(),
+                admin_role_id: cfg.admin_role_id.clone(),
+            }),
         }
     }
 }
@@ -275,6 +299,27 @@ async fn discord_callback(
                 .into_response();
         }
     };
+
+    // Solo los administradores del servidor reciben sesión de panel (falla cerrado).
+    if let Some(check) = &st.admin_check {
+        let sources = AdminRoleSources {
+            guild_settings: None,
+            global_admin_role: None,
+            is_default_guild: true,
+            env_admin_role_id: check.admin_role_id.as_deref(),
+        };
+        match check_discord_admin(check.api.as_ref(), &check.guild_id, &user.id, &sources).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("[AUTH] {} ({}) no es administrador; sesión denegada", user.username, user.id);
+                return found("/", Vec::new());
+            }
+            Err(err) => {
+                tracing::error!("[AUTH] No se pudo verificar administrador de {}: {err}", user.id);
+                return found("/", Vec::new());
+            }
+        }
+    }
 
     let now = chrono::Utc::now().timestamp() as u64;
     let claims = SessionClaims {
