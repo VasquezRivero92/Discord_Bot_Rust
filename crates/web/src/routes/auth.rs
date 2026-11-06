@@ -328,7 +328,9 @@ async fn discord_callback(
         avatar: user.avatar.clone(),
         is_admin: true,
         role: "admin".to_string(),
-        servidor: None,
+        // El servidor del que se verificó que es administrador: `ensure_manages_guild` exige
+        // que coincida para guardar la configuración de ese servidor.
+        servidor: st.admin_check.as_ref().map(|c| c.guild_id.clone()),
         exp: now + SESSION_SECS,
         extra: serde_json::Map::new(),
     };
