@@ -102,6 +102,7 @@ impl TestHarness {
             guild_settings: guild_settings.clone(),
             docs: Arc::new(FirestoreAdminDocsRepo::new(docs)),
             doc_sink: doc_sink.clone(),
+            users: Arc::new(data::FakeUsersRepo::new()),
             config,
             caches: AdminCaches::default(),
             watchers: Vec::new(),

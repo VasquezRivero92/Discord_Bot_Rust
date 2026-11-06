@@ -9,7 +9,7 @@
 //! | `POST /api/admin/guilds/:guildId/settings` | ~2086 | `{ success: true, settings }` |
 //! | `GET /api/admin/system` | ~206 | `{ uptimeSeconds, hubRegion }` |
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use axum::{

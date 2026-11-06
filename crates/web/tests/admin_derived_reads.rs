@@ -99,6 +99,7 @@ impl Fakes {
             guild_settings: Arc::new(InMemoryGuildSettingsRepo::new()),
             docs: Arc::new(FirestoreAdminDocsRepo::new(docs.clone())),
             doc_sink: Arc::new(FakeDocSink::new()),
+            users: Arc::new(data::FakeUsersRepo::new()),
             config: cfg,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
@@ -590,10 +591,10 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             }
         }
         for (method, path) in [
-            ("GET", "/api/admin/leaderboard"),
+            ("GET", "/api/admin/steam/status"),
             ("GET", "/api/admin/stats/someone"),
-            ("GET", "/api/admin/matches/mixton_404/demo"),
-            ("GET", "/api/admin/matches/abc/demo"),
+            ("GET", "/api/admin/steam/login"),
+            ("POST", "/api/admin/broadcast"),
             ("POST", "/api/admin/users/restore"),
             ("POST", "/api/admin/stats"),
         ] {

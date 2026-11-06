@@ -23,6 +23,7 @@
 pub mod auth;
 pub mod derived_reads;
 mod js;
+pub mod matches_users;
 mod qs;
 mod route_cache;
 pub mod settings;
@@ -37,9 +38,9 @@ use data::{
     AdminDocsRepo, ClaimsRepo, DocSink, FirestoreAdminDocsRepo, FirestoreClaimsRepo,
     FirestoreClient, FirestoreGlobalSettingsRepo, FirestoreGuildSettingsRepo, FirestoreLogsRepo,
     FirestoreMatchHistoryRepo, FirestoreMessagesRepo, FirestoreOrdersRepo,
-    FirestoreSupportCallsRepo, GlobalSettingsRepo, GuildSettingsRepo, LogsRepo, MatchHistoryRepo,
-    MessagesRepo, OrdersRepo, SupportCallsRepo, WatcherHandle, GLOBAL_SETTINGS_TTL,
-    GUILD_SETTINGS_TTL,
+    FirestoreSupportCallsRepo, FirestoreUsersRepo, GlobalSettingsRepo, GuildSettingsRepo, LogsRepo,
+    MatchHistoryRepo, MessagesRepo, OrdersRepo, SupportCallsRepo, UsersRepo, WatcherHandle,
+    GLOBAL_SETTINGS_TTL, GUILD_SETTINGS_TTL,
 };
 
 use crate::session::SessionState;
@@ -76,6 +77,7 @@ pub struct AdminRepos {
     /// Documentos completos: `/stats`, `/users/backup`, `/yape/transactions`.
     pub docs: Arc<dyn AdminDocsRepo>,
     pub doc_sink: Arc<dyn DocSink>,
+    pub users: Arc<dyn UsersRepo>,
     pub config: Arc<Config>,
     /// Cachés de `/stats` y `/yape/transactions`.
     pub caches: AdminCaches,
@@ -109,6 +111,7 @@ impl AdminRepos {
             guild_settings,
             docs: Arc::new(FirestoreAdminDocsRepo::new(client.clone())),
             doc_sink: Arc::new(client.clone()),
+            users: Arc::new(FirestoreUsersRepo::new(client.clone())),
             config,
             caches: AdminCaches::default(),
             watchers: vec![global_watcher, guild_watcher],
@@ -125,7 +128,8 @@ pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
         router = router
             .merge(simple_reads::router(state.session.clone(), repos.clone()))
             .merge(derived_reads::router(state.session.clone(), repos.clone()))
-            .merge(settings::router(state.session, repos));
+            .merge(settings::router(state.session.clone(), repos.clone()))
+            .merge(matches_users::router(state.session, repos));
     }
     router
 }

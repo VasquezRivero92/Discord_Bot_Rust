@@ -231,6 +231,22 @@ impl FirestoreClient {
             .transpose()
     }
 
+    /// Lee `collection/id` sin decodificar (devuelve el `FirestoreDocument` crudo).
+    /// `Ok(None)` si el documento no existe.
+    pub async fn get_raw_doc(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<FirestoreDocument>, DataError> {
+        Ok(self
+            .db
+            .fluent()
+            .select()
+            .by_id_in(collection)
+            .one(id)
+            .await?)
+    }
+
     /// Lista todos los documentos de `collection` como `(id, valor)`, paginando. Un documento
     /// que no se puede decodificar hace fallar la llamada con [`DataError::Decode`].
     pub async fn list_docs<T: DeserializeOwned>(

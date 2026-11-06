@@ -32,6 +32,7 @@ const ACTIVE_MATCHES: &str = "faceit_active_matches";
 const YAPE_TRANSACTIONS: &str = "yape_transacciones";
 const YAPE_OPERATIONS: &str = "yape_operations";
 const YAPE_AUDIT_LOGS: &str = "yape_audit_logs";
+const CONFIG: &str = "faceit_config";
 
 /// `totalUsers` y `totalMatches` de `/stats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,12 @@ pub trait AdminDocsRepo: Send + Sync {
     async fn yape_operations(&self, limit: usize) -> Result<Vec<Value>, DataError>;
     /// `getYapeAuditLogs(limit)`.
     async fn yape_audit_logs(&self, limit: usize) -> Result<Vec<Value>, DataError>;
+    /// Partidas activas (`faceit_active_matches`), filtradas opcionalmente por guild_id.
+    async fn active_matches(&self, guild: Option<&str>) -> Result<Vec<Value>, DataError>;
+    /// Partida activa por id (`faceit_active_matches/{id}`).
+    async fn active_match(&self, id: &str) -> Result<Option<Value>, DataError>;
+    /// Estado del lobby mixton (`faceit_config/mixton_lobby` o `faceit_config/mixton_lobby_{guild}`).
+    async fn mixton_lobby_state(&self, guild: Option<&str>) -> Result<Option<Value>, DataError>;
 }
 
 /// Repo sobre Firestore (o sobre cualquier [`NodeDocSource`]), sin caché (las cachés de
@@ -160,6 +167,42 @@ impl<S: NodeDocSource> AdminDocsRepo for FirestoreAdminDocsRepo<S> {
             _ => 0.0,
         })
         .await
+    }
+
+    async fn active_matches(&self, guild: Option<&str>) -> Result<Vec<Value>, DataError> {
+        let docs = self.source.list_all(ACTIVE_MATCHES).await?;
+        Ok(docs
+            .into_iter()
+            .filter(|(_, d)| match guild {
+                Some(g) => is_str(d.get("guild_id"), g),
+                None => true,
+            })
+            .map(|(id, mut data)| {
+                if !data.contains_key("id") {
+                    data.insert("id".to_string(), Value::String(id));
+                }
+                Value::Object(data)
+            })
+            .collect())
+    }
+
+    async fn active_match(&self, id: &str) -> Result<Option<Value>, DataError> {
+        let doc = self.source.get(ACTIVE_MATCHES, id).await?;
+        Ok(doc.map(|mut data| {
+            if !data.contains_key("id") {
+                data.insert("id".to_string(), Value::String(id.to_string()));
+            }
+            Value::Object(data)
+        }))
+    }
+
+    async fn mixton_lobby_state(&self, guild: Option<&str>) -> Result<Option<Value>, DataError> {
+        let doc_id = match guild {
+            Some(g) if !g.is_empty() => format!("mixton_lobby_{g}"),
+            _ => "mixton_lobby".to_string(),
+        };
+        let doc = self.source.get(CONFIG, &doc_id).await?;
+        Ok(doc.map(Value::Object))
     }
 }
 
@@ -526,5 +569,35 @@ mod tests {
         assert_eq!(ids(&a, "id"), ["a0", "a1", "a2", "a3"]);
         s.fail_lists(Some(DataError::QuotaExceeded));
         assert_eq!(r.yape_audit_logs(50).await, Err(DataError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn active_matches_and_lobby_state_read_from_source() {
+        let s = Arc::new(InMemoryNodeDocs::new());
+        s.put(ACTIVE_MATCHES, "m1", json!({"guild_id": "g1", "demo_url": "url1"}));
+        s.put(ACTIVE_MATCHES, "m2", json!({"guild_id": "g2"}));
+        s.put(CONFIG, "mixton_lobby", json!({"mapCatalog": [{"id": "de_mirage"}]}));
+        s.put(CONFIG, "mixton_lobby_g1", json!({"mapCatalog": [{"id": "de_nuke"}]}));
+
+        let r = repo(&s);
+        let all = r.active_matches(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(ids(&all, "id"), ["m1", "m2"]);
+
+        let g1 = r.active_matches(Some("g1")).await.unwrap();
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g1[0]["id"], "m1");
+
+        let m1 = r.active_match("m1").await.unwrap().expect("match m1");
+        assert_eq!(m1["id"], "m1");
+        assert_eq!(m1["demo_url"], "url1");
+
+        assert!(r.active_match("m999").await.unwrap().is_none());
+
+        let lob_global = r.mixton_lobby_state(None).await.unwrap().expect("global lobby");
+        assert_eq!(lob_global["mapCatalog"][0]["id"], "de_mirage");
+
+        let lob_g1 = r.mixton_lobby_state(Some("g1")).await.unwrap().expect("g1 lobby");
+        assert_eq!(lob_g1["mapCatalog"][0]["id"], "de_nuke");
     }
 }

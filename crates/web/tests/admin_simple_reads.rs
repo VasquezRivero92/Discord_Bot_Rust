@@ -131,6 +131,7 @@ impl Fakes {
                 InMemoryNodeDocs::new(),
             ))),
             doc_sink: Arc::new(FakeDocSink::new()),
+            users: Arc::new(data::FakeUsersRepo::new()),
             config: cfg,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
@@ -771,7 +772,7 @@ async fn reads_mount_only_with_firestore() {
             ("DELETE", "/api/admin/claims/LR-2026-000001"),
             ("POST", "/api/admin/messages"),
             ("GET", "/api/admin/claims/LR-1/extra"),
-            ("GET", "/api/admin/leaderboard"),
+            ("GET", "/api/admin/steam/status"),
         ] {
             let res = client
                 .request(method.parse().unwrap(), format!("http://{front}{path}"))

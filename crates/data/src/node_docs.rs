@@ -106,6 +106,12 @@ pub trait NodeDocSource: Send + Sync {
     ) -> Result<Vec<(String, Map<String, Value>)>, DataError>;
     /// `collection(c)[.where(field, '==', value)].count().get()`.
     async fn count(&self, collection: &str, eq: Option<(&str, &str)>) -> Result<u64, DataError>;
+    /// `collection(c).doc(id).get()`: el documento como mapa de campos, o `None` si no existe.
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Map<String, Value>>, DataError>;
 }
 
 #[async_trait]
@@ -119,6 +125,15 @@ impl NodeDocSource for FirestoreClient {
             .iter()
             .map(node_document)
             .collect()
+    }
+
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Map<String, Value>>, DataError> {
+        let doc = self.get_raw_doc(collection, id).await?;
+        doc.map(|d| node_document(&d).map(|(_, v)| v)).transpose()
     }
 
     async fn count(&self, collection: &str, eq: Option<(&str, &str)>) -> Result<u64, DataError> {
@@ -154,6 +169,14 @@ impl<T: NodeDocSource + ?Sized> NodeDocSource for Arc<T> {
 
     async fn count(&self, collection: &str, eq: Option<(&str, &str)>) -> Result<u64, DataError> {
         (**self).count(collection, eq).await
+    }
+
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Map<String, Value>>, DataError> {
+        (**self).get(collection, id).await
     }
 }
 
@@ -266,6 +289,22 @@ impl NodeDocSource for InMemoryNodeDocs {
             })
             .count() as u64)
     }
+
+    async fn get(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Map<String, Value>>, DataError> {
+        let _open = self.gate.read().await;
+        if let Some(err) = self.list_error.lock().expect("mutex envenenado").clone() {
+            return Err(err);
+        }
+        let collections = self.collections.lock().expect("mutex envenenado");
+        Ok(collections
+            .get(collection)
+            .and_then(|docs| docs.get(id))
+            .cloned())
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +416,8 @@ mod tests {
         s.fail_counts(Some(DataError::QuotaExceeded));
         assert_eq!(s.count("c", None).await, Err(DataError::QuotaExceeded));
         assert!(s.list_all("c").await.is_ok());
+
+        assert_eq!(s.get("c", "a").await.unwrap(), Some(Map::from_iter([("g".into(), json!("2"))])));
+        assert_eq!(s.get("c", "nonexistent").await.unwrap(), None);
     }
 }
