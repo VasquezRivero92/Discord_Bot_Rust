@@ -29,6 +29,7 @@ mod route_cache;
 pub mod settings;
 pub mod simple_reads;
 pub mod target_guild;
+pub mod writes;
 
 use std::sync::Arc;
 
@@ -129,7 +130,8 @@ pub fn router(state: AdminState, repos: Option<AdminRepos>) -> Router {
             .merge(simple_reads::router(state.session.clone(), repos.clone()))
             .merge(derived_reads::router(state.session.clone(), repos.clone()))
             .merge(settings::router(state.session.clone(), repos.clone()))
-            .merge(matches_users::router(state.session, repos));
+            .merge(matches_users::router(state.session.clone(), repos.clone()))
+            .merge(writes::router(state.session, repos));
     }
     router
 }

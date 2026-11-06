@@ -595,7 +595,7 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             ("GET", "/api/admin/stats/someone"),
             ("GET", "/api/admin/steam/login"),
             ("POST", "/api/admin/broadcast"),
-            ("POST", "/api/admin/users/restore"),
+            ("POST", "/api/admin/users/sync-all"),
             ("POST", "/api/admin/stats"),
         ] {
             let res = client
