@@ -101,6 +101,12 @@ pub fn build_app(deps: AppDeps) -> Router {
     if let Some(claims) = deps.claims {
         migrated = migrated.merge(routes::public_api::claims_router(claims));
     }
+    // Historial público de partidas (`/historial`), con la misma fuente que el panel admin.
+    if let Some(admin) = &deps.admin {
+        migrated = migrated.merge(routes::public_api::matches_history_router(
+            admin.match_history.clone(),
+        ));
+    }
     // `/api/admin/*` migradas (solo esas: el resto sigue en el proxy). Sin
     // secreto válido (imposible con `Config::from_map`) no se monta nada.
     match session::SessionState::from_config(cfg) {

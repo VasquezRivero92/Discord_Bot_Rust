@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -33,6 +33,70 @@ pub fn router(claims: Arc<dyn ClaimsRepo>) -> Router {
 /// Solo `GET /api/products` (no necesita Firestore).
 pub fn products_router() -> Router {
     Router::new().route("/api/products", get(list_products))
+}
+
+/// Servidores cuyo historial comparten (MachuPeek y el hub de FACEIT anterior): el legacy los
+/// une cuando se pide cualquiera de los dos.
+const HISTORY_GUILDS: [&str; 2] = ["1274598531759345674", "1472731390675255410"];
+
+/// `GET /api/lobby/matches-history` (y `/match-history`): últimas partidas del historial de
+/// Firestore como `{ history }`. `limit` se acota a 1..=50 (20 si falta o no es un número).
+/// El detalle `/{match_id}` no se monta aquí y sigue en el proxy.
+pub fn matches_history_router(repo: Arc<dyn data::MatchHistoryRepo>) -> Router {
+    Router::new()
+        .route("/api/lobby/matches-history", get(list_matches_history))
+        .route("/api/lobby/match-history", get(list_matches_history))
+        .with_state(repo)
+}
+
+async fn list_matches_history(
+    State(repo): State<Arc<dyn data::MatchHistoryRepo>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n != 0)
+        .map(|n| n.clamp(1, 50) as u32)
+        .unwrap_or(20);
+    let guild = q
+        .get("guildId")
+        .map(String::as_str)
+        .filter(|g| !g.is_empty());
+
+    let guilds: Vec<Option<&str>> = match guild {
+        Some(g) if HISTORY_GUILDS.contains(&g) => HISTORY_GUILDS.iter().map(|g| Some(*g)).collect(),
+        other => vec![other],
+    };
+
+    let mut history = Vec::new();
+    for g in guilds {
+        match repo.list(limit, g).await {
+            Ok(mut rows) => history.append(&mut rows),
+            Err(e) => {
+                tracing::error!("Error al obtener historial de partidas de Firestore: {e}");
+            }
+        }
+    }
+
+    let created_secs = |e: &data::MatchHistoryEntry| {
+        e.created_at
+            .as_ref()
+            .and_then(|v| v.get("_seconds"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
+    history.sort_by_key(|e| std::cmp::Reverse(created_secs(e)));
+
+    // Sin duplicados por `id`; las filas sin `id` se descartan, como en el legacy.
+    let mut seen = std::collections::HashSet::new();
+    history.retain(|e| match e.extra.get("id").and_then(Value::as_str) {
+        Some(id) => seen.insert(id.to_owned()),
+        None => false,
+    });
+    history.truncate(limit as usize);
+
+    json_response(StatusCode::OK, &json!({ "history": history }))
 }
 
 /// Solo `GET /api/reclamaciones/:code`. Sin fuente de reclamaciones no se monta y la
