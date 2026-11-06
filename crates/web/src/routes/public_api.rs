@@ -99,6 +99,45 @@ async fn list_matches_history(
     json_response(StatusCode::OK, &json!({ "history": history }))
 }
 
+/// Lo que necesita el detalle de una partida del historial.
+#[derive(Clone)]
+pub struct MatchDetailState {
+    pub docs: Arc<dyn data::AdminDocsRepo>,
+    pub users: Arc<dyn data::UsersRepo>,
+    pub avatars: Arc<dyn crate::steam_avatars::SteamAvatars>,
+}
+
+/// `GET /api/lobby/matches-history/{id}` (y `/match-history/{id}`): la partida con sus
+/// estadísticas y las fotos de perfil de Steam de quienes jugaron.
+pub fn match_detail_router(state: MatchDetailState) -> Router {
+    Router::new()
+        .route("/api/lobby/matches-history/{match_id}", get(match_detail))
+        .route("/api/lobby/match-history/{match_id}", get(match_detail))
+        .with_state(state)
+}
+
+async fn match_detail(State(st): State<MatchDetailState>, Path(match_id): Path<String>) -> Response {
+    // Un error de lectura es "no encontrada", como el legacy (`getMatchHistoryById` devuelve null).
+    let Some(mut history) = st.docs.match_history_by_id(&match_id).await.ok().flatten() else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Partida no encontrada."}),
+        );
+    };
+    let mut stats = st.docs.match_stats(&match_id).await.ok().flatten();
+    if stats.is_none() {
+        stats = history.get("stats").filter(|s| !s.is_null()).cloned();
+    }
+
+    crate::steam_avatars::enrich_match(&mut history, &mut stats, &*st.users, &*st.avatars).await;
+
+    let mut body = json!({ "history": history });
+    if let Some(stats) = stats {
+        body["stats"] = stats;
+    }
+    json_response(StatusCode::OK, &body)
+}
+
 /// Solo `GET /api/reclamaciones/:code`. Sin fuente de reclamaciones no se monta y la
 /// ruta sigue llegando a Node por el proxy.
 pub fn claims_router(claims: Arc<dyn ClaimsRepo>) -> Router {

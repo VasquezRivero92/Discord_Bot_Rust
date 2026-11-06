@@ -29,6 +29,8 @@ use serde_json::{Map, Value};
 
 const USERS: &str = "faceit_users";
 const ACTIVE_MATCHES: &str = "faceit_active_matches";
+const MATCHES_HISTORY: &str = "faceit_matches_history";
+const MATCH_STATS: &str = "faceit_match_stats";
 const YAPE_TRANSACTIONS: &str = "yape_transacciones";
 const YAPE_OPERATIONS: &str = "yape_operations";
 const YAPE_AUDIT_LOGS: &str = "yape_audit_logs";
@@ -61,6 +63,10 @@ pub trait AdminDocsRepo: Send + Sync {
     async fn active_matches(&self, guild: Option<&str>) -> Result<Vec<Value>, DataError>;
     /// Partida activa por id (`faceit_active_matches/{id}`).
     async fn active_match(&self, id: &str) -> Result<Option<Value>, DataError>;
+    /// `getMatchHistoryById`: `faceit_matches_history/{id}` tal cual, `None` si no existe.
+    async fn match_history_by_id(&self, id: &str) -> Result<Option<Value>, DataError>;
+    /// `getMatchStats`: `faceit_match_stats/{id}` tal cual, `None` si no existe.
+    async fn match_stats(&self, id: &str) -> Result<Option<Value>, DataError>;
     /// Estado del lobby mixton (`faceit_config/mixton_lobby` o `faceit_config/mixton_lobby_{guild}`).
     async fn mixton_lobby_state(&self, guild: Option<&str>) -> Result<Option<Value>, DataError>;
 }
@@ -194,6 +200,18 @@ impl<S: NodeDocSource> AdminDocsRepo for FirestoreAdminDocsRepo<S> {
             }
             Value::Object(data)
         }))
+    }
+
+    async fn match_history_by_id(&self, id: &str) -> Result<Option<Value>, DataError> {
+        Ok(self
+            .source
+            .get(MATCHES_HISTORY, id)
+            .await?
+            .map(Value::Object))
+    }
+
+    async fn match_stats(&self, id: &str) -> Result<Option<Value>, DataError> {
+        Ok(self.source.get(MATCH_STATS, id).await?.map(Value::Object))
     }
 
     async fn mixton_lobby_state(&self, guild: Option<&str>) -> Result<Option<Value>, DataError> {

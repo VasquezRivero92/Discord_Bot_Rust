@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod routes;
 pub mod session;
 pub mod static_files;
+pub mod steam_avatars;
 
 /// Builds the application router. Unknown routes return 404.
 pub fn app() -> Router {
@@ -105,6 +106,13 @@ pub fn build_app(deps: AppDeps) -> Router {
     if let Some(admin) = &deps.admin {
         migrated = migrated.merge(routes::public_api::matches_history_router(
             admin.match_history.clone(),
+        ));
+        migrated = migrated.merge(routes::public_api::match_detail_router(
+            routes::public_api::MatchDetailState {
+                docs: admin.docs.clone(),
+                users: admin.users.clone(),
+                avatars: Arc::new(steam_avatars::HttpSteamAvatars::new()),
+            },
         ));
     }
     // `/api/admin/*` migradas (solo esas: el resto sigue en el proxy). Sin

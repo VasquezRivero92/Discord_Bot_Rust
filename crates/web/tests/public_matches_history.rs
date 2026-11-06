@@ -92,6 +92,100 @@ async fn limit_is_clamped_and_alias_path_works() {
     assert_eq!(body["history"].as_array().unwrap().len(), 20);
 }
 
+struct FakeAvatars(std::collections::HashMap<String, String>);
+
+#[async_trait::async_trait]
+impl web::steam_avatars::SteamAvatars for FakeAvatars {
+    async fn fetch_many(&self, ids: &[String]) -> std::collections::HashMap<String, String> {
+        ids.iter()
+            .filter_map(|id| self.0.get(id).map(|a| (id.clone(), a.clone())))
+            .collect()
+    }
+}
+
+const STEAM_A: &str = "76561198000000001";
+const STEAM_B: &str = "76561198000000002";
+
+fn detail_app(docs: data::InMemoryNodeDocs, users: data::FakeUsersRepo) -> Router {
+    public_api::match_detail_router(public_api::MatchDetailState {
+        docs: Arc::new(data::FirestoreAdminDocsRepo::new(docs)),
+        users: Arc::new(users),
+        avatars: Arc::new(FakeAvatars(
+            [
+                (STEAM_A.to_string(), "https://steam/a.jpg".to_string()),
+                (STEAM_B.to_string(), "https://steam/b.jpg".to_string()),
+            ]
+            .into(),
+        )),
+    })
+}
+
+#[tokio::test]
+async fn detail_adds_steam_avatars_to_rosters_and_stats() {
+    let docs = data::InMemoryNodeDocs::new();
+    docs.put(
+        "faceit_matches_history",
+        "m1",
+        json!({
+            "id": "m1",
+            "faction1_roster": [{ "id": STEAM_A, "nickname": "Ana" }],
+            "faction2_roster": [{ "id": "uuid-b", "nickname": "Beto", "discord_id": "222" }],
+        }),
+    );
+    docs.put(
+        "faceit_match_stats",
+        "m1",
+        json!({ "teams": [{ "players": [
+            { "playerId": STEAM_A, "nickname": "Ana" },
+            { "playerId": "uuid-b", "nickname": "Beto" },
+        ]}]}),
+    );
+    let users = data::FakeUsersRepo::new();
+    users.insert("222", json!({ "steam_id_64": STEAM_B, "discord_avatar": "https://dc/b.png" }));
+
+    let (status, body) = get(&detail_app(docs, users), "/api/lobby/matches-history/m1").await;
+    assert_eq!(status, StatusCode::OK);
+    let h = &body["history"];
+    assert_eq!(h["faction1_roster"][0]["avatar"], "https://steam/a.jpg");
+    assert_eq!(h["faction1_roster"][0]["steam_id_64"], STEAM_A);
+    assert_eq!(h["faction2_roster"][0]["avatar"], "https://steam/b.jpg");
+    assert_eq!(h["faction2_roster"][0]["steam_id_64"], STEAM_B);
+    let players = &body["stats"]["teams"][0]["players"];
+    assert_eq!(players[0]["avatar"], "https://steam/a.jpg");
+    assert_eq!(players[1]["avatar"], "https://steam/b.jpg");
+    assert_eq!(players[1]["steam_id_64"], STEAM_B);
+}
+
+#[tokio::test]
+async fn detail_falls_back_to_the_linked_account_photo_and_embedded_stats() {
+    let docs = data::InMemoryNodeDocs::new();
+    docs.put(
+        "faceit_matches_history",
+        "m2",
+        json!({
+            "id": "m2",
+            "faction1_roster": [{ "id": "x", "nickname": "Sin Steam", "discord_id": "333" }],
+            "stats": { "teams": [] },
+        }),
+    );
+    let users = data::FakeUsersRepo::new();
+    users.insert("333", json!({ "discord_avatar": "https://dc/c.png" }));
+
+    let (status, body) = get(&detail_app(docs, users), "/api/lobby/match-history/m2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["history"]["faction1_roster"][0]["avatar"], "https://dc/c.png");
+    assert_eq!(body["history"]["faction1_roster"][0]["steam_id_64"], Value::Null);
+    assert_eq!(body["stats"], json!({ "teams": [] }));
+}
+
+#[tokio::test]
+async fn detail_of_an_unknown_match_is_404() {
+    let app = detail_app(data::InMemoryNodeDocs::new(), data::FakeUsersRepo::new());
+    let (status, body) = get(&app, "/api/lobby/matches-history/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "Partida no encontrada.");
+}
+
 #[tokio::test]
 async fn read_failure_returns_an_empty_history_like_the_legacy() {
     let repo = FakeMatchHistoryRepo::new();
