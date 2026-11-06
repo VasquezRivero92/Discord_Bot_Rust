@@ -436,6 +436,56 @@ async fn get_discord_roles_success_filters_everyone_and_sorts() {
     std::env::remove_var("DISCORD_API_BASE_URL");
 }
 
+#[tokio::test]
+async fn get_discord_channels_keeps_text_and_voice_with_category() {
+    let _env = ENV_LOCK.lock().await;
+    let mock_discord = Router::new().route(
+        "/guilds/guild_default_1/channels",
+        get(|| async {
+            Json(json!([
+                { "id": "10", "name": "Competitivo", "type": 4, "position": 0 },
+                { "id": "11", "name": "partidas", "type": 0, "position": 2, "parent_id": "10" },
+                { "id": "12", "name": "sala-espera", "type": 2, "position": 1, "parent_id": "10" },
+                { "id": "13", "name": "foro", "type": 15, "position": 3 },
+                { "id": "14", "name": "general", "type": 0, "position": 4 }
+            ]))
+        }),
+    );
+    let (addr, _server) = serve_mock(mock_discord).await;
+    std::env::set_var("DISCORD_API_BASE_URL", format!("http://{addr}"));
+
+    let harness = TestHarness::new();
+    let r = harness.router();
+    let g_token = global_admin_token();
+
+    let (status, ct, body) =
+        get_req(r.clone(), "/api/admin/discord/channels", Some(&g_token), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct, JSON_CT);
+
+    let ch = body["channels"].as_array().expect("array de canales");
+    // Sin la categoría ni el foro; ordenados por posición.
+    assert_eq!(ch.len(), 3);
+    assert_eq!(ch[0]["name"], "sala-espera");
+    assert_eq!(ch[0]["kind"], "voice");
+    assert_eq!(ch[0]["parentName"], "Competitivo");
+    assert_eq!(ch[1]["name"], "partidas");
+    assert_eq!(ch[1]["kind"], "text");
+    assert_eq!(ch[2]["name"], "general");
+    assert!(ch[2]["parentId"].is_null());
+
+    std::env::remove_var("DISCORD_API_BASE_URL");
+}
+
+#[tokio::test]
+async fn get_discord_channels_requires_admin_session() {
+    let _env = ENV_LOCK.lock().await;
+    let harness = TestHarness::new();
+    let r = harness.router();
+    let (status, _ct, _body) = get_req(r, "/api/admin/discord/channels", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 // ------------------------------------------------------------- Map Catalog
 
 #[tokio::test]

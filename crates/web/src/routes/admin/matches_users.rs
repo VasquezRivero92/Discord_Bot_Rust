@@ -44,6 +44,7 @@ pub(crate) fn router(session: SessionState, repos: AdminRepos) -> Router {
     Router::new()
         .route("/api/admin/leaderboard", get(get_leaderboard))
         .route("/api/admin/discord/roles", get(get_discord_roles))
+        .route("/api/admin/discord/channels", get(get_discord_channels))
         .route(
             "/api/admin/map-catalog",
             get(get_map_catalog).post(post_map_catalog),
@@ -189,6 +190,40 @@ async fn get_discord_roles(
             Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({ "error": "Error al obtener roles de Discord" }),
+            ))
+        }
+    }
+}
+
+/// `GET /api/admin/discord/channels`: canales de la guild (texto, anuncios, voz y escenario),
+/// agrupados por categoría, para los desplegables de la configuración.
+async fn get_discord_channels(
+    State(st): State<MatchesUsersState>,
+    ctx: AdminContext,
+    RawQuery(q): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, AdminError> {
+    let target = resolve_target_guild_id(&ctx, q.as_deref(), None, &headers)?;
+    let guild_id = target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let gid = st.repos.config.discord_guild_id.trim();
+            (!gid.is_empty()).then_some(gid)
+        });
+
+    let bot_token = st.repos.config.discord_token.trim();
+    let (Some(guild_id), false) = (guild_id, bot_token.is_empty()) else {
+        return Ok(json_response(StatusCode::OK, &json!({ "channels": [] })));
+    };
+
+    match fetch_discord_channels(guild_id, bot_token).await {
+        Ok(channels) => Ok(json_response(StatusCode::OK, &json!({ "channels": channels }))),
+        Err(e) => {
+            tracing::error!("Error al listar canales de Discord para {guild_id}: {e}");
+            Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({ "error": "Error al obtener canales de Discord" }),
             ))
         }
     }
@@ -943,6 +978,67 @@ async fn fetch_discord_roles(guild_id: &str, bot_token: &str) -> Result<Vec<Valu
     });
 
     Ok(roles)
+}
+
+/// Canales de la guild como `{ id, name, kind, parentId, parentName }`, con `kind` en
+/// `text` | `voice`; las categorías y los tipos sin uso (foros, hilos) se descartan.
+async fn fetch_discord_channels(guild_id: &str, bot_token: &str) -> Result<Vec<Value>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let base = discord_api_base_url();
+    let res = client
+        .get(format!("{base}/guilds/{guild_id}/channels"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bot {bot_token}"))
+        .header(
+            reqwest::header::USER_AGENT,
+            "DiscordBot (https://machupeek.com, 1.0.0)",
+        )
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("Discord channels API returned status {}", res.status()));
+    }
+
+    let body: Value = res.json().await.map_err(|e| e.to_string())?;
+    let Some(all) = body.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    let category_name = |id: &str| -> Option<&str> {
+        all.iter()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|c| c.get("name").and_then(Value::as_str))
+    };
+
+    let mut channels: Vec<(u64, Value)> = Vec::new();
+    for c in all {
+        let kind = match c.get("type").and_then(Value::as_u64) {
+            Some(0) | Some(5) => "text",
+            Some(2) | Some(13) => "voice",
+            _ => continue,
+        };
+        let id = c.get("id").and_then(Value::as_str).unwrap_or("");
+        let parent_id = c.get("parent_id").and_then(Value::as_str);
+        let position = c.get("position").and_then(Value::as_u64).unwrap_or(0);
+        channels.push((
+            position,
+            json!({
+                "id": id,
+                "name": c.get("name").and_then(Value::as_str).unwrap_or(""),
+                "kind": kind,
+                "parentId": parent_id,
+                "parentName": parent_id.and_then(category_name),
+            }),
+        ));
+    }
+    channels.sort_by_key(|(position, _)| *position);
+
+    Ok(channels.into_iter().map(|(_, v)| v).collect())
 }
 
 async fn fetch_discord_member_club_roles(

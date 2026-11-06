@@ -385,6 +385,64 @@ async fn post_settings_updates_and_audits() {
 }
 
 #[tokio::test]
+async fn channel_id_lists_are_saved_and_read_back_for_global_settings() {
+    let harness = TestHarness::new();
+    let r = harness.router();
+    let g_token = global_admin_token();
+
+    let update = json!({
+        "discordSupportChannelId": "111",
+        "discordSupportChannelIds": ["111", "222"],
+    });
+    let (status, _ct, _body) =
+        post_req(r.clone(), "/api/admin/settings", Some(&g_token), update).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let saved = harness.doc_sink.get("faceit_config", "settings").expect("documento guardado");
+    assert_eq!(saved["discordSupportChannelId"], "111");
+    assert_eq!(saved["discordSupportChannelIds"], json!(["111", "222"]));
+}
+
+#[tokio::test]
+async fn channel_id_lists_are_saved_and_read_back_for_guild_settings() {
+    let harness = TestHarness::new();
+    let guild_id = "guild_special_2";
+    let r = harness.router();
+    let g_token = global_admin_token();
+
+    let update = json!({
+        "discordAdminAlertsChannelId": "7",
+        "discordAdminAlertsChannelIds": ["7", "8", "9"],
+    });
+    let (status, _ct, _body) = post_req(
+        r.clone(),
+        &format!("/api/admin/guilds/{guild_id}/settings"),
+        Some(&g_token),
+        update,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let saved = harness.doc_sink.get("guild_settings", guild_id).expect("guild settings guardado");
+    assert_eq!(saved["discordAdminAlertsChannelIds"], json!(["7", "8", "9"]));
+
+    // Lo guardado vuelve a leerse desde la base de datos con la lista completa.
+    harness
+        .guild_settings
+        .insert(guild_id, serde_json::from_value::<GuildSettings>(saved).unwrap());
+    let (status, _ct, body) = get_req(
+        r.clone(),
+        &format!("/api/admin/guilds/{guild_id}/settings"),
+        Some(&g_token),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["settings"]["discordAdminAlertsChannelId"], "7");
+    assert_eq!(body["settings"]["discordAdminAlertsChannelIds"], json!(["7", "8", "9"]));
+}
+
+#[tokio::test]
 async fn get_guilds_returns_list() {
     let harness = TestHarness::new();
     let r = harness.router();

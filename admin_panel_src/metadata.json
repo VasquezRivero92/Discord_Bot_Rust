@@ -1,0 +1,6 @@
+{
+  "name": "Nexus Admin",
+  "description": "Panel de administración y estadísticas para el bot de Discord y Faceit Hub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

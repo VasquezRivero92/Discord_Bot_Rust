@@ -1,0 +1,245 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Custom Webkit scrollbar for modern CRM aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #F1F5F9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Scrollbar styling for Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #CBD5E1 #F1F5F9;
+}
+
+/* Global utility classes for modular CRM styling */
+.crm-card {
+  background-color: #ffffff;
+  border: 1px solid #E2E8F0;
+  border-radius: 1rem;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.04);
+}
+
+.crm-badge-green {
+  background-color: #ECFDF5;
+  color: #059669;
+  border: 1px solid rgba(16, 185, 129, 0.2);
+}
+
+.crm-badge-orange {
+  background-color: #FFFBEB;
+  color: #D97706;
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+
+.crm-badge-blue {
+  background-color: #EFF6FF;
+  color: #2563EB;
+  border: 1px solid rgba(37, 99, 235, 0.2);
+}
+
+.crm-badge-red {
+  background-color: #FEF2F2;
+  color: #DC2626;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+/* Modern Modular CRM Light Theme Overrides for Dashboard Panels & Tables */
+.crm-card,
+[class*="bg-[#111]"],
+[class*="bg-[#151515]"],
+[class*="bg-[#1A1A1A]"] {
+  background-color: #FFFFFF !important;
+  border-color: #E2E8F0 !important;
+  color: #1E293B !important;
+  border-radius: 1rem !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.04) !important;
+}
+
+[class*="bg-[#0A0A0A]"] {
+  background-color: #F8FAFC !important;
+  border-color: #E2E8F0 !important;
+  color: #1E293B !important;
+  border-radius: 0.75rem !important;
+}
+
+/* Modals */
+.fixed.inset-0 .bg-\[\#111\] {
+  background-color: #FFFFFF !important;
+  border: 1px solid #E2E8F0 !important;
+  border-radius: 1.25rem !important;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.2) !important;
+}
+
+/* Table header & row adjustments */
+tr.bg-neutral-900,
+thead tr {
+  background-color: #F8FAFC !important;
+  color: #64748B !important;
+}
+
+tbody tr:hover {
+  background-color: #F8FAFC !important;
+}
+
+th {
+  color: #64748B !important;
+}
+
+/* Headings and labels inside containers */
+[class*="bg-[#111]"] h1,
+[class*="bg-[#111]"] h2,
+[class*="bg-[#111]"] h3,
+[class*="bg-[#111]"] h4,
+[class*="bg-[#111]"] td.text-white,
+[class*="bg-[#111]"] span.text-white {
+  color: #0F172A !important;
+}
+
+[class*="bg-[#111]"] p.text-neutral-400,
+[class*="bg-[#111]"] p.text-neutral-500,
+[class*="bg-[#111]"] span.text-neutral-400,
+[class*="bg-[#111]"] span.text-neutral-500,
+[class*="bg-[#111]"] label {
+  color: #64748B !important;
+}
+
+/* Inputs and Selects inside panels */
+input[class*="bg-[#0A0A0A]"],
+select[class*="bg-[#0A0A0A]"],
+textarea[class*="bg-[#0A0A0A]"] {
+  background-color: #FFFFFF !important;
+  border: 1px solid #CBD5E1 !important;
+  color: #0F172A !important;
+  border-radius: 0.75rem !important;
+}
+
+input[class*="bg-[#0A0A0A]"]:focus,
+select[class*="bg-[#0A0A0A]"]:focus,
+textarea[class*="bg-[#0A0A0A]"]:focus {
+  border-color: #E11D48 !important;
+  outline: none !important;
+  box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.1) !important;
+}
+
+/* Buttons with bg-white text-black */
+button.bg-white.text-black {
+  background-color: #0F172A !important;
+  color: #FFFFFF !important;
+  border-radius: 0.75rem !important;
+  border: 1px solid transparent !important;
+}
+button.bg-white.text-black:hover {
+  background-color: #1E293B !important;
+}
+
+/* Action buttons with bg-neutral-800 */
+button[class*="bg-neutral-800"] {
+  background-color: #F1F5F9 !important;
+  color: #334155 !important;
+  border: 1px solid #E2E8F0 !important;
+  border-radius: 0.75rem !important;
+}
+button[class*="bg-neutral-800"]:hover {
+  background-color: #E2E8F0 !important;
+}
+
+/* Table borders */
+.border-white\/10,
+.border-white\/20,
+.border-white\/5,
+.divide-white\/5,
+.divide-white\/10 {
+  border-color: #E2E8F0 !important;
+}
+
+/* Search input container */
+.relative > input[class*="bg-[#111]"] {
+  background-color: #FFFFFF !important;
+  border: 1px solid #E2E8F0 !important;
+  color: #0F172A !important;
+  border-radius: 0.75rem !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03) !important;
+}
+
+/* Immediate acknowledgement for every action; requests can finish afterwards. */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+input[type="button"]:not(:disabled),
+input[type="submit"]:not(:disabled) {
+  transition-property: transform, opacity, filter, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:not(:disabled):active,
+button[data-instant-pressed="true"],
+[role="button"]:not([aria-disabled="true"]):active,
+[role="button"][data-instant-pressed="true"],
+input[type="button"]:not(:disabled):active,
+input[type="submit"]:not(:disabled):active {
+  transform: scale(0.97);
+  filter: brightness(0.9);
+}
+
+button[data-request-pending="true"],
+[role="button"][data-request-pending="true"],
+select[data-request-pending="true"],
+input[data-request-pending="true"] {
+  cursor: progress !important;
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+html[data-network-pending="true"]::before {
+  content: "";
+  position: fixed;
+  z-index: 9999;
+  top: 0;
+  left: 0;
+  width: 35%;
+  height: 3px;
+  background: #5865f2;
+  box-shadow: 0 0 12px rgba(88, 101, 242, 0.85);
+  animation: request-progress 900ms ease-in-out infinite alternate;
+  pointer-events: none;
+}
+
+@keyframes request-progress {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(285%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  input[type="button"]:not(:disabled),
+  input[type="submit"]:not(:disabled) {
+    transition-duration: 0ms;
+  }
+
+  html[data-network-pending="true"]::before {
+    animation: none;
+    width: 100%;
+  }
+}
