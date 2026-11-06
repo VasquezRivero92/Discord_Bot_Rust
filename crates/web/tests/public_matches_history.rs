@@ -179,6 +179,31 @@ async fn detail_falls_back_to_the_linked_account_photo_and_embedded_stats() {
 }
 
 #[tokio::test]
+async fn detail_takes_the_steam_id_of_a_roster_player_from_the_stats_by_nickname() {
+    let docs = data::InMemoryNodeDocs::new();
+    docs.put(
+        "faceit_matches_history",
+        "m3",
+        json!({
+            "id": "m3",
+            "faction1_roster": [{ "id": "uuid-a", "nickname": "Ana", "discord_id": "444" }],
+        }),
+    );
+    docs.put(
+        "faceit_match_stats",
+        "m3",
+        json!({ "teams": [{ "players": [{ "playerId": STEAM_A, "nickname": "ana" }] }] }),
+    );
+    let users = data::FakeUsersRepo::new();
+    users.insert("444", json!({ "discord_avatar": "https://dc/a.png" }));
+
+    let (_, body) = get(&detail_app(docs, users), "/api/lobby/matches-history/m3").await;
+    let p = &body["history"]["faction1_roster"][0];
+    assert_eq!(p["steam_id_64"], STEAM_A);
+    assert_eq!(p["avatar"], "https://steam/a.jpg");
+}
+
+#[tokio::test]
 async fn detail_of_an_unknown_match_is_404() {
     let app = detail_app(data::InMemoryNodeDocs::new(), data::FakeUsersRepo::new());
     let (status, body) = get(&app, "/api/lobby/matches-history/nope").await;

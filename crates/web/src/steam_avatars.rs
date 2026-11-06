@@ -215,12 +215,30 @@ pub async fn enrich_match(
         let s64 = direct.or_else(|| matched.as_ref().and_then(|m| m.s64.clone()));
         (s64, matched)
     };
+    // Las estadísticas traen el SteamID64 como `playerId`: sirve para los del roster que no lo
+    // tienen (ni en el roster ni en su usuario vinculado). El legacy no lo cruza.
+    let stats_s64_by_nick: HashMap<String, String> = stats
+        .as_ref()
+        .and_then(|s| s.get("teams"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("players").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|pl| {
+            let s64 = text(pl.get("playerId")).filter(|id| is_steam_id(id))?;
+            Some((key(pl.get("nickname"))?, s64))
+        })
+        .collect();
     let history_player = |p: &Map<String, Value>| -> (Option<String>, Option<Info>) {
         let matched = key(p.get("nickname"))
             .and_then(|k| lookup.get(&k))
             .or_else(|| key(p.get("id")).and_then(|k| lookup.get(&k)))
             .cloned();
-        let s64 = text(p.get("steam_id_64")).or_else(|| matched.as_ref().and_then(|m| m.s64.clone()));
+        let s64 = text(p.get("steam_id_64"))
+            .or_else(|| matched.as_ref().and_then(|m| m.s64.clone()))
+            .or_else(|| key(p.get("nickname")).and_then(|k| stats_s64_by_nick.get(&k).cloned()));
         (s64, matched)
     };
 
