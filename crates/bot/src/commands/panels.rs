@@ -30,7 +30,7 @@ pub async fn run_setup_recargas(
             "¡Recarga saldo a tu cuenta de forma instantánea usando **Yape** para participar en las partidas y cuotas de apuestas de **Machupeek**!\n\n\
             **📌 ¿Cómo recargar?**\n\
             1️⃣ Realiza tu Yape al número oficial de la comunidad.\n\
-            2️⃣ Presiona el botón de abajo e ingresa el monto, tu celular y el código de comprobante.\n\
+            2️⃣ Presiona el botón de abajo e ingresa el monto, tu celular y el número de operación.\n\
             3️⃣ Tu saldo se acreditará y tu celular quedará registrado para recibir premios si ganas.\n\n\
             🔒 *Nunca te pediremos tus claves ni códigos de acceso.*"
         )
