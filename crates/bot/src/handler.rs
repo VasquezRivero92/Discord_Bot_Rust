@@ -239,7 +239,7 @@ impl EventHandler for BotHandler {
                     }
                     "iniciar_recarga_btn" => {
                         let resp = CreateInteractionResponseMessage::new()
-                            .content("💜 Para recargar saldo con Yape:\n1. Transfiere al número oficial del servidor.\n2. Envía tu comprobante o regístralo desde el panel web en [machupeek.com](https://machupeek.com).")
+                            .content("💜 Para recargar saldo con Yape:\n1. Escanea el QR de Yape fijado en este canal y envía el monto.\n2. Envía tu comprobante o regístralo desde el panel web en [machupeek.com](https://machupeek.com).")
                             .ephemeral(true);
 
                         component

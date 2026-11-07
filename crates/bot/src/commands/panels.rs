@@ -1,5 +1,7 @@
 use serenity::all::*;
 
+const YAPE_QR: &[u8] = include_bytes!("../../assets/yape-qr.png");
+
 pub fn register_setup_recargas() -> CreateCommand {
     CreateCommand::new("setup_recargas")
         .description("Publica el panel interactivo de recargas con Yape en este canal")
@@ -32,6 +34,7 @@ pub async fn run_setup_recargas(
             3️⃣ Tu saldo se acreditará y tu celular quedará registrado para recibir premios si ganas.\n\n\
             🔒 *Nunca te pediremos tus claves ni códigos de acceso.*"
         )
+        .image("attachment://yape-qr.png")
         .color(0x742284) // Púrpura Yape
         .footer(CreateEmbedFooter::new(format!("{} • Billetera Yape", guild_name)));
 
@@ -44,11 +47,15 @@ pub async fn run_setup_recargas(
 
     let response = CreateInteractionResponseMessage::new()
         .embed(embed)
+        .add_file(CreateAttachment::bytes(YAPE_QR, "yape-qr.png"))
         .components(vec![row]);
 
     interaction
         .create_response(&ctx.http, CreateInteractionResponse::Message(response))
-        .await
+        .await?;
+
+    // Fija el panel para que el QR quede siempre visible en el canal de recargas.
+    interaction.get_response(&ctx.http).await?.pin(&ctx.http).await
 }
 
 pub async fn run_setup_soporte(
