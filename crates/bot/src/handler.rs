@@ -237,15 +237,7 @@ impl EventHandler for BotHandler {
                         )
                         .await
                     }
-                    "iniciar_recarga_btn" => {
-                        let resp = CreateInteractionResponseMessage::new()
-                            .content("💜 Para recargar saldo con Yape:\n1. Escanea el QR de Yape fijado en este canal y envía el monto.\n2. Registra tu recarga con el número de operación desde el panel web en [machupeek.com](https://machupeek.com).")
-                            .ephemeral(true);
-
-                        component
-                            .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
-                            .await
-                    }
+                    "iniciar_recarga_btn" => commands::recarga::open_modal(&ctx, &component).await,
                     "iniciar_verificacion_btn" => {
                         let resp = CreateInteractionResponseMessage::new()
                             .content("🔗 Para vincular tu cuenta, ejecuta el comando `/verificar_fc <tu_nickname_de_faceit>` aquí en el servidor.")
@@ -280,6 +272,14 @@ impl EventHandler for BotHandler {
 
                 let result = if custom_id.starts_with("support_call_modal_") {
                     commands::llamar_admin::handle_support_call_modal(
+                        &ctx,
+                        &modal,
+                        &self.config,
+                        self.firestore.as_ref(),
+                    )
+                    .await
+                } else if custom_id == commands::recarga::MODAL_ID {
+                    commands::recarga::handle_modal(
                         &ctx,
                         &modal,
                         &self.config,
