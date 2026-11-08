@@ -405,10 +405,41 @@ async fn join(
         Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
     };
     let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
-    let state = manager.join_queue(guild_id, payload.player).await;
+    let player = if user.is_admin_like() {
+        payload.player
+    } else {
+        own_player(&user, payload.player)
+    };
+    let state = manager.join_queue(guild_id, player).await;
     let available_players = partition_available_players(&state);
     Json(json!({ "success": true, "state": state, "availablePlayers": available_players }))
         .into_response()
+}
+
+/// Lo que un usuario sin permisos de admin puede poner en la cola: solo a sí mismo, con la
+/// identidad de su sesión. Del cuerpo no se confía la SteamID (el lanzamiento la toma de su
+/// cuenta vinculada), ni el ELO, el nivel o el tier, que deciden su lugar en el draft.
+fn own_player(user: &RequireUser, requested: Player) -> Player {
+    let username = user.username.clone();
+    let mut player = Player {
+        discord_id: user.user_id.clone(),
+        nickname: username.clone(),
+        faceit_nickname: Some(username.clone()),
+        steam_id_64: None,
+        avatar: user.avatar.clone(),
+        faceit_elo: 1000,
+        faceit_level: Some(1),
+        ready: requested.ready,
+        tier: "C".to_string(),
+        mixton_tier_override: None,
+        discord_user: Some(DiscordUserDetails {
+            username: username.clone(),
+            display_name: username,
+            avatar_url: format_discord_avatar(&user.user_id, user.avatar.as_deref()),
+        }),
+    };
+    player.ensure_discord_user();
+    player
 }
 
 async fn player_ready(
@@ -2107,6 +2138,38 @@ fn forward_chat_to_discord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn un_usuario_solo_se_une_a_si_mismo_sin_steam_ni_elo_del_cuerpo() {
+        let user = RequireUser(crate::auth::LobbyUser {
+            user_id: "111".into(),
+            username: "yo".into(),
+            avatar: None,
+            role: None,
+            servidor: None,
+            is_admin: false,
+            nickname: None,
+            faceit_nickname: None,
+        });
+        let requested = Player {
+            discord_id: "222".into(),
+            nickname: "otro".into(),
+            steam_id_64: Some("76561198000000001".into()),
+            faceit_elo: 3000,
+            tier: "A".into(),
+            mixton_tier_override: Some("A".into()),
+            ready: true,
+            ..Default::default()
+        };
+        let p = own_player(&user, requested);
+        assert_eq!(p.discord_id, "111");
+        assert_eq!(p.nickname, "yo");
+        assert_eq!(p.steam_id_64, None);
+        assert_eq!(p.faceit_elo, 1000);
+        assert_eq!(p.tier, "C");
+        assert_eq!(p.mixton_tier_override, None);
+        assert!(p.ready);
+    }
 
     #[test]
     fn test_random_alphanumeric_length_and_chars() {
