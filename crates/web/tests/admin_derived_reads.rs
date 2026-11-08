@@ -101,6 +101,7 @@ impl Fakes {
             doc_sink: Arc::new(FakeDocSink::new()),
             users: Arc::new(data::FakeUsersRepo::new()),
             config: cfg,
+            firestore: None,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         };
@@ -591,25 +592,45 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
                 assert_eq!(text, format!("LEGACY GET {path}"));
             }
         }
-        for (method, path) in [
-            ("GET", "/api/admin/steam/status"),
-            ("GET", "/api/admin/stats/someone"),
-            ("GET", "/api/admin/steam/login"),
-            ("POST", "/api/admin/broadcast"),
-            ("POST", "/api/admin/users/sync-all"),
-            ("POST", "/api/admin/stats"),
-        ] {
-            let res = client
-                .request(method.parse().unwrap(), format!("http://{front}{path}"))
-                .header(header::COOKIE, format!("auth_token={t}"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                res.text().await.unwrap(),
-                format!("LEGACY {method} {path}"),
-                "{with_firestore} {method} {path}"
-            );
+        if !with_firestore {
+            for (method, path) in [
+                ("GET", "/api/admin/steam/status"),
+                ("GET", "/api/admin/stats/someone"),
+                ("GET", "/api/admin/steam/login"),
+                ("POST", "/api/admin/broadcast"),
+                ("POST", "/api/admin/users/sync-all"),
+                ("POST", "/api/admin/stats"),
+            ] {
+                let res = client
+                    .request(method.parse().unwrap(), format!("http://{front}{path}"))
+                    .header(header::COOKIE, format!("auth_token={t}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.text().await.unwrap(),
+                    format!("LEGACY {method} {path}"),
+                    "{with_firestore} {method} {path}"
+                );
+            }
+        } else {
+            for (method, path) in [
+                ("GET", "/api/admin/steam/login"),
+                ("POST", "/api/admin/stats"),
+                ("GET", "/api/admin/unknown-route"),
+            ] {
+                let res = client
+                    .request(method.parse().unwrap(), format!("http://{front}{path}"))
+                    .header(header::COOKIE, format!("auth_token={t}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.text().await.unwrap(),
+                    format!("LEGACY {method} {path}"),
+                    "{with_firestore} {method} {path}"
+                );
+            }
         }
     }
 }
@@ -637,27 +658,25 @@ async fn legacy_panel_writes_clear_the_rust_caches() {
         let client = client.clone();
         let t = t.clone();
         async move {
-            client
+            let req = client
                 .request(method.parse().unwrap(), format!("http://{front}{path}"))
-                .header(header::COOKIE, format!("auth_token={t}"))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap()
+                .header(header::COOKIE, format!("auth_token={t}"));
+            let req = if method == "POST" {
+                req.header(header::CONTENT_TYPE, "application/json").body("{}")
+            } else {
+                req
+            };
+            req.send().await.unwrap().text().await.unwrap()
         }
     };
 
     call("GET", "/api/admin/yape/transactions").await;
     call("GET", "/api/admin/yape/transactions").await;
     assert_eq!(f.docs.lists_of(YAPE_T), 1, "cacheado");
-    assert_eq!(
-        call("POST", "/api/admin/yape/manual-approve").await,
-        "LEGACY POST /api/admin/yape/manual-approve"
-    );
+    let res_yape = call("POST", "/api/admin/yape/manual-approve").await;
+    assert!(res_yape.contains("monto"), "{res_yape}");
     call("GET", "/api/admin/yape/transactions").await;
-    assert_eq!(f.docs.lists_of(YAPE_T), 2, "invalidado por Node");
+    assert_eq!(f.docs.lists_of(YAPE_T), 2, "invalidado por escritura de yape");
 
     call("GET", "/api/admin/stats").await;
     call("GET", "/api/admin/stats?guildId=g1").await;

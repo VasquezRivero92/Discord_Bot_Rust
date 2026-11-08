@@ -103,6 +103,16 @@ impl web::steam_avatars::SteamAvatars for FakeAvatars {
     }
 }
 
+struct FakeFaceit(std::collections::HashMap<String, String>);
+
+#[async_trait::async_trait]
+impl web::steam_avatars::FaceitSteamIds for FakeFaceit {
+    async fn steam_id(&self, player_id: &str) -> Option<String> {
+        self.0.get(player_id).cloned()
+    }
+}
+
+const FACEIT_UUID: &str = "5fa066c1-e03b-4c92-81da-51a0964d5d50";
 const STEAM_A: &str = "76561198000000001";
 const STEAM_B: &str = "76561198000000002";
 
@@ -116,6 +126,9 @@ fn detail_app(docs: data::InMemoryNodeDocs, users: data::FakeUsersRepo) -> Route
                 (STEAM_B.to_string(), "https://steam/b.jpg".to_string()),
             ]
             .into(),
+        )),
+        faceit: Arc::new(FakeFaceit(
+            [(FACEIT_UUID.to_string(), STEAM_B.to_string())].into(),
         )),
     })
 }
@@ -201,6 +214,93 @@ async fn detail_takes_the_steam_id_of_a_roster_player_from_the_stats_by_nickname
     let p = &body["history"]["faction1_roster"][0];
     assert_eq!(p["steam_id_64"], STEAM_A);
     assert_eq!(p["avatar"], "https://steam/a.jpg");
+}
+
+#[tokio::test]
+async fn detail_of_a_faceit_match_finds_the_registered_user_by_faceit_nickname() {
+    let docs = data::InMemoryNodeDocs::new();
+    docs.put(
+        "faceit_matches_history",
+        "1-abc",
+        json!({
+            "id": "1-abc",
+            "faction1_roster": [{ "id": "uuid-a", "nickname": "Ana" }],
+            "faction2_roster": [{ "id": "uuid-z", "nickname": "Nadie" }],
+        }),
+    );
+    let users = data::FakeUsersRepo::new();
+    users.insert("555", json!({ "faceit_nickname": "Ana", "faceit_nickname_lower": "ana", "steam_id_64": STEAM_A }));
+
+    let (_, body) = get(&detail_app(docs, users), "/api/lobby/matches-history/1-abc").await;
+    let h = &body["history"];
+    assert_eq!(h["faction1_roster"][0]["steam_id_64"], STEAM_A);
+    assert_eq!(h["faction1_roster"][0]["avatar"], "https://steam/a.jpg");
+    assert_eq!(h["faction2_roster"][0]["avatar"], Value::Null);
+}
+
+#[tokio::test]
+async fn detail_resolves_the_steam_id_of_a_faceit_player_through_the_faceit_api() {
+    let docs = data::InMemoryNodeDocs::new();
+    docs.put(
+        "faceit_matches_history",
+        "1-xyz",
+        json!({
+            "id": "1-xyz",
+            "faction1_roster": [{ "id": FACEIT_UUID, "nickname": "Sin Registro" }],
+        }),
+    );
+    let (_, body) = get(
+        &detail_app(docs, data::FakeUsersRepo::new()),
+        "/api/lobby/matches-history/1-xyz",
+    )
+    .await;
+    let p = &body["history"]["faction1_roster"][0];
+    assert_eq!(p["steam_id_64"], STEAM_B);
+    assert_eq!(p["avatar"], "https://steam/b.jpg");
+}
+
+async fn raw_get(app: &Router, uri: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn avatar_app() -> Router {
+    public_api::steam_avatar_router(Arc::new(FakeAvatars(
+        [(STEAM_A.to_string(), "https://steam/a.jpg".to_string())].into(),
+    )))
+}
+
+#[tokio::test]
+async fn steam_avatar_redirects_to_the_image_so_the_img_tag_can_load_it() {
+    let res = raw_get(&avatar_app(), &format!("/api/lobby/steam-avatar/{STEAM_A}")).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.headers()["location"], "https://steam/a.jpg");
+    assert_eq!(res.headers()["cache-control"], "public, max-age=7200");
+
+    // Sin foto de Steam: la genérica, sin caché.
+    let res = raw_get(&avatar_app(), &format!("/api/lobby/steam-avatar/{STEAM_B}")).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert!(res.headers()["location"].to_str().unwrap().contains("steamstatic"));
+    assert!(res.headers().get("cache-control").is_none());
+}
+
+#[tokio::test]
+async fn steam_avatar_rejects_ids_that_are_not_steamid64() {
+    let (status, body) = get(&avatar_app(), "/api/lobby/steam-avatar/abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "SteamID64 inválido.");
+}
+
+#[tokio::test]
+async fn steam_avatars_batch_returns_only_the_resolved_valid_ids() {
+    let uri = format!("/api/lobby/steam-avatars?ids={STEAM_A},{STEAM_B},nope,{STEAM_A}");
+    let (status, body) = get(&avatar_app(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "avatars": { STEAM_A: "https://steam/a.jpg" } }));
+    let (_, body) = get(&avatar_app(), "/api/lobby/steam-avatars").await;
+    assert_eq!(body, json!({ "avatars": {} }));
 }
 
 #[tokio::test]

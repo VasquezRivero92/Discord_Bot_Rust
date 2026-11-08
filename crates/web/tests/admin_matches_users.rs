@@ -127,6 +127,7 @@ impl TestHarness {
             doc_sink: doc_sink.clone(),
             users: users.clone(),
             config,
+            firestore: None,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         };

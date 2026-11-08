@@ -120,6 +120,18 @@ impl NodeDocSource for FirestoreClient {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, Map<String, Value>)>, DataError> {
+        if let Some(m) = &self.mysql {
+            let docs = m.list_raw_json(collection).await?;
+            return docs
+                .into_iter()
+                .map(|(id, v)| match crate::mysql::json_for_node(v) {
+                    Value::Object(map) => Ok((id, map)),
+                    _ => Err(DataError::Decode(format!(
+                        "{collection}/{id}: no es un objeto JSON"
+                    ))),
+                })
+                .collect();
+        }
         self.list_raw_docs(collection)
             .await?
             .iter()
@@ -132,6 +144,17 @@ impl NodeDocSource for FirestoreClient {
         collection: &str,
         id: &str,
     ) -> Result<Option<Map<String, Value>>, DataError> {
+        if let Some(m) = &self.mysql {
+            let Some(v) = m.get_raw_json(collection, id).await? else {
+                return Ok(None);
+            };
+            return match crate::mysql::json_for_node(v) {
+                Value::Object(map) => Ok(Some(map)),
+                _ => Err(DataError::Decode(format!(
+                    "{collection}/{id}: no es un objeto JSON"
+                ))),
+            };
+        }
         let doc = self.get_raw_doc(collection, id).await?;
         doc.map(|d| node_document(&d).map(|(_, v)| v)).transpose()
     }

@@ -68,6 +68,16 @@ impl Cs2ServerManager {
         }
     }
 
+    /// Sin acceso remoto: ni SSH ni EC2. Para pruebas: `new` encuentra la clave real
+    /// (`clave_cs2.pem`) y apunta al servidor de producción, así que una prueba que lance o
+    /// configure una partida ejecutaría comandos en él.
+    pub fn offline(mut self) -> Self {
+        self.ssh_key_path = None;
+        self.ec2_client = None;
+        self.ec2_instance_id = None;
+        self
+    }
+
     pub fn server_ip(&self) -> &str {
         &self.server_ip
     }

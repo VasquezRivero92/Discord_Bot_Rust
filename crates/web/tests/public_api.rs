@@ -366,6 +366,7 @@ async fn post_reclamaciones_is_proxied() {
         .send()
         .await
         .unwrap();
+    assert_eq!(post.status(), 200);
     assert_eq!(
         post.text().await.unwrap(),
         "LEGACY POST /api/checkout/purchase"
@@ -397,4 +398,85 @@ async fn post_reclamaciones_is_proxied() {
         .await
         .unwrap();
     assert_eq!(health.text().await.unwrap(), "LEGACY GET /health");
+}
+
+#[tokio::test]
+async fn checkout_purchase_endpoint() {
+    let fs = Arc::new(data::FirestoreClient::in_memory_mysql());
+    let app = public_api::checkout_router(fs);
+
+    let (status, _, body) = {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/checkout/purchase")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let val: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, (), val)
+    };
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "El carrito de compras está vacío.");
+}
+
+#[tokio::test]
+async fn claims_post_endpoint_validates_and_creates_claim() {
+    let fs = Arc::new(data::FirestoreClient::in_memory_mysql());
+    let app = public_api::claims_post_router(fs);
+
+    // 1. Falta campos obligatorios -> 400
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/reclamaciones")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "consumerName": "Juan" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Correo inválido -> 400
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/reclamaciones")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "consumerName": "Juan Perez",
+                "consumerDocNumber": "12345678",
+                "consumerEmail": "invalido",
+                "claimDetail": "Detalle del problema",
+                "consumerRequest": "Devolución"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Válido -> 201 Created con código de reclamo
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/reclamaciones")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "consumerName": "Juan Perez",
+                "consumerDocNumber": "12345678",
+                "consumerEmail": "juan@example.com",
+                "claimDetail": "Detalle del problema",
+                "consumerRequest": "Devolución"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let val: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["success"], true);
+    assert!(val["claimCode"].as_str().unwrap().starts_with("LR-"));
+    assert_eq!(val["deadlineDays"], 15);
 }

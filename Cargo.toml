@@ -13,6 +13,7 @@ tower = { version = "0.5", features = ["util"] }
 thiserror = "2"
 dotenvy = "0.15"
 firestore = "0.61"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "mysql", "json", "chrono", "macros"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

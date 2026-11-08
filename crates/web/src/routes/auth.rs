@@ -16,14 +16,14 @@ use std::sync::Arc;
 
 use crate::discord::{check_discord_admin, AdminRoleSources, DiscordApi, RestDiscordApi};
 use crate::session::{
-    clear_cookies, issue_cookies, set_cookie_values, OptionalUser, SessionClaims,
-    SessionState, SESSION_SECS,
+    clear_cookies, issue_cookies, set_cookie_values, OptionalUser, SessionClaims, SessionState,
+    SESSION_SECS,
 };
 
 const AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
 
 /// Estado de las rutas de autenticación.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthState {
     pub client_id: String,
     pub client_secret: String,
@@ -32,6 +32,20 @@ pub struct AuthState {
     pub http: reqwest::Client,
     /// Verificación de administrador contra Discord. `None` (solo pruebas) omite la comprobación.
     pub admin_check: Option<AdminCheck>,
+    pub firestore: Option<Arc<data::FirestoreClient>>,
+    pub faceit_api_key: Option<String>,
+    pub faceit_base_url: String,
+    pub default_guild_id: String,
+}
+
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("admin_check", &self.admin_check)
+            .finish()
+    }
 }
 
 /// Datos para comprobar que quien inicia sesión es administrador del servidor.
@@ -44,7 +58,9 @@ pub struct AdminCheck {
 
 impl std::fmt::Debug for AdminCheck {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdminCheck").field("guild_id", &self.guild_id).finish()
+        f.debug_struct("AdminCheck")
+            .field("guild_id", &self.guild_id)
+            .finish()
     }
 }
 
@@ -62,15 +78,18 @@ impl AuthState {
                 .build()
                 .unwrap_or_default(),
             admin_check: None,
+            firestore: None,
+            faceit_api_key: None,
+            faceit_base_url: "https://open.faceit.com".to_owned(),
+            default_guild_id: String::new(),
         }
     }
 
     pub fn from_config(cfg: &Config) -> Self {
-        let session = SessionState::from_config(cfg)
-            .unwrap_or_else(|_| {
-                SessionState::new(b"default-jwt-secret-min-32-bytes-long!", false)
-                    .expect("Secreto de prueba válido")
-            });
+        let session = SessionState::from_config(cfg).unwrap_or_else(|_| {
+            SessionState::new(b"default-jwt-secret-min-32-bytes-long!", false)
+                .expect("Secreto de prueba válido")
+        });
         Self {
             client_id: cfg.discord_client_id.clone(),
             client_secret: cfg.discord_client_secret.clone(),
@@ -85,7 +104,21 @@ impl AuthState {
                 guild_id: cfg.discord_guild_id.clone(),
                 admin_role_id: cfg.admin_role_id.clone(),
             }),
+            firestore: None,
+            faceit_api_key: cfg
+                .faceit_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty() && !k.starts_with("TU_"))
+                .map(str::to_owned),
+            faceit_base_url: "https://open.faceit.com".to_owned(),
+            default_guild_id: cfg.discord_guild_id.clone(),
         }
+    }
+
+    pub fn with_firestore(mut self, firestore: Option<Arc<data::FirestoreClient>>) -> Self {
+        self.firestore = firestore;
+        self
     }
 }
 
@@ -311,11 +344,18 @@ async fn discord_callback(
         match check_discord_admin(check.api.as_ref(), &check.guild_id, &user.id, &sources).await {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!("[AUTH] {} ({}) no es administrador; sesión denegada", user.username, user.id);
+                tracing::warn!(
+                    "[AUTH] {} ({}) no es administrador; sesión denegada",
+                    user.username,
+                    user.id
+                );
                 return found("/", Vec::new());
             }
             Err(err) => {
-                tracing::error!("[AUTH] No se pudo verificar administrador de {}: {err}", user.id);
+                tracing::error!(
+                    "[AUTH] No se pudo verificar administrador de {}: {err}",
+                    user.id
+                );
                 return found("/", Vec::new());
             }
         }
@@ -350,58 +390,72 @@ async fn discord_callback(
     let cookies = issue_cookies(&claims, &token, &st.session);
     let cookie_headers = set_cookie_values(&cookies);
 
-    tracing::info!("[AUTH] Usuario autenticado con éxito: {} ({})", user.username, user.id);
+    tracing::info!(
+        "[AUTH] Usuario autenticado con éxito: {} ({})",
+        user.username,
+        user.id
+    );
     found(target_path, cookie_headers)
 }
 
-/// `GET /auth/logout`: borra ambas cookies y vuelve a `/`.
-async fn logout() -> Response {
+/// `GET /auth/logout`: revoca el token de la sesión (deja de valer aunque alguien haya copiado
+/// la cookie), borra ambas cookies y vuelve a `/`.
+async fn logout(headers: axum::http::HeaderMap) -> Response {
+    crate::session::revoke_request_tokens(&headers);
     found("/", set_cookie_values(&clear_cookies()))
 }
 
 /// `GET /auth/me`
-async fn auth_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
-    match user {
-        Some(u) => {
-            let avatar_url = u.avatar.as_deref().map(|av| {
-                if av.starts_with("http") { av.to_string() }
-                else { format!("https://cdn.discordapp.com/avatars/{}/{}.png", u.user_id, av) }
-            }).unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/0.png".to_string());
-            Json(json!({
-                "user": {
-                    "userId": u.user_id,
-                    "username": u.username,
-                    "avatar": u.avatar,
-                    "avatarURL": avatar_url,
-                    "isAdmin": u.is_admin,
-                    "role": u.role,
-                    "servidor": u.servidor,
-                    "hasSavedPhone": false,
-                    "balance": 0.0,
-                    "faceit_nickname": u.username,
-                    "faceit_player_id": "faceit_mock",
-                    "skillLevel": 10,
-                    "faceit_level": 10,
-                    "elo": 2000,
-                    "faceit_elo": 2000,
-                    "tier": "S",
-                    "steam_id_64": "76561198000000000"
-                }
-            }))
-            .into_response()
-        },
-        None => Json(json!({ "user": null })).into_response(),
-    }
+async fn auth_me(
+    OptionalUser(user): OptionalUser,
+    RawQuery(raw): RawQuery,
+    State(st): State<AuthState>,
+) -> impl IntoResponse {
+    lobby_me(OptionalUser(user), RawQuery(raw), State(st)).await
 }
 
 /// `GET /api/lobby/me`
-async fn lobby_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
+async fn lobby_me(
+    OptionalUser(user): OptionalUser,
+    RawQuery(raw): RawQuery,
+    State(st): State<AuthState>,
+) -> impl IntoResponse {
     match user {
         Some(u) => {
-            let avatar_url = u.avatar.as_deref().map(|av| {
-                if av.starts_with("http") { av.to_string() }
-                else { format!("https://cdn.discordapp.com/avatars/{}/{}.png", u.user_id, av) }
-            }).unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/0.png".to_string());
+            if let Some(ref fs) = st.firestore {
+                let query_guild = raw.as_deref().and_then(|r| {
+                    url::form_urlencoded::parse(r.as_bytes()).find_map(|(k, v)| {
+                        ((k == "guildId" || k == "guild_id" || k == "guild")
+                            && !v.trim().is_empty())
+                        .then(|| v.trim().to_owned())
+                    })
+                });
+                let body = super::account::build_authenticated_user_json(
+                    &u,
+                    fs,
+                    &st.http,
+                    &st.faceit_base_url,
+                    st.faceit_api_key.as_deref(),
+                    query_guild.as_deref(),
+                    &st.default_guild_id,
+                )
+                .await;
+                return Json(body).into_response();
+            }
+            let avatar_url = u
+                .avatar
+                .as_deref()
+                .map(|av| {
+                    if av.starts_with("http") {
+                        av.to_string()
+                    } else {
+                        format!(
+                            "https://cdn.discordapp.com/avatars/{}/{}.png",
+                            u.user_id, av
+                        )
+                    }
+                })
+                .unwrap_or_else(|| "https://cdn.discordapp.com/embed/avatars/0.png".to_string());
             Json(json!({
                 "user": {
                     "userId": u.user_id,
@@ -413,18 +467,18 @@ async fn lobby_me(OptionalUser(user): OptionalUser) -> impl IntoResponse {
                     "servidor": u.servidor,
                     "hasSavedPhone": false,
                     "balance": 0.0,
-                    "faceit_nickname": u.username,
-                    "faceit_player_id": "faceit_mock",
-                    "skillLevel": 10,
-                    "faceit_level": 10,
-                    "elo": 2000,
-                    "faceit_elo": 2000,
-                    "tier": "S",
-                    "steam_id_64": "76561198000000000"
+                    "faceit_nickname": null,
+                    "faceit_player_id": null,
+                    "skillLevel": null,
+                    "faceit_level": null,
+                    "elo": null,
+                    "faceit_elo": null,
+                    "tier": null,
+                    "steam_id_64": null
                 }
             }))
             .into_response()
-        },
+        }
         None => Json(json!({ "user": null })).into_response(),
     }
 }

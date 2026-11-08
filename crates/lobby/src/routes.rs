@@ -9,7 +9,7 @@ use crate::state::{
     LobbyManager, LobbyTeam, Player,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, RawQuery, State},
+    extract::{DefaultBodyLimit, RawQuery, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -177,6 +177,35 @@ pub struct PickPayload {
     pub player_discord_id: Option<String>,
 }
 
+
+#[derive(Deserialize, Debug, Default)]
+pub struct OverrideTierPayload {
+    #[serde(rename = "guildId", default)]
+    pub guild_id: Option<String>,
+    #[serde(rename = "playerDiscordId", default)]
+    pub player_discord_id: Option<String>,
+    pub tier: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct ToggleCommandPayload {
+    #[serde(rename = "guildId", default)]
+    pub guild_id: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct LoadTeamPayload {
+    #[serde(rename = "guildId", default)]
+    pub guild_id: Option<String>,
+    #[serde(rename = "teamId", default)]
+    pub team_id: Option<String>,
+    #[serde(rename = "captainDiscordId", default)]
+    pub captain_discord_id: Option<String>,
+    #[serde(rename = "playerDiscordIds", default)]
+    pub player_discord_ids: Option<Vec<String>>,
+}
+
 pub fn router(state: LobbyApiState) -> Router {
     let ctx = LobbyCtx {
         manager: state.manager,
@@ -188,11 +217,8 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/state", get(get_state))
         .route("/api/lobby/mixton-state", get(get_state))
         .route("/api/lobby/guilds", get(guilds))
-        .route("/api/lobby/matches-history", get(matches_history))
-        .route(
-            "/api/lobby/matches-history/{match_id}",
-            get(matches_history),
-        )
+        // `/api/lobby/matches-history` lo monta el crate web con el historial de Firestore; el
+        // detalle `/{match_id}` sigue en el proxy (antes devolvía una lista vacía simulada).
         .route(
             "/api/lobby/map-catalog",
             get(map_catalog).post(update_map_catalog),
@@ -200,8 +226,7 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-queues", get(mixton_queues))
         // Dinero (wallet, player-balance, quick-add-balance, recharge-yape): sin escritura a Firestore en Rust todavía; se dejan sin registrar para que el proxy las envíe al legado Node. NO simular saldo.
         .route("/api/lobby/users", get(users))
-        .route("/api/lobby/steam-avatars", get(steam_avatars))
-        .route("/api/lobby/steam-avatar/{steam_id}", get(steam_avatar))
+        // `/api/lobby/steam-avatar(s)` los sirve el crate web (`public_api::steam_avatar_router`).
         // WebSockets
         .route("/api/lobby/mixton-ws", get(crate::ws::mixton_ws_handler))
         // Acciones de jugador
@@ -229,6 +254,9 @@ pub fn router(state: LobbyApiState) -> Router {
         .route("/api/lobby/mixton-cancel-veto", post(cancel_veto))
         // Equipos y capitanes
         .route("/api/lobby/mixton-clear-team", post(clear_team))
+        .route("/api/lobby/mixton-load-team", post(load_team))
+        .route("/api/lobby/mixton-override-tier", post(override_tier))
+        .route("/api/lobby/mixton-toggle-command", post(toggle_command))
         .route("/api/lobby/mixton-assign-captain", post(assign_captain))
         .route("/api/lobby/mixton-pick", post(pick_player))
         .route("/api/lobby/mixton-captain-proposal", post(captain_proposal))
@@ -257,11 +285,8 @@ pub fn router(state: LobbyApiState) -> Router {
             "/api/lobby/mixton-chat-send",
             post(chat_message).layer(DefaultBodyLimit::max(9 * 1024 * 1024)),
         )
+        .route("/api/lobby/mixton-chat-incoming", post(chat_incoming))
         .with_state(ctx)
-}
-
-async fn matches_history(_user: OptionalLobbyUser) -> impl IntoResponse {
-    Json(json!({ "history": [] }))
 }
 
 async fn map_catalog(
@@ -327,14 +352,6 @@ async fn guilds(_user: RequireUser, State(manager): State<Arc<LobbyManager>>) ->
 
 async fn users(_user: RequireUser) -> impl IntoResponse {
     Json(json!({ "users": [] }))
-}
-
-async fn steam_avatars() -> impl IntoResponse {
-    Json(json!({ "avatars": {} }))
-}
-
-async fn steam_avatar(Path(_): Path<String>) -> impl IntoResponse {
-    Json(json!({ "avatar": "https://cdn.discordapp.com/embed/avatars/0.png" }))
 }
 
 async fn get_state(
@@ -1606,7 +1623,26 @@ async fn chat_history(
         g_opt
     };
     let guild_id = manager.resolve_guild_id(effective_guild.as_deref());
-    let history = manager.get_chat_history(guild_id).await;
+    let mut history = manager.get_chat_history(guild_id).await;
+
+    if history.is_empty() {
+        let legacy_base = std::env::var("LEGACY_URL").unwrap_or_else(|_| "http://bot:3001".to_string());
+        let client = reqwest::Client::new();
+        let url = format!("{legacy_base}/api/lobby/mixton-chat-history?guildId={guild_id}");
+        if let Ok(res) = client.get(&url).send().await {
+            if let Ok(val) = res.json::<serde_json::Value>().await {
+                if let Some(msgs) = val.get("messages").and_then(|m| m.as_array()) {
+                    for m in msgs {
+                        if let Ok(chat_msg) = serde_json::from_value::<ChatMessage>(m.clone()) {
+                            manager.add_chat_message(guild_id, chat_msg).await;
+                        }
+                    }
+                    history = manager.get_chat_history(guild_id).await;
+                }
+            }
+        }
+    }
+
     Json(json!({
         "success": true,
         "messages": history
@@ -1929,7 +1965,17 @@ async fn chat_message(
     let image_url = saved_image_filename.map(|f| format!("/uploads/chat/{f}"));
     let is_admin = user.is_admin_like();
 
-    // TODO: reenviar a Discord (requiere crates/bot)
+    let target_channel_id = std::env::var("DISCORD_MIXTON_CHAT_CHANNEL_ID")
+        .or_else(|_| std::env::var("DISCORD_MIXTON_CHANNEL_ID"))
+        .unwrap_or_else(|_| "1563654582452756571".to_string());
+
+    forward_chat_to_discord(
+        target_channel_id,
+        author_name.clone(),
+        avatar_url.clone(),
+        text.to_string(),
+        saved_image_path.clone(),
+    );
 
     let msg = ChatMessage {
         id,
@@ -1945,6 +1991,117 @@ async fn chat_message(
 
     manager.add_chat_message(guild_id, msg.clone()).await;
     Json(json!({ "success": true, "message": msg })).into_response()
+}
+
+#[derive(Deserialize)]
+struct IncomingChatPayload {
+    #[serde(rename = "guildId")]
+    guild_id: Option<String>,
+    message: ChatMessage,
+}
+
+async fn chat_incoming(
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<IncomingChatPayload>,
+) -> impl IntoResponse {
+    let guild_id = manager.resolve_guild_id(payload.guild_id.as_deref());
+    manager.add_chat_message(guild_id, payload.message).await;
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
+fn forward_chat_to_discord(
+    channel_id: String,
+    author_name: String,
+    avatar_url: String,
+    content: String,
+    image_path: Option<std::path::PathBuf>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("DiscordBot (https://machupeek.com, 1.0)")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        // La URL del webhook es un secreto: solo desde el entorno, nunca en el código.
+        let webhook_url = std::env::var("DISCORD_MIXTON_WEBHOOK_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty());
+
+        let target_webhook = if let Some(wh) = webhook_url {
+            Some(wh)
+        } else if let Ok(token) = std::env::var("DISCORD_TOKEN") {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/webhooks");
+            let resp = client.get(&url)
+                .header("Authorization", format!("Bot {token}"))
+                .send()
+                .await;
+            if let Ok(r) = resp {
+                if let Ok(webhooks) = r.json::<Vec<serde_json::Value>>().await {
+                    webhooks.into_iter().find_map(|w| {
+                        let id = w.get("id")?.as_str()?;
+                        let tok = w.get("token")?.as_str()?;
+                        Some(format!("https://discord.com/api/webhooks/{id}/{tok}"))
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(wh_url) = target_webhook {
+            let payload_json = serde_json::json!({
+                "content": content,
+                "username": author_name,
+                "avatar_url": avatar_url
+            });
+
+            let mut has_image = false;
+            let mut form = reqwest::multipart::Form::new();
+            if let Some(ref path) = image_path {
+                if path.exists() {
+                    if let Ok(bytes) = tokio::fs::read(path).await {
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png").to_string();
+                        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+                        form = form.part("files[0]", part);
+                        form = form.text("payload_json", payload_json.to_string());
+                        has_image = true;
+                    }
+                }
+            }
+
+            let res = if has_image {
+                client.post(&wh_url).multipart(form).send().await
+            } else {
+                client.post(&wh_url).json(&payload_json).send().await
+            };
+
+            if let Ok(r) = res {
+                if r.status().is_success() {
+                    tracing::info!("Mensaje de chat reenviado a webhook Discord con éxito");
+                    return;
+                } else {
+                    tracing::warn!("Webhook Discord respondió con error: status={}", r.status());
+                }
+            }
+        }
+
+        // Fallback al bot directo en el canal
+        if let Ok(token) = std::env::var("DISCORD_TOKEN") {
+            let msg_url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+            let body = serde_json::json!({
+                "content": format!("💬 **{}**: {}", author_name, content)
+            });
+            let _ = client.post(&msg_url)
+                .header("Authorization", format!("Bot {token}"))
+                .json(&body)
+                .send()
+                .await;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1997,4 +2154,228 @@ mod tests {
             "https://cdn.discordapp.com/embed/avatars/0.png"
         );
     }
+}
+
+
+async fn override_tier(
+    admin: RequireAdmin,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<OverrideTierPayload>,
+) -> impl IntoResponse {
+    let p_id = match payload.player_discord_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Falta el ID del jugador." })),
+            )
+                .into_response()
+        }
+    };
+
+    if let Some(ref t) = payload.tier {
+        if !matches!(t.to_uppercase().as_str(), "S" | "A" | "B" | "C") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Tier inválido. Debe ser S, A, B, C o null." })),
+            )
+                .into_response();
+        }
+    }
+
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let norm_tier = payload.tier.as_ref().map(|t| t.to_uppercase());
+
+    let mut found = false;
+    for p in &mut state.available_players {
+        if p.discord_id == p_id {
+            p.mixton_tier_override = norm_tier.clone();
+            if let Some(ref t) = norm_tier {
+                p.tier = t.clone();
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        for t in &mut state.teams {
+            if let Some(ref mut c) = t.captain {
+                if c.discord_id == p_id {
+                    c.mixton_tier_override = norm_tier.clone();
+                    if let Some(ref nt) = norm_tier {
+                        c.tier = nt.clone();
+                    }
+                    break;
+                }
+            }
+            for p in &mut t.players {
+                if p.discord_id == p_id {
+                    p.mixton_tier_override = norm_tier.clone();
+                    if let Some(ref nt) = norm_tier {
+                        p.tier = nt.clone();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    state.sanitize();
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({
+        "success": true,
+        "tier": norm_tier,
+        "state": updated,
+        "availablePlayers": available_players,
+    }))
+    .into_response()
+}
+
+async fn toggle_command(
+    admin: RequireAdmin,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<ToggleCommandPayload>,
+) -> impl IntoResponse {
+    let enabled = match payload.enabled {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "El valor de \"enabled\" debe ser un booleano." })),
+            )
+                .into_response()
+        }
+    };
+
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+    state.command_enabled = enabled;
+    let updated = manager.update_state(guild_id, state).await;
+    Json(json!({ "success": true, "commandEnabled": enabled, "state": updated })).into_response()
+}
+
+async fn load_team(
+    admin: RequireAdmin,
+    RawQuery(raw): RawQuery,
+    State(manager): State<Arc<LobbyManager>>,
+    Json(payload): Json<LoadTeamPayload>,
+) -> impl IntoResponse {
+    let (team_id, cap_id, player_ids) = match (
+        payload.team_id.filter(|s| !s.trim().is_empty()),
+        payload.captain_discord_id.filter(|s| !s.trim().is_empty()),
+        payload.player_discord_ids,
+    ) {
+        (Some(tid), Some(cid), Some(pids)) => (tid, cid, pids),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Faltan parámetros (teamId, captainDiscordId, playerDiscordIds)." })),
+            )
+                .into_response()
+        }
+    };
+
+    let g_opt = payload
+        .guild_id
+        .or_else(|| extract_guild_id(raw.as_deref()));
+    let guild_opt = match resolve_guild_for_user(&admin, g_opt.as_deref(), true) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    };
+    let guild_id = manager.resolve_guild_id(guild_opt.as_deref());
+    let mut state = manager.get_state(guild_id).await;
+
+    let team_pos = match state.teams.iter().position(|t| t.id == team_id) {
+        Some(pos) => pos,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Equipo no encontrado." })),
+            )
+                .into_response()
+        }
+    };
+
+    let all_roster_ids: std::collections::HashSet<String> =
+        std::iter::once(cap_id.clone())
+            .chain(player_ids.iter().cloned())
+            .collect();
+
+    state
+        .available_players
+        .retain(|p| !all_roster_ids.contains(&p.discord_id));
+
+    for other_team in &mut state.teams {
+        if let Some(ref c) = other_team.captain {
+            if all_roster_ids.contains(&c.discord_id) {
+                other_team.captain = None;
+            }
+        }
+        other_team
+            .players
+            .retain(|p| !all_roster_ids.contains(&p.discord_id));
+    }
+
+    let mut cap_player = Player {
+        discord_id: cap_id.clone(),
+        nickname: "Capitán".to_string(),
+        faceit_nickname: Some("Capitán".to_string()),
+        faceit_elo: 1000,
+        ready: true,
+        tier: "A".to_string(),
+        ..Default::default()
+    };
+    cap_player.ensure_discord_user();
+    state.teams[team_pos].captain = Some(cap_player);
+
+    state.teams[team_pos].players.clear();
+    for pid in player_ids.iter().take(4) {
+        let mut p = Player {
+            discord_id: pid.clone(),
+            nickname: "Jugador".to_string(),
+            faceit_nickname: Some("Jugador".to_string()),
+            faceit_elo: 1000,
+            ready: true,
+            tier: "C".to_string(),
+            ..Default::default()
+        };
+        p.ensure_discord_user();
+        state.teams[team_pos].players.push(p);
+    }
+
+    let all_done = state.teams.len() >= 2
+        && state
+            .teams
+            .iter()
+            .all(|t| t.captain.is_some() && t.players.len() == 4);
+    if all_done {
+        state.draft_finished = true;
+        state.draft_started = false;
+        state.auto_start_veto_if_ready();
+    }
+
+    state.sanitize();
+    let updated = manager.update_state(guild_id, state).await;
+    let available_players = partition_available_players(&updated);
+    Json(json!({ "success": true, "state": updated, "availablePlayers": available_players }))
+        .into_response()
 }

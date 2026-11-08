@@ -106,10 +106,15 @@ impl<S: NodeDocSource> AdminDocsRepo for FirestoreAdminDocsRepo<S> {
                 matches: matches.len() as u64,
             },
             Some(g) => StatsTotals {
-                // `(data.servidor || data.mixton_guild_id) === targetGuildId`
+                // La vinculación es global; cuenta usuarios globales o asociados al servidor
                 users: users
                     .iter()
-                    .filter(|(_, d)| is_str(js_or(d, &["servidor", "mixton_guild_id"]), g))
+                    .filter(|(_, d)| {
+                        match js_or(d, &["guild_id", "servidor", "mixton_guild_id"]) {
+                            Some(v) if js_truthy(v) => is_str(Some(v), g),
+                            _ => true,
+                        }
+                    })
                     .count() as u64,
                 // `doc.data().guild_id === targetGuildId`
                 matches: matches
@@ -125,8 +130,10 @@ impl<S: NodeDocSource> AdminDocsRepo for FirestoreAdminDocsRepo<S> {
         Ok(docs
             .into_iter()
             .filter(|(_, d)| match guild {
-                // `(guild_id || servidor || mixton_guild_id || null) !== targetGuildId` -> fuera
-                Some(g) => is_str(js_or(d, &["guild_id", "servidor", "mixton_guild_id"]), g),
+                Some(g) => match js_or(d, &["guild_id", "servidor", "mixton_guild_id"]) {
+                    Some(v) if js_truthy(v) => is_str(Some(v), g),
+                    _ => true,
+                },
                 None => true,
             })
             .map(|(id, data)| {
@@ -514,9 +521,11 @@ mod tests {
             "el falsy del documento gana"
         );
         let g1 = r.users_backup(Some("g1")).await.unwrap();
-        assert_eq!(ids(&g1, "discordId"), ["2", "3", "g1_1"]);
+        // La vinculación es global: los usuarios sin servidor ("5") entran en el backup de
+        // cualquier servidor; los de otro servidor ("4", g2) no.
+        assert_eq!(ids(&g1, "discordId"), ["2", "3", "", "g1_1"]);
         assert_eq!(
-            g1[2],
+            g1[3],
             json!({"discordId": "g1_1", "guild_id": "g1",
                 "linkedAt": {"_seconds": 5, "_nanoseconds": 0}})
         );

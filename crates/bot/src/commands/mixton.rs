@@ -41,7 +41,7 @@ pub async fn run_listo(
     let discord_id = user.id.to_string();
     let guild_str = guild_id.to_string();
 
-    // Leer doc global users/{discord_id} y doc por servidor {guild_id}_{discord_id} en faceit_users
+    // Leer vinculación global del usuario en faceit_users/{discord_id}
     let global_doc = match fs
         .get_doc::<serde_json::Value>("faceit_users", &discord_id)
         .await
@@ -57,23 +57,7 @@ pub async fn run_listo(
         }
     };
 
-    let server_doc_id = format!("{guild_str}_{discord_id}");
-    let server_doc = match fs
-        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-        .await
-    {
-        Ok(doc) => doc,
-        Err(e) => {
-            tracing::warn!(
-                "Error al leer doc de servidor de faceit_users/{}: {}",
-                server_doc_id,
-                e
-            );
-            None
-        }
-    };
-
-    let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), None);
     if !super::mixton_logic::is_user_verified(&merged) {
         return Ok(CreateInteractionResponseMessage::new()
             .content("❌ No estás verificado. Debes vincular tu cuenta de Faceit usando el comando `/verificar_fc <nickname>` o desde la web antes de unirte al mixton.")
@@ -176,23 +160,7 @@ pub async fn run_no_listo(
             }
         };
 
-        let server_doc_id = format!("{guild_str}_{discord_id}");
-        let server_doc = match fs
-            .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-            .await
-        {
-            Ok(doc) => doc,
-            Err(e) => {
-                tracing::warn!(
-                    "Error al leer doc de servidor de faceit_users/{}: {}",
-                    server_doc_id,
-                    e
-                );
-                None
-            }
-        };
-
-        let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+        let merged = super::mixton_logic::merge_user_docs(global_doc.as_ref(), None);
         if !super::mixton_logic::is_user_verified(&merged) {
             return Ok(CreateInteractionResponseMessage::new()
                 .content("❌ No estás verificado. Este comando es solo para miembros registrados.")

@@ -104,6 +104,7 @@ impl TestHarness {
             doc_sink: doc_sink.clone(),
             users: Arc::new(data::FakeUsersRepo::new()),
             config,
+            firestore: None,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         };

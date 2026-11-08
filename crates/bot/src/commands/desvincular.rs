@@ -20,17 +20,18 @@ use std::sync::Arc;
 /// `faceit_users`. Nunca se tocan los demás servidores ni el documento global si hay servidor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkPlan {
-    /// Id del documento a borrar: `{guild_id}_{discord_id}`, o `discord_id` sin servidor.
-    pub doc_id: String,
+    /// Documentos a borrar en faceit_users (tanto local de guild como global)
+    pub doc_ids: Vec<String>,
 }
 
-/// Función pura que determina qué documento se borra al desvincular.
+/// Función pura que determina qué documentos se borran al desvincular.
 pub fn compute_unlink_plan(guild_id: Option<&str>, discord_id: &str) -> UnlinkPlan {
-    let doc_id = match guild_id {
-        Some(gid) => format!("{gid}_{discord_id}"),
-        None => discord_id.to_string(),
-    };
-    UnlinkPlan { doc_id }
+    let mut doc_ids = Vec::new();
+    if let Some(gid) = guild_id {
+        doc_ids.push(format!("{gid}_{discord_id}"));
+    }
+    doc_ids.push(discord_id.to_string());
+    UnlinkPlan { doc_ids }
 }
 
 /// Ejecuta la desvinculación sobre una implementación de [`data::DocSink`].
@@ -38,7 +39,10 @@ pub async fn execute_unlink_on_sink<S: DocSink + ?Sized>(
     sink: &S,
     plan: &UnlinkPlan,
 ) -> Result<(), data::DataError> {
-    sink.delete_doc("faceit_users", &plan.doc_id).await
+    for id in &plan.doc_ids {
+        sink.delete_doc("faceit_users", id).await?;
+    }
+    Ok(())
 }
 
 /// Valida si el canal donde se ejecutó el comando es el canal de vinculación permitido.
@@ -348,13 +352,13 @@ mod tests {
     #[test]
     fn test_compute_unlink_plan_with_guild() {
         let plan = compute_unlink_plan(Some("guild_99"), "user_42");
-        assert_eq!(plan.doc_id, "guild_99_user_42");
+        assert_eq!(plan.doc_ids, vec!["guild_99_user_42", "user_42"]);
     }
 
     #[test]
     fn test_compute_unlink_plan_without_guild() {
         let plan = compute_unlink_plan(None, "user_42");
-        assert_eq!(plan.doc_id, "user_42");
+        assert_eq!(plan.doc_ids, vec!["user_42"]);
     }
 
     #[tokio::test]
@@ -395,9 +399,8 @@ mod tests {
         // 1. El doc de servidor se borra por completo.
         assert_eq!(sink.get("faceit_users", "guild_1_u1"), None);
 
-        // 2. El doc global queda INTACTO (como en el legado): otros servidores no se ven afectados.
-        let remaining_global = sink.get("faceit_users", "u1").expect("global doc exists");
-        assert_eq!(remaining_global, global_user);
+        // 2. El doc global también se borra para desvincular al usuario por completo.
+        assert_eq!(sink.get("faceit_users", "u1"), None);
     }
 
     #[test]

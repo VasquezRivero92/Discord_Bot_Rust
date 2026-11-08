@@ -255,25 +255,14 @@ pub async fn run(
         }
     };
 
-    // 4. Buscar vinculación en Firestore (doc global + doc específico del servidor)
+    // 4. Buscar vinculación global del jugador
     let global_doc = fs
         .get_doc::<serde_json::Value>("faceit_users", &discord_id)
         .await
         .ok()
         .flatten();
 
-    let server_doc_id = match guild_str.as_deref() {
-        Some(gid) => format!("{gid}_{discord_id}"),
-        None => discord_id.clone(),
-    };
-
-    let server_doc = fs
-        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-        .await
-        .ok()
-        .flatten();
-
-    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), None);
     if !mixton_logic::is_user_verified(&merged) {
         let msg = EditInteractionResponse::new().content(SyncError::NotLinked.user_message());
         interaction.edit_response(&ctx.http, msg).await?;
@@ -345,16 +334,16 @@ pub async fn run(
         sync_member_nickname(ctx, gid, interaction.user.id, player_actual_nick).await;
     }
 
-    // 8. Actualizar Firestore: server doc {guild}_{id} con merge_doc
+    // 8. Actualizar documento global del jugador con merge_doc
     let patch = serde_json::json!({
         "faceit_level": level,
         "faceit_elo": elo,
         "updatedAt": data::timestamp_now(),
     });
-    if let Err(err) = fs.merge_doc("faceit_users", &server_doc_id, &patch).await {
+    if let Err(err) = fs.merge_doc("faceit_users", &discord_id, &patch).await {
         warn!(
-            "Error al actualizar stats en Firestore para {}: {}",
-            server_doc_id, err
+            "Error al actualizar stats para {}: {}",
+            discord_id, err
         );
     }
 

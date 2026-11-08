@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod faceit;
 pub mod handler;
+pub mod wallet_notifier;
 
 use common::config::Config;
 use data::FirestoreClient;
@@ -29,6 +30,7 @@ pub async fn start_bot(
         .filter(|k| !k.is_empty())
         .map(|k| FaceitClient::new(k.clone()));
 
+    let notifier_fs = firestore.clone();
     let handler = BotHandler {
         config: config.clone(),
         firestore,
@@ -44,6 +46,11 @@ pub async fn start_bot(
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
         .await?;
+
+    // Avisos de billetera por mensaje privado (recargas, retiros, apuestas, premios).
+    if let Some(fs) = notifier_fs {
+        wallet_notifier::spawn(client.http.clone(), fs);
+    }
 
     info!("Iniciando Gateway de Discord...");
     if let Err(why) = client.start().await {

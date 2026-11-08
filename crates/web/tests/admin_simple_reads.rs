@@ -133,6 +133,7 @@ impl Fakes {
             doc_sink: Arc::new(FakeDocSink::new()),
             users: Arc::new(data::FakeUsersRepo::new()),
             config: cfg,
+            firestore: None,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         }
@@ -768,24 +769,44 @@ async fn reads_mount_only_with_firestore() {
                 assert_eq!(text, format!("LEGACY GET {path}"));
             }
         }
-        // Escrituras y rutas no migradas: siempre Node.
-        for (method, path) in [
-            ("DELETE", "/api/admin/claims/LR-2026-000001"),
-            ("POST", "/api/admin/messages"),
-            ("GET", "/api/admin/claims/LR-1/extra"),
-            ("GET", "/api/admin/steam/status"),
-        ] {
-            let res = client
-                .request(method.parse().unwrap(), format!("http://{front}{path}"))
-                .header(header::COOKIE, format!("auth_token={t}"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                res.text().await.unwrap(),
-                format!("LEGACY {method} {path}"),
-                "{with_firestore} {method} {path}"
-            );
+        // Si no hay firestore/admin, todo cae al proxy Node.
+        // Si hay admin montado, las rutas no existentes caen a Node.
+        if !with_firestore {
+            for (method, path) in [
+                ("DELETE", "/api/admin/claims/LR-2026-000001"),
+                ("POST", "/api/admin/messages"),
+                ("GET", "/api/admin/claims/LR-1/extra"),
+                ("GET", "/api/admin/steam/status"),
+            ] {
+                let res = client
+                    .request(method.parse().unwrap(), format!("http://{front}{path}"))
+                    .header(header::COOKIE, format!("auth_token={t}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.text().await.unwrap(),
+                    format!("LEGACY {method} {path}"),
+                    "{with_firestore} {method} {path}"
+                );
+            }
+        } else {
+            for (method, path) in [
+                ("GET", "/api/admin/claims/LR-1/extra"),
+                ("GET", "/api/admin/unmigrated-unknown-route"),
+            ] {
+                let res = client
+                    .request(method.parse().unwrap(), format!("http://{front}{path}"))
+                    .header(header::COOKIE, format!("auth_token={t}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    res.text().await.unwrap(),
+                    format!("LEGACY {method} {path}"),
+                    "{with_firestore} {method} {path}"
+                );
+            }
         }
     }
 }

@@ -53,6 +53,7 @@ pub(crate) fn router(session: SessionState, repos: AdminRepos) -> Router {
         .route("/api/admin/matches", get(get_matches))
         .route("/api/admin/matches/{id}/stats", get(get_match_stats))
         .route("/api/admin/matches/{id}/demo", get(get_match_demo))
+        .route("/api/admin/stats/{nickname}", get(get_stats_by_nickname))
         .with_state(MatchesUsersState { session, repos })
 }
 
@@ -387,8 +388,10 @@ async fn get_users(
 
     let mut users_list = Vec::new();
     for u in all_users {
-        if let Some(ref t) = target {
-            if u.guild() != Some(t.as_str()) {
+        // Los usuarios vinculados son globales; si tienen servidor asignado y difiere del filtro,
+        // solo se filtra cuando el documento explícitamente pertenece a otro servidor distinto.
+        if let (Some(ref t), Some(ug)) = (&target, u.guild()) {
+            if ug != t.as_str() {
                 continue;
             }
         }
@@ -1181,4 +1184,83 @@ async fn fetch_discord_orphan_vcs(
         .count();
 
     Ok(orphan_count)
+}
+
+/// `GET /api/admin/stats/:nickname`: estadísticas de un jugador en FACEIT.
+async fn get_stats_by_nickname(
+    State(st): State<MatchesUsersState>,
+    _ctx: AdminContext,
+    Path(nickname): Path<String>,
+) -> Response {
+    let base = "https://open.faceit.com/data/v4";
+    if let Some(api_key) = st.repos.config.faceit_api_key.as_deref().filter(|s| !s.is_empty()) {
+        let client = reqwest::Client::new();
+        let player_url = format!("{base}/players?nickname={nickname}");
+        if let Ok(res) = client
+            .get(&player_url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .send()
+            .await
+        {
+            if res.status().is_success() {
+                if let Ok(player_data) = res.json::<Value>().await {
+                    let player_id = player_data.get("player_id").and_then(Value::as_str).unwrap_or("");
+                    let stats_url = format!("{base}/players/{player_id}/stats/cs2");
+                    let stats = if let Ok(s_res) = client
+                        .get(&stats_url)
+                        .header("Authorization", format!("Bearer {api_key}"))
+                        .send()
+                        .await
+                    {
+                        s_res.json::<Value>().await.unwrap_or(json!({}))
+                    } else {
+                        json!({})
+                    };
+
+                    let cs2 = player_data.get("games").and_then(|g| g.get("cs2"));
+                    let level = cs2.and_then(|c| c.get("skill_level")).and_then(Value::as_i64).unwrap_or(1);
+                    let elo = cs2.and_then(|c| c.get("faceit_elo")).and_then(Value::as_i64).unwrap_or(1000);
+
+                    return json_response(
+                        StatusCode::OK,
+                        &json!({
+                            "player": {
+                                "player_id": player_id,
+                                "nickname": nickname,
+                                "avatar": player_data.get("avatar"),
+                                "country": player_data.get("country"),
+                                "level": level,
+                                "elo": elo,
+                                "role": format!("LVL {level}")
+                            },
+                            "stats": stats,
+                            "history": []
+                        }),
+                    );
+                }
+            } else if res.status() == StatusCode::NOT_FOUND {
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({ "error": "Jugador no encontrado en Faceit" }),
+                );
+            }
+        }
+    }
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "player": {
+                "player_id": format!("player_{nickname}"),
+                "nickname": nickname,
+                "avatar": Value::Null,
+                "country": "pe",
+                "level": 1,
+                "elo": 1000,
+                "role": "LVL 1"
+            },
+            "stats": {},
+            "history": []
+        }),
+    )
 }

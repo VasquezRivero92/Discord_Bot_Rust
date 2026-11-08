@@ -177,21 +177,43 @@ fn query_params(collection: &str, q: &Query) -> FirestoreQueryParams {
         .opt_limit(q.limit)
 }
 
-/// Cliente Firestore de solo lectura. Barato de clonar (comparte la conexión).
+/// Cliente de base de datos (respaldado por MySQL en tiempo real o Firestore legado).
 #[derive(Clone)]
 pub struct FirestoreClient {
-    pub(crate) db: FirestoreDb,
+    pub(crate) mysql: Option<crate::mysql::MysqlClient>,
+    pub(crate) db: Option<FirestoreDb>,
 }
 
 impl FirestoreClient {
-    /// Conecta con el proyecto `project_id`.
-    ///
-    /// - Con `FIRESTORE_EMULATOR_HOST` definida y `credentials = None`, se conecta al emulador
-    ///   sin buscar credenciales (el crate envía el token de prueba `owner`).
-    /// - Con `credentials = Some(ruta)`, usa esa clave de cuenta de servicio (también contra el
-    ///   emulador si la variable está definida).
-    /// - Sin variable ni ruta, usa las Application Default Credentials del entorno.
+    /// Conecta a MySQL en tiempo real mediante `database_url` (`mysql://user:pass@host:port/db`).
+    pub async fn connect_mysql(database_url: &str) -> Result<Self, DataError> {
+        let mysql = crate::mysql::MysqlClient::connect(database_url).await?;
+        Ok(Self::from_mysql(mysql))
+    }
+
+    /// Envuelve un [`crate::mysql::MysqlClient`] ya construido.
+    pub fn from_mysql(mysql: crate::mysql::MysqlClient) -> Self {
+        Self {
+            mysql: Some(mysql),
+            db: None,
+        }
+    }
+
+    /// Crea un cliente respaldado por el motor MySQL en memoria (para pruebas sin red).
+    pub fn in_memory_mysql() -> Self {
+        Self::from_mysql(crate::mysql::MysqlClient::in_memory())
+    }
+
+    /// Devuelve el cliente MySQL subyacente si está activo.
+    pub fn mysql(&self) -> Option<&crate::mysql::MysqlClient> {
+        self.mysql.as_ref()
+    }
+
+    /// Conecta con `project_id` (si empieza con `mysql://`, conecta a MySQL; en otro caso a Firestore).
     pub async fn connect(project_id: &str, credentials: Option<&Path>) -> Result<Self, DataError> {
+        if project_id.starts_with("mysql://") {
+            return Self::connect_mysql(project_id).await;
+        }
         let options = FirestoreDbOptions::new(project_id.to_string());
         let db = match credentials {
             Some(path) => {
@@ -206,12 +228,17 @@ impl FirestoreClient {
     /// Envuelve un [`FirestoreDb`] ya construido (p. ej. con opciones propias de reintentos o
     /// de tiempo de espera).
     pub fn from_db(db: FirestoreDb) -> Self {
-        Self { db }
+        Self {
+            mysql: None,
+            db: Some(db),
+        }
     }
 
     /// Acceso directo al FirestoreDb subyacente.
     pub fn db(&self) -> &FirestoreDb {
-        &self.db
+        self.db
+            .as_ref()
+            .expect("FirestoreDb solicitado en un cliente configurado en modo MySQL")
     }
 
     /// Lee `collection/id`. `Ok(None)` si el documento no existe.
@@ -220,8 +247,11 @@ impl FirestoreClient {
         collection: &str,
         id: &str,
     ) -> Result<Option<T>, DataError> {
+        if let Some(m) = &self.mysql {
+            return m.get_doc(collection, id).await;
+        }
         let doc = self
-            .db
+            .db()
             .fluent()
             .select()
             .by_id_in(collection)
@@ -239,7 +269,7 @@ impl FirestoreClient {
         id: &str,
     ) -> Result<Option<FirestoreDocument>, DataError> {
         Ok(self
-            .db
+            .db()
             .fluent()
             .select()
             .by_id_in(collection)
@@ -253,6 +283,9 @@ impl FirestoreClient {
         &self,
         collection: &str,
     ) -> Result<Vec<(String, T)>, DataError> {
+        if let Some(m) = &self.mysql {
+            return m.list_docs(collection).await;
+        }
         let docs = self.list_raw_docs(collection).await?;
         docs.iter().map(decode_document).collect()
     }
@@ -265,7 +298,7 @@ impl FirestoreClient {
         collection: &str,
     ) -> Result<Vec<FirestoreDocument>, DataError> {
         Ok(self
-            .db
+            .db()
             .fluent()
             .list()
             .from(collection)
@@ -280,6 +313,9 @@ impl FirestoreClient {
     /// filtros de `q` (se ignoran su orden y su límite), con una agregación `COUNT` de Firestore
     /// (una lectura por cada 1000 entradas de índice, sin leer los documentos).
     pub async fn count(&self, collection: &str, q: Query) -> Result<u64, DataError> {
+        if let Some(m) = &self.mysql {
+            return m.count(collection, q).await;
+        }
         let params = query_params(
             collection,
             &Query {
@@ -288,7 +324,7 @@ impl FirestoreClient {
                 ..q
             },
         );
-        let mut select = self.db.fluent().select().from(collection);
+        let mut select = self.db().fluent().select().from(collection);
         if let Some(filter) = params.filter {
             select = select.filter(move |_| Some(filter.clone()));
         }
@@ -302,20 +338,16 @@ impl FirestoreClient {
     /// Consulta `collection` con los filtros, el orden y el límite de `q` y devuelve los
     /// documentos como `(id, valor)`, decodificados igual que en [`FirestoreClient::list_docs`]
     /// (un documento no decodificable hace fallar la llamada con [`DataError::Decode`]).
-    ///
-    /// **Índices:** Firestore resuelve con sus índices automáticos las consultas con filtros de un solo campo o con un
-    /// único campo ordenado, pero una consulta con un filtro sobre un campo y `order_by` sobre
-    /// *otro* campo (p. ej. `guild_id == x` ordenado por `createdAt`) necesita un índice
-    /// compuesto, y sin él Firestore responde `FAILED_PRECONDITION` (llega como
-    /// [`DataError::Firestore`]). Este cliente nunca crea índices; hay que desplegarlos aparte
-    /// (ver "Fase 2A" en `docs/riesgos.md`).
     pub async fn query<T: DeserializeOwned>(
         &self,
         collection: &str,
         q: Query,
     ) -> Result<Vec<(String, T)>, DataError> {
+        if let Some(m) = &self.mysql {
+            return m.query(collection, q).await;
+        }
         let params = query_params(collection, &q);
-        let mut select = self.db.fluent().select().from(collection);
+        let mut select = self.db().fluent().select().from(collection);
         if let Some(filter) = params.filter {
             select = select.filter(move |_| Some(filter.clone()));
         }
@@ -330,15 +362,6 @@ impl FirestoreClient {
     }
 
     /// Observa los cambios de `collection` (toda la colección, sin filtros).
-    ///
-    /// El stream es perezoso: el listener se abre al pedir el primer elemento y se cierra al
-    /// soltar el stream. Primero llega la instantánea inicial (un `Added` por documento
-    /// existente), cerrada por un [`ChangeEvent::Synced`] cuando es actual, y luego los cambios.
-    /// Las reconexiones las hace el crate por dentro (cada 5 s tras un fallo, reanudando con el
-    /// resume token en memoria) y se señalan con [`ChangeEvent::Reset`]. Se emite un `Err` terminal (y el stream termina) si Firestore da
-    /// el target por terminado para siempre (p. ej. `PERMISSION_DENIED` por reglas) o si el bucle
-    /// del listener se detiene por un error que el crate no reintenta; quien consume debe volver a
-    /// llamar a `watch_collection`. Los errores reintentables nunca llegan al stream.
     pub fn watch_collection(
         &self,
         collection: &str,
@@ -346,13 +369,7 @@ impl FirestoreClient {
         self.watch(WatchScope::Collection(collection.to_string()))
     }
 
-    /// Como [`FirestoreClient::watch_collection`] pero solo para `collection/id` (el
-    /// `doc(id).onSnapshot` de Node): Firestore solo envía (y cobra) los cambios de ese documento.
-    ///
-    /// Mismo stream y misma semántica: `Added`/`Modified`/`Removed` llevan siempre `id`, cada
-    /// apertura (y reconexión, con `Reset`) termina en un `Synced` con `[id]` si el documento
-    /// existe o con `[]` si no (un documento que no existe no genera ningún evento propio en la
-    /// instantánea), y los errores terminales igual.
+    /// Como [`FirestoreClient::watch_collection`] pero solo para `collection/id`.
     pub fn watch_document(
         &self,
         collection: &str,
@@ -369,13 +386,203 @@ impl FirestoreClient {
         &self,
         scope: WatchScope,
     ) -> impl Stream<Item = Result<ChangeEvent, DataError>> + Send + 'static {
-        let db = self.db.clone();
-        futures::stream::once(async move { start_watch(db, scope).await }).flat_map(|started| {
-            match started {
+        if let Some(m) = &self.mysql {
+            return m.watch(scope).left_stream();
+        }
+        let db = self.db().clone();
+        futures::stream::once(async move { start_watch(db, scope).await })
+            .flat_map(|started| match started {
                 Ok(events) => events.left_stream(),
                 Err(err) => futures::stream::once(async move { Err(err) }).right_stream(),
-            }
+            })
+            .right_stream()
+    }
+
+    /// Finaliza una partida en MySQL guardando marcador, ganador y estadísticas. Liquida el pozo
+    /// solo con `pay_winners` (el llamador pasa `MATCH_PAYOUT_ENABLED`).
+    pub async fn finish_match(
+        &self,
+        match_id: &str,
+        winner: Option<&str>,
+        team1_score: Option<u32>,
+        team2_score: Option<u32>,
+        stats: Option<&serde_json::Value>,
+        pay_winners: bool,
+    ) -> Result<crate::mysql::MatchFinishOutcome, DataError> {
+        if let Some(m) = &self.mysql {
+            return m
+                .finish_match(match_id, winner, team1_score, team2_score, stats, pay_winners)
+                .await;
+        }
+        Ok(crate::mysql::MatchFinishOutcome {
+            match_id: match_id.to_string(),
+            winner: winner.unwrap_or("unknown").to_string(),
+            score_a: team1_score.unwrap_or(0),
+            score_b: team2_score.unwrap_or(0),
+            payouts: vec![],
+            stats_saved: stats.is_some(),
         })
+    }
+
+    /// Cobra la apuesta a todos los jugadores al lanzar la partida (todo-o-nada, una vez).
+    /// Sin MySQL falla cerrado: no se puede garantizar el cobro atómico.
+    pub async fn collect_match_stakes(
+        &self,
+        match_id: &str,
+        bet_cents: i64,
+        players: &[String],
+        manual_paid: &[String],
+    ) -> Result<crate::mysql::StakeOutcome, DataError> {
+        match &self.mysql {
+            Some(m) => {
+                m.collect_match_stakes(match_id, bet_cents, players, manual_paid)
+                    .await
+            }
+            None => Err(DataError::Firestore(
+                "el cobro de apuestas requiere MySQL".into(),
+            )),
+        }
+    }
+
+    /// Devuelve las apuestas de una partida cancelada (idempotente). Total devuelto ahora.
+    pub async fn refund_match_stakes(&self, match_id: &str, reason: &str) -> Result<i64, DataError> {
+        match &self.mysql {
+            Some(m) => m.refund_match_stakes(match_id, reason).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Avisos por mensaje privado (y alertas de administración) pendientes de enviar.
+    pub async fn pending_notifications(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<crate::mysql::WalletNotification>, DataError> {
+        match &self.mysql {
+            Some(m) => m.pending_notifications(limit).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn mark_notification(&self, id: u64, delivered: bool) -> Result<(), DataError> {
+        match &self.mysql {
+            Some(m) => m.mark_notification(id, delivered).await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn notify_user(&self, discord_id: &str, message: &str) -> Result<(), DataError> {
+        match &self.mysql {
+            Some(m) => m.notify_user(discord_id, message).await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn alert_admins(&self, message: &str) -> Result<(), DataError> {
+        match &self.mysql {
+            Some(m) => m.alert_admins(message).await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn reconcile_wallets(&self) -> Result<Vec<crate::mysql::WalletMismatch>, DataError> {
+        match &self.mysql {
+            Some(m) => m.reconcile_wallets().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Límite de intentos persistente (MySQL), compartido por la web y el bot. Sin MySQL usa el
+    /// limitador en memoria del proceso (`memory_fallback`).
+    pub async fn allow_wallet_attempt(
+        &self,
+        scope: &str,
+        subject: &str,
+        max: i64,
+        window_secs: i64,
+        memory_fallback: fn(&str) -> bool,
+    ) -> bool {
+        match &self.mysql {
+            Some(m) => match m.allow_attempt_db(scope, subject, max, window_secs).await {
+                Ok(allowed) => allowed,
+                Err(e) => {
+                    // Si la base no responde, se cae al límite en memoria (nunca sin límite).
+                    tracing::warn!("límite de intentos {scope}: {e}; se usa el de memoria");
+                    memory_fallback(subject)
+                }
+            },
+            None => memory_fallback(subject),
+        }
+    }
+
+    /// Devuelve el saldo de los retiros que el worker de Yape rechazó sin enviar. Solo existe
+    /// con MySQL (el worker trabaja sobre su tabla); sin MySQL no hay nada que reembolsar.
+    pub async fn refund_rejected_withdrawals(&self, limit: u32) -> Result<Vec<String>, DataError> {
+        match &self.mysql {
+            Some(m) => m.refund_rejected_withdrawals(limit).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Cancela una partida en MySQL marcándola como CANCELLED.
+    pub async fn cancel_match(
+        &self,
+        match_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), DataError> {
+        if let Some(m) = &self.mysql {
+            return m.cancel_match(match_id, reason).await;
+        }
+        Ok(())
+    }
+
+    /// Obtiene el saldo de un usuario en soles (0.0 si no existe).
+    pub async fn get_user_balance(
+        &self,
+        discord_id: &str,
+        guild_id: Option<&str>,
+    ) -> Result<f64, DataError> {
+        if let Some(m) = &self.mysql {
+            return m.get_user_balance(discord_id, guild_id).await;
+        }
+        let doc = self.get_doc::<serde_json::Value>("faceit_users", discord_id).await?;
+        let cents = doc.as_ref().map(crate::withdraw::balance_cents).unwrap_or(0);
+        Ok(cents as f64 / 100.0)
+    }
+
+    /// Ajusta el saldo de un usuario registrando libro contable y auditoría.
+    pub async fn adjust_user_balance(
+        &self,
+        discord_id: &str,
+        guild_id: Option<&str>,
+        adjustment: crate::mysql::BalanceAdjustment,
+        reason: &str,
+        admin_name: &str,
+        source: &str,
+    ) -> Result<f64, DataError> {
+        if let Some(m) = &self.mysql {
+            return m
+                .adjust_user_balance(discord_id, guild_id, adjustment, reason, admin_name, source)
+                .await;
+        }
+        // Sin MySQL no hay transacción ni libro de movimientos: no se toca saldo.
+        let _ = (discord_id, guild_id, adjustment, reason, admin_name, source);
+        Err(DataError::Firestore(
+            "Ajustar saldo requiere MySQL (transacción y libro de movimientos)".into(),
+        ))
+    }
+
+    /// Procesa la compra de la tienda con verificación Yape.
+    pub async fn checkout_purchase(
+        &self,
+        operation_number: &str,
+        expected_amount: f64,
+        customer: &serde_json::Value,
+        items: &serde_json::Value,
+    ) -> Result<String, crate::mysql::CheckoutError> {
+        if let Some(m) = &self.mysql {
+            return m.checkout_purchase(operation_number, expected_amount, customer, items).await;
+        }
+        Err(crate::mysql::CheckoutError::Invalid("Checkout requiere MySQL".into()))
     }
 }
 

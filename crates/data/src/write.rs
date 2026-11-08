@@ -125,14 +125,17 @@ impl FirestoreClient {
         id: &str,
         val: &serde_json::Value,
     ) -> Result<(), DataError> {
-        let doc_name = format!("{}/{}/{}", self.db.get_documents_path(), collection, id);
+        if let Some(m) = &self.mysql {
+            return m.set_doc(collection, id, val).await;
+        }
+        let doc_name = format!("{}/{}/{}", self.db().get_documents_path(), collection, id);
         let fields = json_to_document_fields(val)?;
         let doc = Document {
             name: doc_name,
             fields,
             ..Default::default()
         };
-        self.db
+        self.db()
             .fluent()
             .update()
             .in_col(collection)
@@ -150,6 +153,9 @@ impl FirestoreClient {
         id: &str,
         val: &serde_json::Value,
     ) -> Result<(), DataError> {
+        if let Some(m) = &self.mysql {
+            return m.merge_doc(collection, id, val).await;
+        }
         let map = match val {
             serde_json::Value::Object(map) => map,
             _ => {
@@ -166,13 +172,13 @@ impl FirestoreClient {
             .iter()
             .map(|(k, v)| (k.clone(), json_to_firestore_value(v)))
             .collect();
-        let doc_name = format!("{}/{}/{}", self.db.get_documents_path(), collection, id);
+        let doc_name = format!("{}/{}/{}", self.db().get_documents_path(), collection, id);
         let doc = Document {
             name: doc_name,
             fields,
             ..Default::default()
         };
-        self.db
+        self.db()
             .fluent()
             .update()
             .fields(&keys)
@@ -186,8 +192,11 @@ impl FirestoreClient {
 
     /// Borra el documento en `collection/id`; si no existe, devuelve `Ok(())`.
     pub async fn delete_doc(&self, collection: &str, id: &str) -> Result<(), DataError> {
+        if let Some(m) = &self.mysql {
+            return m.delete_doc(collection, id).await;
+        }
         let res = self
-            .db
+            .db()
             .fluent()
             .delete()
             .from(collection)
@@ -210,17 +219,20 @@ impl FirestoreClient {
         id: &str,
         fields: &[&str],
     ) -> Result<(), DataError> {
+        if let Some(m) = &self.mysql {
+            return m.delete_fields(collection, id, fields).await;
+        }
         if fields.is_empty() {
             return Ok(());
         }
-        let doc_name = format!("{}/{}/{}", self.db.get_documents_path(), collection, id);
+        let doc_name = format!("{}/{}/{}", self.db().get_documents_path(), collection, id);
         let doc = Document {
             name: doc_name,
             fields: HashMap::new(),
             ..Default::default()
         };
         let res = self
-            .db
+            .db()
             .fluent()
             .update()
             .fields(fields)

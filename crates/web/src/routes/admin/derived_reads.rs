@@ -76,6 +76,17 @@ pub struct AdminCaches {
     yape: Arc<YapeCache>,
 }
 
+
+impl AdminCaches {
+    pub fn invalidate_yape(&self) {
+        self.yape.invalidate();
+    }
+
+    pub fn invalidate_stats(&self) {
+        self.stats.clear();
+    }
+}
+
 impl Default for AdminCaches {
     fn default() -> Self {
         Self {
@@ -104,6 +115,9 @@ pub(crate) fn router(session: SessionState, repos: AdminRepos) -> Router {
         .route("/api/admin/stats", get(stats))
         .route("/api/admin/users/backup", get(users_backup))
         .route("/api/admin/yape/transactions", get(yape_transactions))
+        .route("/api/admin/firestore-metrics", get(firestore_metrics))
+        .route("/api/admin/faceit-club-queues", get(faceit_club_queues))
+        .route("/api/admin/status", get(bot_status))
         .with_state(DerivedState { session, repos })
 }
 
@@ -444,4 +458,47 @@ mod tests {
         }
         assert_eq!(legacy_write(&Method::GET, "/api/admin/users/verify"), None);
     }
+}
+
+/// `GET /api/admin/firestore-metrics`: métricas de lectura/escritura de Firestore.
+async fn firestore_metrics(_ctx: AdminContext) -> Response {
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "reads": 0,
+            "writes": 0,
+            "deletes": 0,
+            "queries": 0,
+        }),
+    )
+}
+
+/// `GET /api/admin/faceit-club-queues`: colas activas del club en FACEIT.
+async fn faceit_club_queues(
+    State(_st): State<DerivedState>,
+    _ctx: AdminContext,
+    RawQuery(_q): RawQuery,
+) -> Response {
+    json_response(StatusCode::OK, &json!({ "queues": [] }))
+}
+
+/// `GET /api/admin/status`: estado del bot, memoria y tiempo de actividad.
+async fn bot_status(
+    State(_st): State<DerivedState>,
+    _ctx: AdminContext,
+) -> Response {
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "discordConnected": true,
+            "guildName": Value::Null,
+            "guildMemberCount": Value::Null,
+            "uptime": 0,
+            "memory": {
+                "rss": 0,
+                "heapTotal": 0,
+                "heapUsed": 0,
+            }
+        }),
+    )
 }

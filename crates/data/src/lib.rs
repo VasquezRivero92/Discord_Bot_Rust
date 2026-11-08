@@ -11,6 +11,7 @@ mod logs;
 mod match_history;
 mod messages;
 mod model;
+pub mod mysql;
 mod node_docs;
 mod orders;
 mod payout;
@@ -27,12 +28,17 @@ pub use crate::cache::TtlCache;
 pub use crate::claims::{Claim, ClaimsRepo, FirestoreClaimsRepo, InMemoryClaimsRepo};
 pub use crate::error::DataError;
 pub use crate::withdraw::{
-    allow_attempt as allow_withdraw_attempt, WithdrawError, WithdrawalRequested,
+    allow_attempt as allow_withdraw_attempt, balance_cents, WithdrawError, WithdrawalRequested,
+    STATUS_REVIEW as WITHDRAW_STATUS_REVIEW,
 };
 pub use crate::yape::{
     allow_attempt as allow_yape_attempt, normalize_operation, YapeCredit, YapeError,
 };
 pub use crate::firestore::{document_id, ChangeEvent, Dir, FirestoreClient, Op, Query, Value};
+pub use crate::mysql::{
+    BalanceAdjustment, CheckoutError, MatchFinishOutcome, MysqlClient, PayoutShare, RealtimeEvent, RealtimeOp, StakeOutcome,
+    WalletMismatch, WalletNotification,
+};
 pub use crate::global_settings::{
     effective_config_for_guild, global_admin_role, is_default_guild, js_parse_int, EffectiveConfig,
     FirestoreGlobalSettingsRepo, GlobalSettings, GlobalSettingsRepo, GlobalSettingsSource,
@@ -51,7 +57,9 @@ pub use crate::messages::{
 };
 pub use crate::node_docs::{InMemoryNodeDocs, NodeDocSource};
 pub use crate::orders::{FakeOrdersRepo, FirestoreOrdersRepo, Order, OrdersRepo};
-pub use crate::payout::{plan_payout, split_pot, PayoutError, PayoutOutcome, PayoutPlan};
+pub use crate::payout::{
+    house_cents, plan_payout, split_pot, PayoutError, PayoutOutcome, PayoutPlan,
+};
 pub use crate::source::DocSource;
 pub use crate::support_calls::{
     FakeSupportCallsRepo, FirestoreSupportCallsRepo, SupportCall, SupportCallsRepo,

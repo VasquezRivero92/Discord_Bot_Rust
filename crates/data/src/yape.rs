@@ -103,6 +103,25 @@ pub fn allow_attempt(user: &str) -> bool {
     true
 }
 
+/// Mensaje único cuando el pago existe pero no cuadra (tipo, monto ilegible o monto distinto).
+/// No dice el monto real: si lo dijera, bastaría probar números de operación ajenos con
+/// cualquier monto para aprender el correcto y reclamar el depósito de otra persona.
+pub(crate) const PAYMENT_MISMATCH: &str =
+    "No pudimos validar el depósito con ese número de operación y monto. Revisa ambos datos.";
+
+/// Valida el monto que el jugador dice haber yapeado: soles enteros, mayor que cero.
+pub(crate) fn validate_recharge_amount(amount: f64) -> Result<(), YapeError> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(YapeError::Invalid("Ingresa un monto válido.".into()));
+    }
+    if amount.fract() != 0.0 {
+        return Err(YapeError::Invalid(
+            "Las recargas son en soles enteros (sin céntimos).".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Un número de operación válido como id de documento: letras y números, 1 a 64 caracteres.
 pub fn normalize_operation(raw: &str) -> Result<String, YapeError> {
     let op = raw.trim();
@@ -196,10 +215,20 @@ impl FirestoreClient {
         phone: Option<&str>,
         source: &str,
     ) -> Result<YapeCredit, YapeError> {
-        let operation = normalize_operation(operation)?;
-        if !expected_amount.is_finite() || expected_amount <= 0.0 {
-            return Err(YapeError::Invalid("Ingresa un monto válido.".into()));
+        if let Some(m) = &self.mysql {
+            return m
+                .credit_yape_operation(
+                    operation,
+                    discord_id,
+                    guild_id,
+                    expected_amount,
+                    phone,
+                    source,
+                )
+                .await;
         }
+        let operation = normalize_operation(operation)?;
+        validate_recharge_amount(expected_amount)?;
         let guild_id = guild_id.map(str::trim).filter(|g| !g.is_empty());
 
         // 1. El pago tiene que existir en el monitor, ser una ENTRADA y coincidir en monto.
@@ -210,19 +239,13 @@ impl FirestoreClient {
             return Ok(YapeCredit::NotYetSeen);
         };
         if text(&payment, "tipo").unwrap_or_default().to_uppercase() != "ENTRADA" {
-            return Err(YapeError::Invalid(
-                "El número de operación indicado no corresponde a un depósito recibido.".into(),
-            ));
+            return Err(YapeError::Invalid(PAYMENT_MISMATCH.into()));
         }
         let Some(amount) = amount_of(payment.get("monto")) else {
-            return Err(YapeError::Invalid(
-                "El depósito encontrado no tiene un monto válido.".into(),
-            ));
+            return Err(YapeError::Invalid(PAYMENT_MISMATCH.into()));
         };
         if !same_amount(amount, expected_amount) {
-            return Err(YapeError::Invalid(format!(
-                "El depósito es de S/ {amount:.2} y no coincide con el monto solicitado."
-            )));
+            return Err(YapeError::Invalid(PAYMENT_MISMATCH.into()));
         }
         let received_at = text(&payment, "fecha_hora").or_else(|| text(&payment, "fecha_registro"));
 
@@ -260,7 +283,15 @@ impl FirestoreClient {
             Some(g) => format!("{g}_{discord_id}"),
             None => discord_id.to_string(),
         };
-        let user_exists = self.get_raw_doc(USERS, &user_id).await?.is_some();
+        let existing_user = self.get_doc::<serde_json::Value>(USERS, &user_id).await?;
+        let user_exists = existing_user.is_some();
+        // El celular registrado es el destino del pago automático de retiros: una recarga solo
+        // lo guarda si la cuenta aún no tiene uno.
+        let has_phone = existing_user
+            .as_ref()
+            .and_then(|u| u.get("phoneNumber"))
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| !p.trim().is_empty());
         let now = FirestoreTimestamp::now();
         let now_ms = Utc::now().timestamp_millis();
         let reason = format!("Recarga Yape verificada (operación: {operation})");
@@ -300,7 +331,7 @@ impl FirestoreClient {
             created_at: now,
         };
         let mut user_fields = vec!["last_balance_update", "last_balance_reason"];
-        if phone.is_some() {
+        if phone.is_some() && !has_phone {
             user_fields.push("phoneNumber");
         }
         if !user_exists {
@@ -386,6 +417,14 @@ mod tests {
         assert!((0..MAX_ATTEMPTS).all(|_| allow_attempt(user)));
         assert!(!allow_attempt(user));
         assert!(allow_attempt("otro-usuario-de-prueba"));
+    }
+
+    #[test]
+    fn recarga_solo_en_soles_enteros() {
+        assert!(validate_recharge_amount(10.0).is_ok());
+        assert!(validate_recharge_amount(10.5).is_err());
+        assert!(validate_recharge_amount(0.0).is_err());
+        assert!(validate_recharge_amount(f64::INFINITY).is_err());
     }
 
     #[test]

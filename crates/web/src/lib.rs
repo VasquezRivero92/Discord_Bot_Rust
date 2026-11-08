@@ -4,10 +4,11 @@ use axum::extract::Request;
 use axum::response::Response;
 use axum::Router;
 use common::config::Config;
-use data::ClaimsRepo;
+use data::{ClaimsRepo, DocSink};
 use tower::ServiceExt;
 
 pub mod discord;
+pub mod match_discord;
 pub mod middleware;
 pub mod proxy;
 pub mod routes;
@@ -43,8 +44,8 @@ pub struct AppDeps {
     pub admin: Option<routes::admin::AdminRepos>,
     pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
     pub lobby: Option<Arc<lobby::LobbyManager>>,
-    /// Cliente de Firestore para `POST /api/lobby/wallet/recharge-yape`. `None` (Firestore
-    /// deshabilitado) deja esa ruta en el proxy.
+    /// Cliente de Firestore para `POST /api/lobby/wallet/recharge-yape` y vinculación de
+    /// cuentas FACEIT/Steam. `None` (Firestore deshabilitado) deja esas rutas en el proxy.
     pub firestore: Option<Arc<data::FirestoreClient>>,
 }
 
@@ -97,14 +98,33 @@ pub fn build_app(deps: AppDeps) -> Router {
     // Node's panel writes (still proxied) clear the caches of the migrated
     // reads, like the legacy `invalidateAdminUsersCache`/`invalidateYapeCache`.
     let admin_caches = deps.admin.as_ref().map(|a| a.caches.clone());
+    let halloween_sink: Option<Arc<dyn DocSink>> = deps
+        .admin
+        .as_ref()
+        .map(|a| a.doc_sink.clone())
+        .or_else(|| deps.firestore.clone().map(|fs| fs as Arc<dyn DocSink>));
+
     let mut migrated = routes::diagnostic::router()
         .merge(routes::public_api::products_router())
-        .merge(routes::auth::router(routes::auth::AuthState::from_config(
-            cfg,
-        )));
+        .merge(routes::matchmaking::router())
+        .merge(routes::halloween::router(halloween_sink))
+        .merge(routes::auth::router(
+            routes::auth::AuthState::from_config(cfg).with_firestore(deps.firestore.clone()),
+        ));
     if let Some(claims) = deps.claims {
         migrated = migrated.merge(routes::public_api::claims_router(claims));
     }
+    if let Some(fs) = &deps.firestore {
+        migrated = migrated
+            .merge(routes::public_api::checkout_router(fs.clone()))
+            .merge(routes::public_api::claims_post_router(fs.clone()));
+    }
+    // Fotos de Steam del historial: una sola caché para el detalle y para `/api/lobby/steam-avatar(s)`.
+    let steam_avatars: Arc<dyn steam_avatars::SteamAvatars> =
+        Arc::new(steam_avatars::HttpSteamAvatars::new());
+    migrated = migrated.merge(routes::public_api::steam_avatar_router(
+        steam_avatars.clone(),
+    ));
     // Historial público de partidas (`/historial`), con la misma fuente que el panel admin.
     if let Some(admin) = &deps.admin {
         migrated = migrated.merge(routes::public_api::matches_history_router(
@@ -114,7 +134,10 @@ pub fn build_app(deps: AppDeps) -> Router {
             routes::public_api::MatchDetailState {
                 docs: admin.docs.clone(),
                 users: admin.users.clone(),
-                avatars: Arc::new(steam_avatars::HttpSteamAvatars::new()),
+                avatars: steam_avatars,
+                faceit: Arc::new(steam_avatars::HttpFaceitSteamIds::new(
+                    cfg.faceit_api_key.clone(),
+                )),
             },
         ));
     }
@@ -129,18 +152,63 @@ pub fn build_app(deps: AppDeps) -> Router {
         }
         Err(e) => tracing::warn!("admin routes not mounted ({e}): /api/admin stays on the proxy"),
     }
+    // Canales de voz y anuncio de las partidas (sin token de bot: `None`, no se toca Discord).
+    let match_discord = match_discord::MatchDiscord::new(&cfg.discord_token).map(Arc::new);
+    let env = &cfg.env_defaults;
+    let channels_env = match_discord::MatchChannelsConfig {
+        matches_channel_ids: match_discord::parse_id_list(env.discord_matches_channel_id.as_deref()),
+        waiting_room_ids: match_discord::parse_id_list(
+            env.discord_waiting_room_channel_id.as_deref(),
+        ),
+        access_role_id: match_discord::parse_id_list(env.discord_match_access_role_id.as_deref())
+            .into_iter()
+            .next(),
+    };
+    // Lanzamiento de partidas con cobro de apuestas (antes en Node): necesita el servidor CS2,
+    // el lobby, MySQL (cobro atómico) y una sesión válida. Sin alguno, la ruta sigue en el proxy.
+    if let (Some(cs2_mgr), Some(lobby_mgr), Some(fs), Ok(session)) = (
+        deps.cs2.clone(),
+        deps.lobby.clone(),
+        deps.firestore.clone(),
+        session::SessionState::from_config(cfg),
+    ) {
+        migrated = migrated.merge(routes::match_launch::router(
+            routes::match_launch::MatchLaunchState {
+                lobby: lobby_mgr,
+                cs2: cs2_mgr,
+                firestore: fs,
+                auth: Arc::new(session),
+                launching: Default::default(),
+                discord: match_discord.clone(),
+                channels_env,
+            },
+        ));
+    }
     if let Some(cs2_mgr) = deps.cs2 {
+        // Mismo interruptor de pagos y mismo secreto para MatchZy y para el plugin CS2: ambos
+        // pueden declarar ganadores.
+        let payout_enabled = std::env::var("MATCH_PAYOUT_ENABLED").is_ok_and(|v| v == "1");
+        let cs2_secret = std::env::var("MATCHZY_WEBHOOK_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         migrated = migrated
             .merge(routes::cs2_api::router(routes::cs2_api::Cs2ApiState {
                 manager: cs2_mgr.clone(),
+                firestore: deps.firestore.clone(),
+                secret: cs2_secret.clone(),
+                payout_enabled,
+                discord: match_discord.clone(),
             }))
             .merge(routes::webhooks::router(routes::webhooks::WebhooksState {
                 cs2_manager: cs2_mgr,
                 firestore: deps.firestore.clone(),
-                payout_enabled: std::env::var("MATCH_PAYOUT_ENABLED").is_ok_and(|v| v == "1"),
+                payout_enabled,
+                matchzy_secret: cs2_secret,
+                discord: match_discord,
             }));
     }
-    if let Some(lobby_mgr) = deps.lobby {
+    if let Some(lobby_mgr) = deps.lobby.clone() {
         // Falla cerrado: sin una sesión válida el lobby rechaza todo token. Nunca
         // se usa una clave de respaldo conocida (permitiría forjar sesiones).
         let lobby_auth: Arc<dyn lobby::auth::SessionVerifier> =
@@ -157,18 +225,28 @@ pub fn build_app(deps: AppDeps) -> Router {
             uploads_dir: cfg.static_dir.join("uploads").join("chat"),
         }));
     }
-    // Recarga Yape verificada contra el monitor (antes en Node). Mismo verificador de sesión que
-    // el lobby; sin sesión válida no se monta y la ruta sigue en el proxy.
+    // Recarga Yape y vinculación de cuentas FACEIT/Steam (antes en Node). Mismo verificador de
+    // sesión que el lobby; sin sesión válida no se monta y la ruta sigue en el proxy.
     if let Some(firestore) = deps.firestore {
         match session::SessionState::from_config(cfg) {
             Ok(s) => {
-                let auth: Arc<dyn lobby::auth::SessionVerifier> = Arc::new(s);
-                migrated = migrated.merge(routes::wallet::router(routes::wallet::WalletState {
-                    firestore,
-                    auth,
-                }));
+                let auth: Arc<dyn lobby::auth::SessionVerifier> = Arc::new(s.clone());
+                migrated = migrated
+                    .merge(routes::wallet::router(routes::wallet::WalletState {
+                        firestore: firestore.clone(),
+                        auth,
+                        lobby: deps.lobby.clone(),
+                        default_guild_id: cfg.discord_guild_id.clone(),
+                    }))
+                    .merge(routes::account::router(routes::account::AccountState::new(
+                        firestore,
+                        s,
+                        cfg.faceit_api_key.clone(),
+                        cfg.base_url.clone(),
+                        cfg.discord_guild_id.clone(),
+                    )));
             }
-            Err(e) => tracing::warn!("wallet route not mounted ({e}): recharge-yape stays on the proxy"),
+            Err(e) => tracing::warn!("wallet/account routes not mounted ({e}): stay on the proxy"),
         }
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before

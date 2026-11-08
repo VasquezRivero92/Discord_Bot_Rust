@@ -115,7 +115,10 @@ async fn sets_helmet_defaults_without_csp_when_absent() {
     assert_eq!(h["cross-origin-opener-policy"], "same-origin");
     assert_eq!(h["cross-origin-resource-policy"], "same-origin");
     assert_eq!(h["origin-agent-cluster"], "?1");
-    assert!(h.get("content-security-policy").is_none());
+    assert_eq!(
+        h["content-security-policy"],
+        "frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'"
+    );
 }
 
 #[tokio::test]

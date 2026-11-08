@@ -1,27 +1,68 @@
-# Stack autónomo de MachuPeek: Web y Bot nativo (Rust) + Túnel Cloudflare.
+# Stack autónomo de MachuPeek: MySQL 8.0 en tiempo real + Web y Bot nativo (Rust) + Túnel Cloudflare.
 # 100% independiente de cualquier otro proyecto o contenedor legado.
 #
 # Uso:
-#   docker compose up -d
+#   docker compose up -d --build
 
 services:
-  # 1. Frente de entrada de alta velocidad + Bot de Discord integrado (Rust / Axum + Serenity)
+  # 1. Base de datos relacional + Motor de Tiempo Real CDC (MySQL 8.0)
+  mysql:
+    image: mysql:8.0
+    container_name: machupeek-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?define MYSQL_ROOT_PASSWORD en .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-machupeek}
+      TZ: UTC
+      # Contraseñas de los usuarios por servicio que crea database/init/02-service-users.sh.
+      WEB_DB_PASSWORD: ${WEB_DB_PASSWORD:-}
+      YAPE_DB_PASSWORD: ${YAPE_DB_PASSWORD:-}
+    ports:
+      # Expuesto en 127.0.0.1:3307 hacia el host (3306 interno en la red Docker)
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - type: bind
+        source: ./database/mysql_schema.sql
+        target: /docker-entrypoint-initdb.d/01-schema.sql
+        read_only: true
+      - type: bind
+        source: ./database/init/02-service-users.sh
+        target: /docker-entrypoint-initdb.d/02-service-users.sh
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # 2. Frente de entrada de alta velocidad + Bot de Discord integrado (Rust / Axum + Serenity)
   web:
     build:
       context: .
       dockerfile: Dockerfile
-    image: machupeek-web:fase1
-    container_name: machupeek-web
+    image: machupeek-web:mysql-realtime
+    container_name: machupeek-rust-web
     restart: unless-stopped
     env_file: .env
     environment:
       PORT: "15633"
       STATIC_DIR: /srv/public
+      # Con WEB_DB_USER/WEB_DB_PASSWORD (tras correr 02-service-users.sh) deja de entrar como root.
+      DATABASE_URL: mysql://${WEB_DB_USER:-root}:${WEB_DB_PASSWORD:-${MYSQL_ROOT_PASSWORD:?define MYSQL_ROOT_PASSWORD en .env}}@mysql:3306/${MYSQL_DATABASE:-machupeek}
       FIREBASE_SERVICE_ACCOUNT_PATH: /run/secrets/firebase-sa.json
       CS2_SSH_KEY_PATH: /app/clave_cs2.pem
     ports:
       # Puerto local para entrar como http://localhost:15633
       - "127.0.0.1:15633:15633"
+    depends_on:
+      mysql:
+        condition: service_healthy
     networks:
       default:
         aliases:
@@ -46,14 +87,84 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # 2. Túnel oficial de Cloudflare Zero Trust para machupeek.com
+  # 3. Túnel oficial de Cloudflare Zero Trust para machupeek.com
   tunnel:
     image: cloudflare/cloudflared:latest
-    container_name: machupeek-tunnel
+    container_name: machupeek-rust-tunnel
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-eyJhIjoiOGJkNGE0MzkwMzJhNWY1Zjg4MDgyYWZhMTU5NTAzMTYiLCJ0IjoiYmVjODFhNjUtOGQ5OC00YjQ5LWEwZjgtODQyYzQ2YWRiM2FmIiwicyI6Ik1qZG1aVEF3TXpjdFkyUTJPQzAwTVRrNExUZ3dZekF0TWpneU1qZ3hOek00WTJJNCJ9}
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?define TUNNEL_TOKEN en .env}
     depends_on:
       web:
         condition: service_healthy
+
+  # 4. Plataforma Yape MachuPeek (Monitor de Pagos, Envío Autónomo y Portal Web)
+  yape:
+    build:
+      context: "../YAPE ANDROID"
+      dockerfile: Dockerfile
+    image: machupeek-yape:latest
+    container_name: machupeek-yape
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      # Con YAPE_DB_USER/YAPE_DB_PASSWORD el monitor solo puede tocar sus tablas (no saldos).
+      MYSQL_USER: ${YAPE_DB_USER:-root}
+      MYSQL_PASSWORD: ${YAPE_DB_PASSWORD:-${MYSQL_ROOT_PASSWORD:?define MYSQL_ROOT_PASSWORD en .env}}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-machupeek}
+      ADB_SERVER_HOST: host.docker.internal
+      ADB_SERVER_PORT: "5037"
+      # Panel y monitor: sin estos valores compose no arranca (ya no hay credenciales en el código).
+      YAPE_ADMIN_USER: ${YAPE_ADMIN_USER:-admin}
+      YAPE_ADMIN_PASS: ${YAPE_ADMIN_PASS:?define YAPE_ADMIN_PASS en el entorno}
+      YAPE_MONITOR_TOKEN: ${YAPE_MONITOR_TOKEN:?define YAPE_MONITOR_TOKEN en el entorno}
+      YAPE_SESSION_SECRET: ${YAPE_SESSION_SECRET:?define YAPE_SESSION_SECRET en el entorno}
+    ports:
+      - "127.0.0.1:3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: "../YAPE ANDROID/public/comprobantes"
+        target: /app/public/comprobantes
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # 5. Copia de seguridad diaria de MySQL (14 días de retención) en ./backups del host.
+  backup:
+    image: mysql:8.0
+    container_name: machupeek-backup
+    restart: unless-stopped
+    environment:
+      MYSQL_PWD: ${MYSQL_ROOT_PASSWORD:?define MYSQL_ROOT_PASSWORD en .env}
+      DB_NAME: ${MYSQL_DATABASE:-machupeek}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        while true; do
+          ts=$$(date +%Y%m%d-%H%M)
+          if mysqldump -h mysql -uroot --single-transaction --routines --triggers "$$DB_NAME" | gzip > "/backups/$$DB_NAME-$$ts.sql.gz.tmp"; then
+            mv "/backups/$$DB_NAME-$$ts.sql.gz.tmp" "/backups/$$DB_NAME-$$ts.sql.gz"
+            echo "backup $$ts listo"
+          else
+            rm -f "/backups/$$DB_NAME-$$ts.sql.gz.tmp"
+            echo "backup $$ts FALLÓ" >&2
+          fi
+          find /backups -name '*.sql.gz' -mtime +14 -delete
+          sleep 86400
+        done
+    volumes:
+      - type: bind
+        source: ./backups
+        target: /backups
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

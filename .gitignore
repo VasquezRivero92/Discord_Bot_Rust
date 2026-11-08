@@ -10,3 +10,6 @@ cookies.txt
 *.pem
 clave_cs2.pem
 public/
+
+# Volcados de MySQL (datos personales y saldos): nunca al repositorio.
+backups/

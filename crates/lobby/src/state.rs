@@ -331,6 +331,8 @@ pub struct LobbyState {
     pub roulette_slice_offset: Option<f64>,
     #[serde(default)]
     pub tournament: Option<serde_json::Value>,
+    #[serde(rename = "commandEnabled", default = "default_true")]
+    pub command_enabled: bool,
     #[serde(rename = "mapCatalog", default = "default_catalog")]
     pub map_catalog: Vec<MapInfo>,
     #[serde(rename = "updatedAt")]
@@ -460,6 +462,7 @@ impl Default for LobbyState {
             roulette_started_at: None,
             roulette_slice_offset: None,
             tournament: None,
+            command_enabled: true,
             map_catalog: default_catalog(),
             updated_at: Utc::now().timestamp_millis(),
         }
@@ -596,7 +599,7 @@ impl LobbyManager {
             "data": {
                 "state": state,
                 "availablePlayers": available_players,
-                "commandEnabled": true,
+                "commandEnabled": state.command_enabled,
                 "guildName": "MachuPeek",
                 "guildId": guild_id
             }

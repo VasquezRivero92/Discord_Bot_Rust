@@ -82,6 +82,13 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()",
     ),
+    // CSP mínima que no restringe scripts ni estilos (la SPA usa inline y CDNs): impide que otro
+    // sitio enmarque la página (clickjacking sobre recargas/retiros), un `<base>` inyectado,
+    // plugins y formularios que envíen datos a otro dominio.
+    (
+        "content-security-policy",
+        "frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'",
+    ),
 ];
 
 struct Shared {

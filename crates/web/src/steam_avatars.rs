@@ -109,6 +109,74 @@ fn cdata(xml: &str, tag: &str) -> Option<String> {
     (!url.is_empty()).then(|| url.to_owned())
 }
 
+/// SteamID64 de un jugador a partir de su id de FACEIT (UUID). Costura para probar sin red.
+#[async_trait]
+pub trait FaceitSteamIds: Send + Sync {
+    async fn steam_id(&self, player_id: &str) -> Option<String>;
+}
+
+/// `GET open.faceit.com/data/v4/players/{id}` con la clave de la API. Sin clave no resuelve nada.
+/// Un SteamID no cambia, así que los aciertos se guardan sin caducidad.
+pub struct HttpFaceitSteamIds {
+    http: reqwest::Client,
+    key: Option<String>,
+    base: String,
+    cache: Mutex<HashMap<String, String>>,
+}
+
+impl HttpFaceitSteamIds {
+    pub fn new(key: Option<String>) -> Self {
+        Self::with_base(key, "https://open.faceit.com")
+    }
+
+    pub fn with_base(key: Option<String>, base: &str) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self {
+            http,
+            key: key.filter(|k| !k.is_empty()),
+            base: base.trim_end_matches('/').to_owned(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl FaceitSteamIds for HttpFaceitSteamIds {
+    async fn steam_id(&self, player_id: &str) -> Option<String> {
+        let key = self.key.as_ref()?;
+        if let Some(id) = self.cache.lock().ok()?.get(player_id) {
+            return Some(id.clone());
+        }
+        let res = self
+            .http
+            .get(format!("{}/data/v4/players/{player_id}", self.base))
+            .bearer_auth(key)
+            .send()
+            .await
+            .ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let body: Value = res.json().await.ok()?;
+        let id = body.get("steam_id_64")?.as_str()?.to_owned();
+        if !is_steam_id(&id) {
+            return None;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(player_id.to_owned(), id.clone());
+        }
+        Some(id)
+    }
+}
+
+/// Id de jugador de FACEIT: un UUID (36 caracteres con guiones).
+fn is_faceit_uuid(s: &str) -> bool {
+    s.len() == 36 && s.bytes().filter(|b| *b == b'-').count() == 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,7 +200,7 @@ mod tests {
 }
 
 /// `/^\d{17}$/`
-fn is_steam_id(s: &str) -> bool {
+pub fn is_steam_id(s: &str) -> bool {
     s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -166,6 +234,7 @@ pub async fn enrich_match(
     stats: &mut Option<Value>,
     users: &dyn UsersRepo,
     avatars: &dyn SteamAvatars,
+    faceit: &dyn FaceitSteamIds,
 ) {
     let roster: Vec<Map<String, Value>> = ["faction1_roster", "faction2_roster"]
         .iter()
@@ -175,21 +244,38 @@ pub async fn enrich_match(
         .collect();
 
     // 1. SteamID64 desde el roster o, si falta, desde el usuario vinculado por Discord.
-    let infos = join_all(roster.iter().map(|p| async move {
-        let mut info = Info {
-            s64: roster_s64(p),
-            avatar: None,
-        };
-        if let Some(discord_id) = text(p.get("discord_id")) {
-            if let Ok(Some(user)) = users.get(&discord_id).await {
+    let guild = text(history.get("guild_id"));
+    let infos = join_all(roster.iter().map(|p| {
+        let guild = guild.clone();
+        async move {
+            let mut info = Info {
+                s64: roster_s64(p),
+                avatar: None,
+            };
+            // Por Discord; las partidas de FACEIT no lo traen, así que se busca al usuario
+            // registrado por su apodo de FACEIT (el legacy no lo hacía).
+            let user = match (text(p.get("discord_id")), text(p.get("nickname"))) {
+                (Some(discord_id), _) => users.get(&discord_id).await,
+                (None, Some(nick)) if info.s64.is_none() => {
+                    users.by_nickname(&nick, guild.as_deref()).await
+                }
+                _ => Ok(None),
+            };
+            if let Ok(Some(user)) = user {
                 if info.s64.is_none() {
                     info.s64 = text(user.extra.get("steam_id_64")).filter(|s| is_steam_id(s));
                 }
                 info.avatar = text(user.extra.get("discord_avatar"))
                     .or_else(|| text(user.extra.get("faceit_avatar")));
             }
+            // Último recurso: el SteamID64 de la cuenta de FACEIT.
+            if info.s64.is_none() {
+                if let Some(player_id) = text(p.get("id")).filter(|id| is_faceit_uuid(id)) {
+                    info.s64 = faceit.steam_id(&player_id).await;
+                }
+            }
+            info
         }
-        info
     }))
     .await;
 

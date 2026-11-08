@@ -63,11 +63,8 @@ async fn test_rutas_stub_no_son_respondidas_por_el_lobby_admin_autenticado() {
 
     let stubs = [
         "/api/lobby/mixton-check-bet-status",
-        "/api/lobby/mixton-load-team",
-        "/api/lobby/mixton-override-tier",
         "/api/lobby/sync-faceit-from-steam",
         "/api/lobby/verify-faceit",
-        "/api/lobby/mixton-toggle-command",
         "/api/lobby/create-match",
         "/api/lobby/mixton-create-match",
     ];
@@ -102,4 +99,50 @@ async fn test_rutas_stub_no_son_respondidas_por_el_lobby_admin_autenticado() {
             res.status()
         );
     }
+}
+
+#[tokio::test]
+async fn test_override_tier_and_toggle_command() {
+    let app = test_router();
+    let admin_token = make_token("admin", true, Some("default"));
+
+    // 1. Toggle command
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/lobby/mixton-toggle-command")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("auth_token={admin_token}"))
+        .body(Body::from(json!({ "enabled": false }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. Override tier
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/lobby/mixton-override-tier")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("auth_token={admin_token}"))
+        .body(Body::from(json!({ "playerDiscordId": "123", "tier": "S" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. Load team
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/lobby/mixton-load-team")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("auth_token={admin_token}"))
+        .body(Body::from(
+            json!({
+                "teamId": "team_1",
+                "captainDiscordId": "cap_1",
+                "playerDiscordIds": ["p1", "p2", "p3", "p4"]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }

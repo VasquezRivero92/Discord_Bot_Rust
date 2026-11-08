@@ -41,6 +41,29 @@ fn state(secure: bool) -> SessionState {
     SessionState::new(SECRET.as_bytes(), secure).unwrap()
 }
 
+#[test]
+fn un_token_revocado_en_el_logout_deja_de_valer() {
+    let c = new_claims("revocado-1".into(), "u".into(), None, "user".into(), false, None, now());
+    let token = sign(&c, SECRET.as_bytes()).unwrap();
+    let otro = sign(
+        &new_claims("revocado-2".into(), "u".into(), None, "user".into(), false, None, now()),
+        SECRET.as_bytes(),
+    )
+    .unwrap();
+    assert!(verify(&token, SECRET.as_bytes()).is_ok());
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!("foo=1; auth_token={token}").parse().unwrap(),
+    );
+    web::session::revoke_request_tokens(&headers);
+
+    assert!(verify(&token, SECRET.as_bytes()).is_err());
+    // Solo se revoca el token de esa sesión, no los demás.
+    assert!(verify(&otro, SECRET.as_bytes()).is_ok());
+}
+
 fn router() -> Router {
     async fn opt(OptionalUser(u): OptionalUser) -> impl IntoResponse {
         Json(json!({ "user": u.map(|c| c.username) }))

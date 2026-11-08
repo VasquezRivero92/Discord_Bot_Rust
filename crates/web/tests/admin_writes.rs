@@ -105,6 +105,7 @@ impl TestHarness {
             doc_sink: doc_sink.clone(),
             users: Arc::new(FakeUsersRepo::new()),
             config,
+            firestore: None,
             caches: AdminCaches::default(),
             watchers: Vec::new(),
         };
@@ -599,15 +600,41 @@ async fn users_restore_guild_happy_path() {
         "Backup importado con éxito: 1 vinculaciones restauradas."
     );
 
-    // Debe extraer el raw discordId y prefijar con la guild
+    // La vinculación es global: se guarda con el discordId sin prefijo de servidor y se
+    // marca el servidor de destino en `guild_id`.
     let saved = harness
         .doc_sink
-        .get("faceit_users", "guild_target_1_999888")
-        .expect("usuario restaurado en faceit_users con prefijo de guild");
+        .get("faceit_users", "999888")
+        .expect("usuario restaurado en faceit_users con su discordId global");
     assert_eq!(saved["faceit_nickname"], "GuildHero");
     assert_eq!(saved["guild_id"], "guild_target_1");
-    assert_eq!(saved["servidor"], "guild_target_1");
-    assert_eq!(saved["mixton_guild_id"], "guild_target_1");
+    assert!(harness
+        .doc_sink
+        .get("faceit_users", "guild_target_1_999888")
+        .is_none());
+}
+
+#[tokio::test]
+async fn users_restore_nunca_restaura_saldo() {
+    let harness = TestHarness::new();
+    let r = harness.router();
+    let a_token = admin_token(Some("guild_target_1"));
+    let users = json!({
+        "users": [{
+            "discordId": "555666",
+            "faceit_nickname": "Viejo",
+            "wallet_balance": 999.0,
+            "withdrawn_today_cents": 0,
+            "last_withdrawal_at": 1
+        }]
+    });
+    let (status, _, _) = post_req(r, "/api/admin/users/restore", Some(&a_token), users).await;
+    assert_eq!(status, StatusCode::OK);
+    let saved = harness.doc_sink.get("faceit_users", "555666").expect("restaurado");
+    assert_eq!(saved["faceit_nickname"], "Viejo");
+    for field in ["wallet_balance", "withdrawn_today_cents", "last_withdrawal_at"] {
+        assert!(saved.get(field).is_none(), "{field} no debe restaurarse");
+    }
 }
 
 #[tokio::test]
@@ -722,4 +749,54 @@ async fn doc_sink_error_handling() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(ct, JSON_CT);
     assert_eq!(body["error"], "Error al restaurar backup");
+}
+
+#[tokio::test]
+async fn adjust_user_balance_validation() {
+    let harness = TestHarness::new();
+    let r = harness.router();
+    let u_token = user_token();
+    let g_token = global_admin_token();
+
+    // 1. Unauthenticated -> 401
+    let (status, _, body) = post_req(
+        r.clone(),
+        "/api/admin/users/123/balance",
+        None,
+        json!({"amount": 10.0, "reason": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "No autenticado");
+
+    // 2. Regular user -> 403
+    let (status, _, body) = post_req(
+        r.clone(),
+        "/api/admin/users/123/balance",
+        Some(&u_token),
+        json!({"amount": 10.0, "reason": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "No autorizado. Se requieren permisos de administrador.");
+
+    // 3. Admin invalid amount for set -> 400
+    let (status, _, body) = post_req(
+        r.clone(),
+        "/api/admin/users/123/balance",
+        Some(&g_token),
+        json!({"type": "set", "amount": -5.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 4. Admin missing amount and delta for delta -> 400
+    let (status, _, body) = post_req(
+        r.clone(),
+        "/api/admin/users/123/balance",
+        Some(&g_token),
+        json!({"type": "delta"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

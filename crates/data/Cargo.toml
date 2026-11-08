@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 firestore.workspace = true
+sqlx.workspace = true
 futures.workspace = true
 serde.workspace = true
 thiserror.workspace = true

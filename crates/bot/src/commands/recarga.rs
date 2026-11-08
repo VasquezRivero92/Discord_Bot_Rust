@@ -102,7 +102,11 @@ pub async fn handle_modal(
     };
 
     let discord_id = modal.user.id.to_string();
-    if !data::allow_yape_attempt(&discord_id) {
+    // Misma cuota persistente que la web: el límite no se esquiva alternando web y Discord.
+    if !fs
+        .allow_wallet_attempt("yape", &discord_id, 10, 600, data::allow_yape_attempt)
+        .await
+    {
         modal
             .edit_response(
                 &ctx.http,

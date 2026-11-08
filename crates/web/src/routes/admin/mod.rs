@@ -80,6 +80,7 @@ pub struct AdminRepos {
     pub doc_sink: Arc<dyn DocSink>,
     pub users: Arc<dyn UsersRepo>,
     pub config: Arc<Config>,
+    pub firestore: Option<Arc<FirestoreClient>>,
     /// Cachés de `/stats` y `/yape/transactions`.
     pub caches: AdminCaches,
     /// Tareas que deben vivir tanto como los repos (watcher de los ajustes
@@ -114,6 +115,7 @@ impl AdminRepos {
             doc_sink: Arc::new(client.clone()),
             users: Arc::new(FirestoreUsersRepo::new(client.clone())),
             config,
+            firestore: Some(Arc::new(client.clone())),
             caches: AdminCaches::default(),
             watchers: vec![global_watcher, guild_watcher],
         }

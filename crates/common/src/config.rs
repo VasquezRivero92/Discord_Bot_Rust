@@ -23,11 +23,13 @@ pub enum ConfigError {
     NoFirestoreCredentials,
 }
 
-/// Cómo se conecta (o no) a Firestore. Se decide con [`firestore_mode`].
+/// Cómo se conecta (o no) a la base de datos (MySQL en tiempo real o Firestore legado). Se decide con [`firestore_mode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirestoreMode {
-    /// Sin `FIRESTORE_PROJECT_ID`: nada que necesite Firestore se monta.
+    /// Sin `DATABASE_URL` / `MYSQL_HOST` ni `FIRESTORE_PROJECT_ID`: nada que necesite base de datos se monta.
     Disabled,
+    /// `DATABASE_URL` / `MYSQL_URL` / `MYSQL_HOST`: conexión directa a MySQL con CDC en tiempo real.
+    Mysql { endpoint: String },
     /// `FIRESTORE_EMULATOR_HOST`: emulador local (nunca datos de producción).
     Emulator { host: String },
     /// `FIREBASE_SERVICE_ACCOUNT_PATH`: clave de cuenta de servicio.
@@ -37,11 +39,11 @@ pub enum FirestoreMode {
 }
 
 impl FirestoreMode {
-    /// Descripción para logs; no contiene secretos (la ruta de la clave no lo es,
-    /// su contenido sí y nunca se lee aquí).
+    /// Descripción para logs; no contiene secretos (la contraseña de MySQL y el contenido de la clave nunca salen aquí).
     pub fn describe(&self) -> String {
         match self {
             FirestoreMode::Disabled => "disabled".to_owned(),
+            FirestoreMode::Mysql { endpoint } => format!("mysql ({endpoint})"),
             FirestoreMode::Emulator { host } => format!("emulator ({host})"),
             FirestoreMode::KeyFile { path } => format!("key-file ({})", path.display()),
             FirestoreMode::Adc => "adc".to_owned(),
@@ -49,19 +51,22 @@ impl FirestoreMode {
     }
 }
 
-/// Modo de credenciales de Firestore, explícito y sin sorpresas.
-///
-/// | proyecto | emulador | clave | ADC | resultado |
-/// |---|---|---|---|---|
-/// | no | * | * | * | `Disabled` |
-/// | sí | sí | * | * | `Emulator` |
-/// | sí | no | sí | * | `KeyFile` |
-/// | sí | no | no | sí | `Adc` |
-/// | sí | no | no | no | error `NoFirestoreCredentials` |
-///
-/// El emulador gana porque el crate `firestore` se conecta al emulador siempre que
-/// `FIRESTORE_EMULATOR_HOST` está definida; así el modo informado es el real.
+/// Extrae `host:port/db` de una URL `mysql://user:pass@host:port/db` sin incluir credenciales.
+fn redact_mysql_url(url: &str) -> String {
+    let without_scheme = url.strip_prefix("mysql://").unwrap_or(url);
+    without_scheme
+        .rsplit_once('@')
+        .map(|(_, host_db)| host_db.to_owned())
+        .unwrap_or_else(|| without_scheme.to_owned())
+}
+
+/// Modo de conexión a base de datos (MySQL tiene prioridad si `DATABASE_URL`, `MYSQL_URL` o `MYSQL_HOST` está configurado).
 pub fn firestore_mode(cfg: &Config) -> Result<FirestoreMode, ConfigError> {
+    if let Some(url) = &cfg.database_url {
+        return Ok(FirestoreMode::Mysql {
+            endpoint: redact_mysql_url(url),
+        });
+    }
     if cfg.firestore_project_id.is_none() {
         return Ok(FirestoreMode::Disabled);
     }
@@ -319,6 +324,8 @@ pub struct Config {
     /// `WS_IDLE_TIMEOUT_SECS`: cierre de un WebSocket proxificado sin ningún
     /// frame en ninguna dirección. `None` (vacío o `0`) = nunca.
     pub ws_idle_timeout: Option<Duration>,
+    /// URL de conexión a MySQL (`DATABASE_URL`, `MYSQL_URL` o construida desde `MYSQL_HOST`...).
+    pub database_url: Option<String>,
     pub firestore_project_id: Option<String>,
     pub firebase_service_account_path: Option<PathBuf>,
     pub firestore_emulator_host: Option<String>,
@@ -360,6 +367,10 @@ impl fmt::Debug for Config {
             .field("proxy_append_peer_to_xff", &self.proxy_append_peer_to_xff)
             .field("proxy_first_byte_timeout", &self.proxy_first_byte_timeout)
             .field("ws_idle_timeout", &self.ws_idle_timeout)
+            .field(
+                "database_url",
+                &self.database_url.as_ref().map(|u| redact_mysql_url(u)),
+            )
             .field("firestore_project_id", &self.firestore_project_id)
             .field(
                 "firebase_service_account_path",
@@ -524,6 +535,20 @@ impl Config {
             proxy_append_peer_to_xff,
             proxy_first_byte_timeout,
             ws_idle_timeout,
+            database_url: optional(vars, "DATABASE_URL")
+                .or_else(|| optional(vars, "MYSQL_URL"))
+                .or_else(|| {
+                    let host = optional(vars, "MYSQL_HOST")?;
+                    let port = with_default(vars, "MYSQL_PORT", "3306");
+                    let user = with_default(vars, "MYSQL_USER", "root");
+                    let pass = optional(vars, "MYSQL_PASSWORD").unwrap_or_default();
+                    let db = with_default(vars, "MYSQL_DATABASE", "machupeek");
+                    if pass.is_empty() {
+                        Some(format!("mysql://{user}@{host}:{port}/{db}"))
+                    } else {
+                        Some(format!("mysql://{user}:{pass}@{host}:{port}/{db}"))
+                    }
+                }),
             firestore_project_id: optional(vars, "FIRESTORE_PROJECT_ID"),
             firebase_service_account_path: optional(vars, "FIREBASE_SERVICE_ACCOUNT_PATH")
                 .map(PathBuf::from),

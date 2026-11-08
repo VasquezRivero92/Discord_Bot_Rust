@@ -322,6 +322,19 @@ pub fn assign_captain(
     Ok(())
 }
 
+/// Las apuestas son en soles enteros (sin céntimos). Negativo o NaN cuenta como 0, como en el
+/// legado; un monto con decimales (o infinito) se rechaza.
+fn whole_soles_bet(bet: f64) -> Result<f64, (u16, String)> {
+    let b = if bet.is_nan() || bet < 0.0 { 0.0 } else { bet };
+    if b.fract() != 0.0 {
+        return Err((
+            400,
+            "La apuesta debe ser un monto en soles enteros (sin céntimos).".to_string(),
+        ));
+    }
+    Ok(b)
+}
+
 /// Establece la propuesta de monto de apuesta de un capitán o administrador.
 /// Port de lobby.js:2533-2596.
 ///
@@ -384,7 +397,7 @@ pub fn set_captain_proposal(
         ));
     }
 
-    let parsed = if bet.is_nan() || bet < 0.0 { 0.0 } else { bet };
+    let parsed = whole_soles_bet(bet)?;
 
     if is_target_a {
         state.captain_a_proposal = Some(serde_json::json!(parsed));
@@ -479,7 +492,7 @@ pub fn set_captain_ready(
     }
 
     if let Some(b) = bet {
-        let parsed = if b.is_nan() || b < 0.0 { 0.0 } else { b };
+        let parsed = whole_soles_bet(b)?;
         if is_target_a {
             state.captain_a_proposal = Some(serde_json::json!(parsed));
         }
@@ -588,6 +601,8 @@ pub fn start_draft(
             "Todos los equipos creados deben tener un capitán asignado.".to_string(),
         ));
     }
+    // Se valida antes de tocar el estado: un monto con céntimos no deja el draft a medias.
+    let bet_amount = bet_amount.map(whole_soles_bet).transpose()?;
 
     if let Some(orders) = pick_order {
         if orders.len() == state.teams.len()
@@ -613,7 +628,7 @@ pub fn start_draft(
     state.auto_countdown_ends_at = None;
 
     if let Some(bet) = bet_amount {
-        state.effective_bet_amount = if bet < 0.0 || bet.is_nan() { 0.0 } else { bet };
+        state.effective_bet_amount = bet;
     } else if let Some(agreed) = state.agreed_bet_amount {
         state.effective_bet_amount = agreed;
     }
@@ -1774,5 +1789,14 @@ mod tests {
             team_2_has_ps,
             "Equipo 2 debía recibir al mejor jugador (p_s) para equilibrar"
         );
+    }
+
+    #[test]
+    fn la_apuesta_es_en_soles_enteros() {
+        assert_eq!(whole_soles_bet(10.0), Ok(10.0));
+        assert_eq!(whole_soles_bet(-3.0), Ok(0.0));
+        assert_eq!(whole_soles_bet(f64::NAN), Ok(0.0));
+        assert!(whole_soles_bet(10.5).is_err());
+        assert!(whole_soles_bet(f64::INFINITY).is_err());
     }
 }

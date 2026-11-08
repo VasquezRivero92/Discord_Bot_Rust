@@ -159,10 +159,65 @@ pub fn sign(claims: &SessionClaims, secret: &[u8]) -> Result<String, SessionErro
     )?)
 }
 
-/// Verifica `token` (solo HS256, `exp` obligatorio, sin margen de reloj).
+/// Tokens cerrados con `/auth/logout`, con el instante (s) hasta el que hay que recordarlos.
+/// El JWT no tiene estado: sin esta lista, una cookie copiada seguiría valiendo hasta su `exp`
+/// aunque el usuario haya cerrado sesión. Es del proceso (un reinicio la vacía).
+static REVOKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::OnceLock::new();
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Revoca `token`: deja de ser válido aunque su firma y su `exp` lo sean.
+pub fn revoke(token: &str) {
+    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+        return;
+    }
+    let now = now_secs();
+    let mut map = REVOKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, until| *until > now);
+    map.insert(token.to_owned(), now.saturating_add(SESSION_SECS));
+}
+
+/// Revoca los tokens de sesión (`auth_token`, `admin_token`) que trae la petición.
+pub fn revoke_request_tokens(headers: &axum::http::HeaderMap) {
+    for value in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(raw) = value.to_str() else { continue };
+        for pair in raw.split(';') {
+            if let Some((name, token)) = pair.trim().split_once('=') {
+                if name == "auth_token" || name == "admin_token" {
+                    revoke(token.trim());
+                }
+            }
+        }
+    }
+}
+
+fn is_revoked(token: &str) -> bool {
+    REVOKED.get().is_some_and(|m| {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(token)
+            .is_some_and(|until| *until > now_secs())
+    })
+}
+
+/// Verifica `token` (solo HS256, `exp` obligatorio, sin margen de reloj, no revocado).
 pub fn verify(token: &str, secret: &[u8]) -> Result<SessionClaims, SessionError> {
     if token.len() > MAX_TOKEN_LEN {
         return Err(SessionError::TooLarge);
+    }
+    if is_revoked(token) {
+        return Err(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidToken,
+        )
+        .into());
     }
     let mut v = Validation::new(Algorithm::HS256);
     v.algorithms = vec![Algorithm::HS256];

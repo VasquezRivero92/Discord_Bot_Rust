@@ -131,21 +131,14 @@ pub async fn run(
     let discord_id = interaction.user.id.to_string();
     let guild_str = guild_id.to_string();
 
-    // 2. Obtener faceit_player_id del usuario desde Firestore
+    // 2. Obtener faceit_player_id del usuario (vinculación global)
     let global_doc = fs
         .get_doc::<serde_json::Value>("faceit_users", &discord_id)
         .await
         .ok()
         .flatten();
 
-    let server_doc_id = format!("{guild_str}_{discord_id}");
-    let server_doc = fs
-        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-        .await
-        .ok()
-        .flatten();
-
-    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), None);
     if !mixton_logic::is_user_verified(&merged) {
         let msg = EditInteractionResponse::new().content(AdminCallError::NotLinked.user_message());
         interaction.edit_response(&ctx.http, msg).await?;
@@ -438,26 +431,14 @@ pub async fn handle_llamar_admin_button(
             .await;
     }
 
-    // 2. Obtener vinculación Faceit del usuario
-    let guild_str = component.guild_id.map(|g| g.to_string());
+    // 2. Obtener vinculación Faceit global del usuario
     let global_doc = fs
         .get_doc::<serde_json::Value>("faceit_users", &discord_id)
         .await
         .ok()
         .flatten();
 
-    let server_doc_id = match guild_str.as_deref() {
-        Some(gid) => format!("{gid}_{discord_id}"),
-        None => discord_id.clone(),
-    };
-
-    let server_doc = fs
-        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-        .await
-        .ok()
-        .flatten();
-
-    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), None);
     if !mixton_logic::is_user_verified(&merged) {
         let resp = CreateInteractionResponseMessage::new()
             .content(
@@ -583,21 +564,14 @@ pub async fn handle_support_call_modal(
     };
     let guild_str = guild_id.to_string();
 
-    // 1. Obtener datos de Faceit
+    // 1. Obtener datos globales de Faceit
     let global_doc = fs
         .get_doc::<serde_json::Value>("faceit_users", &discord_id)
         .await
         .ok()
         .flatten();
 
-    let server_doc_id = format!("{guild_str}_{discord_id}");
-    let server_doc = fs
-        .get_doc::<serde_json::Value>("faceit_users", &server_doc_id)
-        .await
-        .ok()
-        .flatten();
-
-    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), server_doc.as_ref());
+    let merged = mixton_logic::merge_user_docs(global_doc.as_ref(), None);
     if !mixton_logic::is_user_verified(&merged) {
         let msg =
             EditInteractionResponse::new().content("❌ No tienes una cuenta de Faceit vinculada.");

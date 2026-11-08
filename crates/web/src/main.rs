@@ -115,6 +115,50 @@ async fn run() -> ExitCode {
         });
     }
 
+    // Reembolso automático de los retiros que el RPA de Yape no llegó a enviar (los rechaza el
+    // worker cuando falla antes de confirmar). Idempotente: ver `refund_rejected_withdrawals`.
+    // Cada 10 minutos, además, se concilia cada saldo con su último movimiento del libro
+    // (`wallet_ledger`): una diferencia es un cambio de saldo hecho por fuera y se alerta una vez.
+    if let Some(fs) = client.clone() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut rounds: u64 = 0;
+            let mut alerted = std::collections::HashSet::new();
+            loop {
+                tick.tick().await;
+                match fs.refund_rejected_withdrawals(20).await {
+                    Ok(ids) if !ids.is_empty() => {
+                        info!("reembolsados {} retiro(s) no enviados: {ids:?}", ids.len())
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!("reembolso de retiros rechazados: {e}"),
+                }
+                rounds += 1;
+                if rounds % 20 != 1 {
+                    continue;
+                }
+                match fs.reconcile_wallets().await {
+                    Ok(mismatches) => {
+                        for m in mismatches {
+                            if !alerted.insert((m.account_id.clone(), m.actual_cents)) {
+                                continue;
+                            }
+                            let msg = format!(
+                                "Saldo fuera del libro: cuenta {} tiene S/ {:.2} pero su último movimiento dejó S/ {:.2}. Alguien cambió el saldo sin pasar por la billetera.",
+                                m.account_id,
+                                m.actual_cents as f64 / 100.0,
+                                m.ledger_cents as f64 / 100.0
+                            );
+                            error!("{msg}");
+                            let _ = fs.alert_admins(&msg).await;
+                        }
+                    }
+                    Err(e) => error!("conciliación de saldos: {e}"),
+                }
+            }
+        });
+    }
+
     let app = build_app(AppDeps {
         config: cfg,
         claims,
@@ -174,6 +218,30 @@ async fn connect_firestore(
     cfg: &Config,
     mode: &FirestoreMode,
 ) -> Result<Option<FirestoreClient>, String> {
+    if let (FirestoreMode::Mysql { .. }, Some(db_url)) = (mode, cfg.database_url.as_deref()) {
+        info!(
+            "connecting to MySQL real-time engine ({})",
+            mode.describe()
+        );
+        return match tokio::time::timeout(
+            FIRESTORE_CONNECT_TIMEOUT,
+            FirestoreClient::connect_mysql(db_url),
+        )
+        .await
+        {
+            Ok(Ok(client)) => Ok(Some(client)),
+            Ok(Err(e)) => Err(format!(
+                "cannot connect to MySQL ({}): {e}",
+                mode.describe()
+            )),
+            Err(_) => Err(format!(
+                "timed out connecting to MySQL ({}) after {}s",
+                mode.describe(),
+                FIRESTORE_CONNECT_TIMEOUT.as_secs()
+            )),
+        };
+    }
+
     let project = match (mode, cfg.firestore_project_id.as_deref()) {
         (FirestoreMode::Disabled, _) | (_, None) => {
             if cfg.firebase_service_account_path.is_some()

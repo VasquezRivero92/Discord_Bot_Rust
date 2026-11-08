@@ -7,8 +7,8 @@
 //!   que los incrementos de saldo: si MatchZy reenvía `series_end`, o dos procesos intentan
 //!   pagar a la vez, solo uno confirma; el otro recibe [`PayoutOutcome::AlreadyPaid`] y no toca
 //!   ningún saldo.
-//! * El reparto se hace en céntimos enteros y suma exactamente el pozo (el resto de céntimos va
-//!   a los primeros ganadores, de forma determinista).
+//! * El reparto es en soles enteros e igual para todos los ganadores; lo que no alcanza para
+//!   un sol más por ganador queda para la casa (`houseCents`).
 //! * Los saldos suben con incremento atómico, así que no pisan escrituras concurrentes.
 
 use crate::error::DataError;
@@ -64,15 +64,20 @@ impl From<FirestoreError> for PayoutError {
     }
 }
 
-/// Reparte `total_cents` entre `n` ganadores sin perder ni inventar céntimos.
+/// Reparte `total_cents` entre `n` ganadores en **soles enteros**: cada uno recibe lo mismo,
+/// un múltiplo de 100 céntimos, y lo que no alcanza para otro sol entero por ganador queda
+/// para la casa ([`house_cents`]). Nunca se paga más que el pozo.
 pub fn split_pot(total_cents: i64, n: usize) -> Vec<i64> {
     if n == 0 || total_cents <= 0 {
         return Vec::new();
     }
-    let n_i = n as i64;
-    let base = total_cents / n_i;
-    let extra = (total_cents % n_i) as usize;
-    (0..n).map(|i| base + i64::from(i < extra)).collect()
+    let soles_each = total_cents / 100 / n as i64;
+    vec![soles_each * 100; n]
+}
+
+/// Lo que queda para la casa tras [`split_pot`].
+pub fn house_cents(total_cents: i64, shares: &[i64]) -> i64 {
+    total_cents - shares.iter().sum::<i64>()
 }
 
 /// Ids de ganadores únicos, sin vacíos, conservando el orden.
@@ -182,6 +187,9 @@ struct PayoutDoc {
     bet_cents: i64,
     #[serde(rename = "totalPotCents")]
     total_pot_cents: i64,
+    /// Sobrante del reparto en soles enteros: queda para la casa.
+    #[serde(rename = "houseCents")]
+    house_cents: i64,
     winners: Vec<WinnerShare>,
     source: String,
     #[serde(rename = "createdAt")]
@@ -220,6 +228,18 @@ impl FirestoreClient {
         winners: &[String],
         source: &str,
     ) -> Result<PayoutOutcome, PayoutError> {
+        if let Some(m) = &self.mysql {
+            return m
+                .pay_match_winners(match_id, bet_cents, total_players, winners, source)
+                .await;
+        }
+        // El cobro previo de apuestas (`match_stakes`) solo existe con MySQL; sin apuestas
+        // cobradas, pagar el pozo crearía dinero. Falla cerrado.
+        if self.get_raw_doc(crate::mysql::STAKES, match_id.trim()).await?.is_none() {
+            return Err(PayoutError::Invalid(
+                "la partida no tiene apuestas cobradas; no se paga".into(),
+            ));
+        }
         let match_id = match_id.trim();
         if match_id.is_empty()
             || match_id.len() > 128
@@ -256,6 +276,7 @@ impl FirestoreClient {
             status: "paid".into(),
             bet_cents,
             total_pot_cents: total,
+            house_cents: house_cents(total, &shares),
             winners: winners
                 .iter()
                 .zip(&shares)
@@ -327,12 +348,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn el_reparto_suma_exactamente_el_pozo() {
+    fn el_reparto_es_en_soles_enteros_y_el_sobrante_va_a_la_casa() {
         assert_eq!(split_pot(10_000, 5), vec![2000; 5]);
+        // S/ 10 entre 3: S/ 3 a cada uno, S/ 1 para la casa.
         let s = split_pot(1000, 3);
-        assert_eq!(s, vec![334, 333, 333]);
-        assert_eq!(s.iter().sum::<i64>(), 1000);
-        assert_eq!(split_pot(1, 3), vec![1, 0, 0]);
+        assert_eq!(s, vec![300; 3]);
+        assert_eq!(house_cents(1000, &s), 100);
+        // Pozo menor a S/ 1 por ganador: nadie cobra, todo queda para la casa.
+        assert_eq!(split_pot(250, 3), vec![0; 3]);
+        assert!(split_pot(9_999, 7).iter().all(|c| c % 100 == 0));
+        assert!(split_pot(9_999, 7).iter().sum::<i64>() <= 9_999);
     }
 
     #[test]
