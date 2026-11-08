@@ -165,6 +165,7 @@ impl Cs2ServerManager {
         info!("[CS2ServerManager] Iniciando proceso de arranque en puerto {port}...");
 
         // 1. Asegurar máquina virtual en AWS EC2
+        let mut ec2_error = None;
         if let (Some(ref ec2), Some(ref inst_id)) = (&self.ec2_client, &self.ec2_instance_id) {
             info!("[CS2ServerManager] Verificando estado de AWS EC2 ({inst_id})...");
             if let Err(e) = ec2
@@ -172,6 +173,7 @@ impl Cs2ServerManager {
                 .await
             {
                 error!("[CS2ServerManager] Error encendiendo instancia EC2: {e}");
+                ec2_error = Some(e.to_string());
             }
         }
 
@@ -186,7 +188,13 @@ impl Cs2ServerManager {
             )
             .await
             {
+                // Sin SSH no se puede lanzar tmux: el llamador debe cancelar y devolver la apuesta
+                // en vez de dar por iniciada una partida en un servidor apagado.
                 warn!("[CS2ServerManager] Espera de SSH reportó: {e}");
+                return Err(match ec2_error {
+                    Some(ec2) => format!("la instancia EC2 no encendió ({ec2}) y SSH no responde ({e})"),
+                    None => format!("SSH no responde: {e}"),
+                });
             }
 
             // 3. Lanzar sesión tmux en Linux
@@ -208,12 +216,17 @@ impl Cs2ServerManager {
                 }
                 Err(e) => {
                     warn!("[CS2ServerManager] Fallback SSH tmux falló: {e}");
+                    return Err(format!("no se pudo iniciar CS2 por SSH: {e}"));
                 }
             }
         } else {
             warn!("[CS2ServerManager] Clave SSH no disponible para comando remoto de inicio.");
         }
 
+        // Sin SSH (agente local que lee `/api/cs2/current-match`), lo único comprobable es EC2.
+        if let Some(e) = ec2_error {
+            return Err(format!("la instancia EC2 no encendió: {e}"));
+        }
         Ok(())
     }
 

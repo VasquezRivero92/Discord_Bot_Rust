@@ -278,7 +278,25 @@ fn reset_after_launch(state: &mut LobbyState, team_a: &str, team_b: &str) {
     state.roulette_spinning = false;
 }
 
+/// Corre el lanzamiento en su propia tarea: si el navegador corta la conexión, axum suelta el
+/// handler, y un lanzamiento cortado a la mitad dejaría la apuesta cobrada sin partida ni
+/// reembolso. La tarea siempre llega al final (partida creada o apuesta devuelta).
 async fn create_match(
+    user: RequireUser,
+    raw: RawQuery,
+    st: State<MatchLaunchState>,
+    payload: Json<CreateMatchPayload>,
+) -> Response {
+    match tokio::spawn(launch_match(user, raw, st, payload)).await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("[Lanzamiento] la tarea de lanzamiento falló: {e}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "Error interno al lanzar la partida.")
+        }
+    }
+}
+
+async fn launch_match(
     user: RequireUser,
     RawQuery(raw): RawQuery,
     State(st): State<MatchLaunchState>,
