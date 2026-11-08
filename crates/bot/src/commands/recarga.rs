@@ -1,10 +1,9 @@
 //! Recarga de saldo con Yape desde Discord: botón `iniciar_recarga_btn` -> modal `recarga_yape_modal`.
 //!
-//! La acreditación de saldo todavía no existe en Rust, así que el envío del modal registra la
-//! solicitud en `yape_recharge_requests` (una por número de operación) y avisa al canal del staff.
+//! El envío del modal acredita el saldo con `FirestoreClient::credit_yape_operation`, la misma
+//! lógica que usa la web: solo si el monitor registró una entrada del monto indicado.
 
-use common::config::Config;
-use data::FirestoreClient;
+use data::{FirestoreClient, YapeCredit, YapeError};
 use serenity::all::*;
 use tracing::warn;
 
@@ -74,7 +73,6 @@ pub fn validate(
 pub async fn handle_modal(
     ctx: &Context,
     modal: &ModalInteraction,
-    config: &Config,
     firestore: Option<&FirestoreClient>,
 ) -> Result<(), serenity::Error> {
     modal.defer_ephemeral(&ctx.http).await?;
@@ -103,76 +101,48 @@ pub async fn handle_modal(
         return Ok(());
     };
 
-    let doc_id = format!("yape_{operation}");
-    if matches!(
-        fs.get_doc::<serde_json::Value>("yape_recharge_requests", &doc_id)
-            .await,
-        Ok(Some(_))
-    ) {
+    let discord_id = modal.user.id.to_string();
+    if !data::allow_yape_attempt(&discord_id) {
         modal
             .edit_response(
                 &ctx.http,
-                reply("⚠️ Ese número de operación ya fue registrado.".into()),
+                reply("⏳ Alcanzaste el límite de intentos. Espera 10 minutos antes de intentar otro número de operación.".into()),
             )
             .await?;
         return Ok(());
     }
 
-    let doc = serde_json::json!({
-        "id": doc_id,
-        "discord_id": modal.user.id.to_string(),
-        "guild_id": modal.guild_id.map(|g| g.to_string()),
-        "yape_phone": phone,
-        "amount": amount,
-        "operation_number": operation,
-        "status": "pendiente",
-        "createdAt": data::timestamp_now(),
-    });
-    if let Err(err) = fs.set_doc("yape_recharge_requests", &doc_id, &doc).await {
-        warn!("Error al registrar recarga Yape: {}", err);
-        modal
-            .edit_response(
-                &ctx.http,
-                reply("❌ Error al procesar tu recarga. Intenta de nuevo.".into()),
-            )
-            .await?;
-        return Ok(());
-    }
-
-    let alerts_channel = config
-        .env_defaults
-        .discord_admin_alerts_channel_id
-        .as_deref()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(ChannelId::new);
-    match alerts_channel {
-        Some(chan) => {
-            let embed = CreateEmbed::new()
-                .title("💜 Nueva recarga Yape")
-                .color(0x742284)
-                .field("👤 Jugador", format!("<@{}>", modal.user.id), true)
-                .field("💰 Monto", format!("S/ {amount:.2}"), true)
-                .field("📱 Yape", &phone, true)
-                .field("🔢 N.º de operación", format!("`{operation}`"), false)
-                .timestamp(Timestamp::now());
-            if let Err(err) = chan
-                .send_message(&ctx.http, CreateMessage::new().embed(embed))
-                .await
-            {
-                warn!("No se pudo avisar al staff de la recarga Yape: {}", err);
-            }
+    // Saldo global del jugador (`faceit_users/{discordId}`), igual que las recargas de la web.
+    let text = match fs
+        .credit_yape_operation(&operation, &discord_id, None, amount, Some(&phone), "discord")
+        .await
+    {
+        Ok(YapeCredit::Credited {
+            amount,
+            new_balance,
+            ..
+        }) => format!(
+            "✅ **Recarga acreditada**\n💰 Monto: S/ {amount:.2}\n💳 Saldo actual: S/ {new_balance:.2}"
+        ),
+        Ok(YapeCredit::NotYetSeen) => {
+            "⏳ Aún no vemos el depósito. Espera unos segundos y vuelve a pulsar el botón para intentarlo otra vez.".into()
         }
-        None => warn!("Canal de alertas del staff no configurado: recarga Yape sin aviso"),
-    }
-
-    modal
-        .edit_response(
-            &ctx.http,
-            reply(format!(
-                "✅ **Recarga recibida**\n💰 Monto: S/ {amount:.2}\n📱 Yape: {phone}\n🔢 Operación: `{operation}`"
-            )),
-        )
-        .await?;
+        Ok(YapeCredit::AlreadyCredited { own: true }) => {
+            "⚠️ Esta operación ya fue acreditada en tu billetera.".into()
+        }
+        Ok(YapeCredit::AlreadyCredited { own: false }) => {
+            "⚠️ Esta operación ya fue utilizada para acreditar otra cuenta.".into()
+        }
+        Ok(YapeCredit::ReservedByOther) => {
+            "⚠️ Este número de operación ya está siendo usado por otra cuenta.".into()
+        }
+        Err(YapeError::Invalid(msg)) => format!("❌ {msg}"),
+        Err(YapeError::Data(err)) => {
+            warn!("Error al acreditar recarga Yape de {discord_id}: {err}");
+            "❌ Error al verificar el depósito Yape. Intenta de nuevo.".into()
+        }
+    };
+    modal.edit_response(&ctx.http, reply(text)).await?;
     Ok(())
 }
 

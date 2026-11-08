@@ -238,15 +238,7 @@ impl EventHandler for BotHandler {
                         .await
                     }
                     "iniciar_recarga_btn" => commands::recarga::open_modal(&ctx, &component).await,
-                    "iniciar_verificacion_btn" => {
-                        let resp = CreateInteractionResponseMessage::new()
-                            .content("🔗 Para vincular tu cuenta, ejecuta el comando `/verificar_fc <tu_nickname_de_faceit>` aquí en el servidor.")
-                            .ephemeral(true);
-
-                        component
-                            .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
-                            .await
-                    }
+                    "iniciar_verificacion_btn" => commands::verificar::open_modal(&ctx, &component).await,
                     other => {
                         warn!("Botón no reconocido: {}", other);
                         let resp = CreateInteractionResponseMessage::new()
@@ -278,14 +270,16 @@ impl EventHandler for BotHandler {
                         self.firestore.as_ref(),
                     )
                     .await
-                } else if custom_id == commands::recarga::MODAL_ID {
-                    commands::recarga::handle_modal(
+                } else if custom_id == commands::verificar::MODAL_ID {
+                    commands::verificar::handle_modal(
                         &ctx,
                         &modal,
-                        &self.config,
+                        self.faceit.as_ref(),
                         self.firestore.as_ref(),
                     )
                     .await
+                } else if custom_id == commands::recarga::MODAL_ID {
+                    commands::recarga::handle_modal(&ctx, &modal, self.firestore.as_ref()).await
                 } else {
                     warn!("Modal no reconocido: {}", custom_id);
                     let resp = CreateInteractionResponseMessage::new()
