@@ -36,8 +36,11 @@ pub(crate) fn matchzy_authorized(headers: &HeaderMap, secret: Option<&str>) -> b
     let Some(secret) = secret.filter(|s| !s.is_empty()) else {
         return false;
     };
+    // `x-matchzy-token` es la cabecera que el legado dejó configurada en el servidor CS2
+    // (`matchzy_remote_log_header_key`); `Authorization` queda para configuraciones nuevas.
     let Some(value) = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get("x-matchzy-token")
+        .or_else(|| headers.get(axum::http::header::AUTHORIZATION))
         .and_then(|h| h.to_str().ok())
     else {
         return false;
@@ -355,5 +358,14 @@ mod tests {
         assert!(matchzy_authorized(&h, Some("s3creto")));
         assert!(!matchzy_authorized(&h, Some("")));
         assert!(!matchzy_authorized(&h, None));
+    }
+
+    #[test]
+    fn acepta_la_cabecera_x_matchzy_token_del_legado() {
+        let mut h = HeaderMap::new();
+        h.insert("x-matchzy-token", "s3creto".parse().unwrap());
+        assert!(matchzy_authorized(&h, Some("s3creto")));
+        h.insert("x-matchzy-token", "otro".parse().unwrap());
+        assert!(!matchzy_authorized(&h, Some("s3creto")));
     }
 }
