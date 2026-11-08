@@ -473,6 +473,7 @@ async fn unmigrated_admin_route_falls_through_to_proxy() {
         admin: None,
         cs2: None,
         lobby: None,
+        firestore: None,
     }))
     .await;
 
@@ -527,6 +528,7 @@ async fn admin_me_is_served_natively_from_the_session() {
         admin: None,
         cs2: None,
         lobby: None,
+        firestore: None,
     }))
     .await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();

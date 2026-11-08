@@ -570,6 +570,7 @@ async fn derived_reads_mount_only_with_firestore_and_the_rest_stays_on_proxy() {
             admin: with_firestore.then(|| fakes.repos.clone()),
             cs2: None,
         lobby: None,
+        firestore: None,
         }))
         .await;
         for path in ALL {
@@ -627,6 +628,7 @@ async fn legacy_panel_writes_clear_the_rust_caches() {
         admin: Some(f.repos.clone()),
             cs2: None,
         lobby: None,
+        firestore: None,
     }))
     .await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();

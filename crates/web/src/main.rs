@@ -121,6 +121,7 @@ async fn run() -> ExitCode {
         admin,
         cs2,
         lobby,
+        firestore: client.clone().map(Arc::new),
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let server = axum::serve(

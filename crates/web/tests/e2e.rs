@@ -154,6 +154,7 @@ impl Front {
             admin: None,
             cs2: None,
         lobby: None,
+        firestore: None,
         }))
         .await;
         Front {
@@ -321,6 +322,7 @@ async fn legacy_down_gives_502_json_while_rust_routes_keep_working() {
         admin: None,
         cs2: None,
         lobby: None,
+        firestore: None,
     }))
     .await;
     let c = client();

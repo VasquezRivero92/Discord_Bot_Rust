@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cs2_api;
 pub mod diagnostic;
 pub mod public_api;
+pub mod wallet;
 pub mod webhooks;
 
 use axum::http::{header, HeaderValue, StatusCode};

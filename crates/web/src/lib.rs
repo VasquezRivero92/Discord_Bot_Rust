@@ -43,6 +43,9 @@ pub struct AppDeps {
     pub admin: Option<routes::admin::AdminRepos>,
     pub cs2: Option<Arc<cs2::Cs2ServerManager>>,
     pub lobby: Option<Arc<lobby::LobbyManager>>,
+    /// Cliente de Firestore para `POST /api/lobby/wallet/recharge-yape`. `None` (Firestore
+    /// deshabilitado) deja esa ruta en el proxy.
+    pub firestore: Option<Arc<data::FirestoreClient>>,
 }
 
 /// Assembles the front door of machupeek.com.
@@ -133,6 +136,8 @@ pub fn build_app(deps: AppDeps) -> Router {
             }))
             .merge(routes::webhooks::router(routes::webhooks::WebhooksState {
                 cs2_manager: cs2_mgr,
+                firestore: deps.firestore.clone(),
+                payout_enabled: std::env::var("MATCH_PAYOUT_ENABLED").is_ok_and(|v| v == "1"),
             }));
     }
     if let Some(lobby_mgr) = deps.lobby {
@@ -151,6 +156,20 @@ pub fn build_app(deps: AppDeps) -> Router {
             auth: lobby_auth,
             uploads_dir: cfg.static_dir.join("uploads").join("chat"),
         }));
+    }
+    // Recarga Yape verificada contra el monitor (antes en Node). Mismo verificador de sesión que
+    // el lobby; sin sesión válida no se monta y la ruta sigue en el proxy.
+    if let Some(firestore) = deps.firestore {
+        match session::SessionState::from_config(cfg) {
+            Ok(s) => {
+                let auth: Arc<dyn lobby::auth::SessionVerifier> = Arc::new(s);
+                migrated = migrated.merge(routes::wallet::router(routes::wallet::WalletState {
+                    firestore,
+                    auth,
+                }));
+            }
+            Err(e) => tracing::warn!("wallet route not mounted ({e}): recharge-yape stays on the proxy"),
+        }
     }
     // Wrong method on a migrated path -> Node instead of axum's 405. Set before
     // the rate-limit layer so each such request is counted exactly once (by the

@@ -14,6 +14,79 @@ use tracing::info;
 #[derive(Clone)]
 pub struct WebhooksState {
     pub cs2_manager: Arc<Cs2ServerManager>,
+    /// Firestore para pagar premios en `series_end`. `None` = no se paga.
+    pub firestore: Option<Arc<data::FirestoreClient>>,
+    /// Interruptor (`MATCH_PAYOUT_ENABLED=1`): mientras el Node también pueda pagar, apagado.
+    pub payout_enabled: bool,
+}
+
+/// Equipo ganador del payload de MatchZy: `"team1"` o `{ "team": "team1" }`.
+fn winner_team(winner: &Option<serde_json::Value>) -> Option<String> {
+    match winner.as_ref()? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o.get("team")?.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Paga el pozo de `match_id` a los ganadores. Falla cerrado: sin datos claros no se paga y
+/// se deja un error en el log para resolverlo a mano. Es idempotente (`match_payouts`).
+async fn pay_series_winners(
+    state: &WebhooksState,
+    match_id: &str,
+    winner: &Option<serde_json::Value>,
+) {
+    let (true, Some(fs)) = (state.payout_enabled, state.firestore.as_ref()) else {
+        return;
+    };
+    let Some(team) = winner_team(winner) else {
+        tracing::error!("[Payout] {match_id}: series_end sin equipo ganador; no se paga");
+        return;
+    };
+    let mut doc = None;
+    for col in ["faceit_active_matches", "faceit_matches_history"] {
+        match fs.get_doc::<serde_json::Value>(col, match_id).await {
+            Ok(Some(d)) => {
+                doc = Some(d);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("[Payout] {match_id}: no se pudo leer {col}: {e}");
+                return;
+            }
+        }
+    }
+    let Some(doc) = doc else {
+        tracing::error!("[Payout] {match_id}: partida no encontrada; no se paga");
+        return;
+    };
+    let plan = match data::plan_payout(&doc, &team) {
+        Ok(p) => p,
+        Err(why) => {
+            tracing::error!("[Payout] {match_id}: {why}; no se paga");
+            return;
+        }
+    };
+    match fs
+        .pay_match_winners(
+            match_id,
+            plan.bet_cents,
+            plan.total_players,
+            &plan.winners,
+            "matchzy",
+        )
+        .await
+    {
+        Ok(data::PayoutOutcome::Paid(shares)) => {
+            info!("[Payout] {match_id}: pagado a {} ganadores {shares:?}", shares.len())
+        }
+        Ok(data::PayoutOutcome::AlreadyPaid) => info!("[Payout] {match_id}: ya estaba pagada"),
+        Ok(data::PayoutOutcome::NothingToPay) => {
+            info!("[Payout] {match_id}: sin apuesta, nada que pagar")
+        }
+        Err(e) => tracing::error!("[Payout] {match_id}: error al pagar: {e}"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +152,12 @@ async fn matchzy_event(
 
     info!("[MatchZy Webhook Rust] Evento: '{event}' para match: '{match_id}'");
 
+    // El premio se paga solo al terminar la serie, nunca en `map_end`. Se paga antes de limpiar
+    // la partida de memoria.
+    if event == "series_end" {
+        pay_series_winners(&state, match_id, &payload.winner).await;
+    }
+
     if event == "series_end" || event == "map_end" {
         info!("[MatchZy Webhook Rust] Serie o mapa finalizado. Resolviendo partida {match_id}...");
 
@@ -134,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn faceit_verify_get_returns_200() {
         let mgr = test_manager();
-        let app = router(WebhooksState { cs2_manager: mgr });
+        let app = router(WebhooksState { cs2_manager: mgr, firestore: None, payout_enabled: false });
 
         let req = Request::builder()
             .uri("/webhook/faceit")
@@ -151,7 +230,7 @@ mod tests {
             .await;
         assert_eq!(mgr.get_all_active_matches().await.len(), 1);
 
-        let app = router(WebhooksState { cs2_manager: mgr.clone() });
+        let app = router(WebhooksState { cs2_manager: mgr.clone(), firestore: None, payout_enabled: false });
 
         let payload = json!({
             "event": "series_end",
